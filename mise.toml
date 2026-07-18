@@ -40,14 +40,7 @@ run = "npm run verify:package"
 
 [tasks.check]
 description = "Run every local release gate"
-run = [
-  "npm run format:check",
-  "npm run lint",
-  "npm run typecheck",
-  "npm test",
-  "npm run build",
-  "npm run verify:package",
-]
+run = "npm run check"
 
 [tasks."hook:pre-commit"]
 description = "Fast checks used by the pre-commit hook"

@@ -20,16 +20,17 @@ jobs:
       reason: ${{ steps.state.outputs.reason }}
       version: ${{ steps.state.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
-      - uses: jdx/mise-action@v3
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
           cache: true
           install: true
       - run: npm ci --ignore-scripts
       - name: Create or update the version pull request
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
         with:
           version: mise run release:version
           commit: "chore: version package"
@@ -40,10 +41,54 @@ jobs:
         name: Determine whether this commit contains an unpublished release
         run: node scripts/release-state.mjs
 
-  stage:
-    name: Stage pi-hunk@${{ needs.version.outputs.version }}
+  verify:
+    name: Verify pi-hunk@${{ needs.version.outputs.version }}
     needs: version
     if: needs.version.outputs.should-stage == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          cache: true
+          install: true
+      - run: npm ci --ignore-scripts
+      - run: mise run check
+      - name: Pack the verified release without lifecycle scripts
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir release
+          npm pack --ignore-scripts --pack-destination release
+          test -f "release/pi-hunk-${RELEASE_VERSION}.tgz"
+      - name: Preserve the exact verified tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-package-${{ needs.version.outputs.version }}
+          path: release/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve the pinned npm CLI for the credentialed job
+        run: |
+          NPM_ROOT="$(cd "$(dirname "$(realpath "$(command -v npm)")")/.." && pwd)"
+          test "$(node -p 'require(process.argv[1]).version' "$NPM_ROOT/package.json")" = 11.17.0
+          mkdir release-tools
+          tar -czf release-tools/npm-cli-11.17.0.tgz -C "$(dirname "$NPM_ROOT")" "$(basename "$NPM_ROOT")"
+      - name: Upload the pinned npm CLI
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-cli-11.17.0
+          path: release-tools/npm-cli-11.17.0.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  stage:
+    name: Stage pi-hunk@${{ needs.version.outputs.version }}
+    needs: [version, verify]
     runs-on: ubuntu-latest
     environment: npm-release
     permissions:
@@ -51,17 +96,44 @@ jobs:
       id-token: write
     env:
       NPM_CONFIG_PROVENANCE: true
+      RELEASE_COMMIT: ${{ github.sha }}
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          cache: true
-          install: true
-      - run: npm ci --ignore-scripts
-      - run: mise run check
+          node-version: 22.19.0
+      - name: Download the exact verified tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package-${{ needs.version.outputs.version }}
+          path: release
+      - name: Download the pinned npm CLI
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-cli-11.17.0
+          path: release-tools
       - name: Stage the verified package through npm OIDC
-        run: npm stage publish . --access public
+        run: |
+          PACKAGE="release/pi-hunk-${RELEASE_VERSION}.tgz"
+          test -f "$PACKAGE"
+          test "$(find release -type f -name '*.tgz' | wc -l | tr -d ' ')" = 1
+
+          mkdir npm-cli publish repacked
+          tar -xzf release-tools/npm-cli-11.17.0.tgz -C npm-cli
+          test "$(node -p 'require(process.argv[1]).version' npm-cli/package/package.json)" = 11.17.0
+
+          tar -xzf "$PACKAGE" -C publish
+          mkdir publish/package/.git
+          printf '%s\n' "$RELEASE_COMMIT" > publish/package/.git/HEAD
+          node npm-cli/package/bin/npm-cli.js pack publish/package \
+            --ignore-scripts \
+            --pack-destination repacked >/dev/null
+          cmp "$PACKAGE" "repacked/pi-hunk-${RELEASE_VERSION}.tgz"
+
+          node npm-cli/package/bin/npm-cli.js stage publish publish/package \
+            --ignore-scripts \
+            --access public
       - name: Approval required
         run: |
-          echo "pi-hunk@${{ needs.version.outputs.version }} is staged, not public."
+          echo "pi-hunk@${RELEASE_VERSION} is staged, not public."
           echo "Inspect and approve it with npm 2FA before finalizing the release."

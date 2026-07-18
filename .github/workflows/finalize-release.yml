@@ -9,7 +9,7 @@ on:
         type: string
 
 concurrency:
-  group: release-finalize
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -24,33 +24,33 @@ jobs:
       tag: ${{ steps.metadata.outputs.tag }}
       version: ${{ steps.metadata.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - id: metadata
         name: Resolve immutable registry metadata
         env:
           VERSION: ${{ inputs.version }}
         run: node scripts/release-metadata.mjs "$VERSION"
 
-  finalize:
-    name: Verify and tag pi-hunk@${{ needs.resolve.outputs.version }}
+  verify:
+    name: Verify pi-hunk@${{ needs.resolve.outputs.version }}
     needs: resolve
     runs-on: ubuntu-latest
-    environment: npm-release
     permissions:
-      contents: write
+      contents: read
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
       RELEASE_INTEGRITY: ${{ needs.resolve.outputs.integrity }}
-      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
       RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
     steps:
       - name: Check out the exact commit recorded by npm
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ needs.resolve.outputs.commit }}
           fetch-depth: 0
-      - uses: jdx/mise-action@v3
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
           cache: true
           install: true
@@ -62,19 +62,44 @@ jobs:
           mise run check
       - name: Reproduce and verify the published tarball
         run: node scripts/verify-release-tarball.mjs "$RELEASE_INTEGRITY"
-      - name: Refuse an existing tag or release
+
+  finalize:
+    name: Tag pi-hunk@${{ needs.resolve.outputs.version }}
+    needs: [resolve, verify]
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: write
+    steps:
+      - name: Create or verify the immutable release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Tag already exists: $RELEASE_TAG" >&2
-            exit 1
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null || true)"
+          if [ -n "$existing" ]; then
+            test "$existing" = "$RELEASE_COMMIT" || {
+              echo "Existing tag $RELEASE_TAG points to $existing, not $RELEASE_COMMIT" >&2
+              exit 1
+            }
+            echo "Verified existing tag $RELEASE_TAG at $RELEASE_COMMIT"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" \
+              -f sha="$RELEASE_COMMIT"
           fi
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "GitHub release already exists: $RELEASE_TAG" >&2
-            exit 1
-          fi
-      - name: Tag the verified npm source commit
+      - name: Create the GitHub release if it does not exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          git tag "$RELEASE_TAG" "$RELEASE_COMMIT"
-          git push origin "refs/tags/$RELEASE_TAG"
-      - name: Create the GitHub release
-        run: gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub release $RELEASE_TAG already exists"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
