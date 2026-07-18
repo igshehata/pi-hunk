@@ -74,7 +74,7 @@ jobs:
           retention-days: 7
       - name: Preserve the pinned npm CLI for the credentialed job
         run: |
-          NPM_ROOT="$(cd "$(dirname "$(realpath "$(command -v npm)")")/.." && pwd)"
+          NPM_ROOT="$(cd "$(dirname "$(command -v npm)")/.." && pwd)"
           test "$(node -p 'require(process.argv[1]).version' "$NPM_ROOT/package.json")" = 11.17.0
           mkdir release-tools
           tar -czf release-tools/npm-cli-11.17.0.tgz -C "$(dirname "$NPM_ROOT")" "$(basename "$NPM_ROOT")"
