@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "categories": {
+    "correctness": "error"
+  },
+  "options": {
+    "maxWarnings": 0
+  },
+  "env": {
+    "builtin": true
+  },
+  "ignorePatterns": ["dist/**", "coverage/**", ".pi-subagents/**"],
+  "overrides": [
+    {
+      "files": ["extensions/overlay/input.ts", "test/render-buffer.test.ts"],
+      "rules": {
+        "no-control-regex": "off"
+      }
+    },
+    {
+      "files": ["extensions/coordinator.ts"],
+      "rules": {
+        "unicorn/no-useless-spread": "off"
+      }
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "name": "pi-hunk",
+  "version": "0.1.0",
+  "description": "Review Pi coding-agent changes in a native, persistent Hunk overlay",
+  "keywords": [
+    "code-review",
+    "coding-agent",
+    "diff",
+    "hunk",
+    "overlay",
+    "pi-extension",
+    "pi-package",
+    "tui"
+  ],
+  "homepage": "https://github.com/igshehata/pi-hunk#readme",
+  "bugs": {
+    "url": "https://github.com/igshehata/pi-hunk/issues"
+  },
+  "license": "MIT",
+  "author": "Islam Shehata",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/igshehata/pi-hunk.git"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm ls --depth=0 && npm test && npm run build && npm run verify:package",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "prepare": "npm run build",
+    "test": "vitest run",
+    "test:critical": "vitest run test/auto-review-integration.test.ts test/overlay-embedded-integration.test.ts test/experimental-pi-wrap.test.ts test/overlay-controller.test.ts test/embedded-visibility.test.ts test/config-command.test.ts test/extension-toggle.test.ts test/zigpty-adapter.test.ts",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "verify:package": "node scripts/verify-package.mjs"
+  },
+  "dependencies": {
+    "@coder/libghostty-vt-node": "0.1.0-beta.1",
+    "zigpty": "0.2.1"
+  },
+  "devDependencies": {
+    "@changesets/cli": "2.31.1",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
+    "@types/node": "24.13.3",
+    "esbuild": "0.28.1",
+    "oxfmt": "0.59.0",
+    "oxlint": "1.74.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "npm@11.17.0",
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

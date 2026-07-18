@@ -1,0 +1,71 @@
+[tools]
+node = "22.19.0"
+npm = "11.17.0"
+
+[tasks.setup]
+description = "Install dependencies and activate repository Git hooks"
+run = ["npm ci", "git config core.hooksPath .githooks"]
+
+[tasks.format]
+description = "Format source and documentation with Oxfmt"
+run = "npm run format"
+
+[tasks."format:check"]
+description = "Check formatting without changing files"
+run = "npm run format:check"
+
+[tasks.lint]
+description = "Lint TypeScript and JavaScript with Oxlint"
+run = "npm run lint"
+
+[tasks.typecheck]
+description = "Type-check the project"
+run = "npm run typecheck"
+
+[tasks.test]
+description = "Run the full automated test suite"
+run = "npm test"
+
+[tasks."test:critical"]
+description = "Run the release-blocking boundary suite"
+run = "npm run test:critical"
+
+[tasks.build]
+description = "Build the distributable Pi extension"
+run = "npm run build"
+
+[tasks.pack]
+description = "Verify the exact npm package and a clean consumer install"
+run = "npm run verify:package"
+
+[tasks.check]
+description = "Run every local release gate"
+run = [
+  "npm run format:check",
+  "npm run lint",
+  "npm run typecheck",
+  "npm test",
+  "npm run build",
+  "npm run verify:package",
+]
+
+[tasks."hook:pre-commit"]
+description = "Fast checks used by the pre-commit hook"
+run = ["npm run format:check", "npm run lint", "npm run typecheck"]
+
+[tasks."hook:pre-push"]
+description = "Release gates used by the pre-push hook"
+run = "mise run check"
+
+[tasks.changeset]
+description = "Describe a user-visible change for the next release"
+interactive = true
+run = "npm exec changeset"
+
+[tasks."changeset:status"]
+description = "Show pending Changesets and the resulting version"
+run = "npm exec changeset status"
+
+[tasks."release:version"]
+description = "Consume pending Changesets and update package versions/changelog"
+run = ["npm exec changeset version", "npm install --package-lock-only --ignore-scripts"]

@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version PR or release preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      should-stage: ${{ steps.state.outputs.should_stage }}
+      reason: ${{ steps.state.outputs.reason }}
+      version: ${{ steps.state.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v3
+        with:
+          cache: true
+          install: true
+      - run: npm ci --ignore-scripts
+      - name: Create or update the version pull request
+        uses: changesets/action@v1
+        with:
+          version: mise run release:version
+          commit: "chore: version package"
+          title: "chore: version package"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: state
+        name: Determine whether this commit contains an unpublished release
+        run: node scripts/release-state.mjs
+
+  stage:
+    name: Stage pi-hunk@${{ needs.version.outputs.version }}
+    needs: version
+    if: needs.version.outputs.should-stage == 'true'
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_CONFIG_PROVENANCE: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v3
+        with:
+          cache: true
+          install: true
+      - run: npm ci --ignore-scripts
+      - run: mise run check
+      - name: Stage the verified package through npm OIDC
+        run: npm stage publish . --access public
+      - name: Approval required
+        run: |
+          echo "pi-hunk@${{ needs.version.outputs.version }} is staged, not public."
+          echo "Inspect and approve it with npm 2FA before finalizing the release."

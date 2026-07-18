@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+set -eu
+
+if ! command -v mise >/dev/null 2>&1; then
+  echo "pi-hunk: mise is required for repository hooks (https://mise.jdx.dev)." >&2
+  exit 1
+fi
+
+exec mise run hook:pre-commit
