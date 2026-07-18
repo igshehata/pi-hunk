@@ -74,10 +74,17 @@ jobs:
           retention-days: 7
       - name: Preserve the pinned npm CLI for the credentialed job
         run: |
-          NPM_ROOT="$(cd "$(dirname "$(command -v npm)")/.." && pwd)"
-          test "$(node -p 'require(process.argv[1]).version' "$NPM_ROOT/package.json")" = 11.17.0
+          NPM_INSTALL="$(mise where npm@11.17.0)"
+          NPM_ROOT=""
+          for candidate in "$NPM_INSTALL/package" "$NPM_INSTALL/lib/node_modules/npm"; do
+            if test "$(node -p 'require(process.argv[1]).version' "$candidate/package.json" 2>/dev/null || true)" = 11.17.0; then
+              NPM_ROOT="$candidate"
+              break
+            fi
+          done
+          test -n "$NPM_ROOT"
           mkdir release-tools
-          tar -czf release-tools/npm-cli-11.17.0.tgz -C "$(dirname "$NPM_ROOT")" "$(basename "$NPM_ROOT")"
+          tar -czf release-tools/npm-cli-11.17.0.tgz -C "$NPM_ROOT" .
       - name: Upload the pinned npm CLI
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -118,8 +125,8 @@ jobs:
           test -f "$PACKAGE"
           test "$(find release -type f -name '*.tgz' | wc -l | tr -d ' ')" = 1
 
-          mkdir npm-cli publish repacked
-          tar -xzf release-tools/npm-cli-11.17.0.tgz -C npm-cli
+          mkdir -p npm-cli/package publish repacked
+          tar -xzf release-tools/npm-cli-11.17.0.tgz -C npm-cli/package
           test "$(node -p 'require(process.argv[1]).version' npm-cli/package/package.json)" = 11.17.0
 
           tar -xzf "$PACKAGE" -C publish
