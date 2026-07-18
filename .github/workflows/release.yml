@@ -132,12 +132,12 @@ jobs:
           tar -xzf "$PACKAGE" -C publish
           mkdir publish/package/.git
           printf '%s\n' "$RELEASE_COMMIT" > publish/package/.git/HEAD
-          node npm-cli/package/bin/npm-cli.js pack publish/package \
+          node npm-cli/package/bin/npm-cli.js pack ./publish/package \
             --ignore-scripts \
             --pack-destination repacked >/dev/null
           cmp "$PACKAGE" "repacked/pi-hunk-${RELEASE_VERSION}.tgz"
 
-          node npm-cli/package/bin/npm-cli.js stage publish publish/package \
+          node npm-cli/package/bin/npm-cli.js stage publish ./publish/package \
             --ignore-scripts \
             --access public
       - name: Approval required
