@@ -127,7 +127,7 @@ jobs:
 
           mkdir -p npm-cli/package publish repacked
           tar -xzf release-tools/npm-cli-11.17.0.tgz -C npm-cli/package
-          test "$(node -p 'require(process.argv[1]).version' npm-cli/package/package.json)" = 11.17.0
+          test "$(node -p 'require(require("node:path").resolve(process.argv[1])).version' npm-cli/package/package.json)" = 11.17.0
 
           tar -xzf "$PACKAGE" -C publish
           mkdir publish/package/.git
