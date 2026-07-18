@@ -77,8 +77,7 @@ jobs:
           RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null || true)"
-          if [ -n "$existing" ]; then
+          if existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null)"; then
             test "$existing" = "$RELEASE_COMMIT" || {
               echo "Existing tag $RELEASE_TAG points to $existing, not $RELEASE_COMMIT" >&2
               exit 1
