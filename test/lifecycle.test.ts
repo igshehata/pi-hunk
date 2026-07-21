@@ -95,7 +95,12 @@ describe("ReviewCoordinator shutdown", () => {
           },
         ) => {
           const component = factory(
-            { terminal: { columns: 80, rows: 24, write: vi.fn() }, requestRender: vi.fn() },
+            {
+              terminal: { columns: 80, rows: 24, write: vi.fn() },
+              render: vi.fn(() => []),
+              invalidate: vi.fn(),
+              requestRender: vi.fn(),
+            },
             {},
             {},
             () => undefined,
@@ -179,7 +184,12 @@ describe("ReviewCoordinator shutdown", () => {
             activeOpens += 1;
             maxConcurrent = Math.max(maxConcurrent, activeOpens);
             factory(
-              { terminal: { columns: 80, rows: 24, write: vi.fn() }, requestRender: vi.fn() },
+              {
+                terminal: { columns: 80, rows: 24, write: vi.fn() },
+                render: vi.fn(() => []),
+                invalidate: vi.fn(),
+                requestRender: vi.fn(),
+              },
               {},
               {},
               () => undefined,

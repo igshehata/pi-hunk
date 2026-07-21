@@ -43,8 +43,8 @@ export interface HunkConfig {
 }
 
 export const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
-  layout: "full",
-  experimentalPiWrap: false,
+  layout: "right",
+  experimentalPiWrap: true,
 };
 
 const OVERLAY_LAYOUTS: Record<OverlayLayout, ResolvedOverlayLayout> = {
