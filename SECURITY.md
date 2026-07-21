@@ -28,7 +28,8 @@ disclosure before publishing details.
 
 Repository npm installs enforce a seven-day minimum release age through `.npmrc`. New dependency
 versions therefore become eligible only after they have been public for seven days; `npm ci` remains
-reproducible from the reviewed lockfile. CI also fails on high-severity npm audit findings.
+reproducible from the reviewed lockfile. Maintainers can run `npm run audit` when reviewing
+dependency security without blocking unrelated CI changes.
 
 For an urgent security fix that is newer than the waiting period, a maintainer may explicitly run
 `npm install --min-release-age=0 <package>@<version>`, review the package and lockfile changes, and
