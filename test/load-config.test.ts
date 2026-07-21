@@ -119,7 +119,7 @@ describe("config loading", () => {
 
     const config = await loadConfig(context(root), (warning) => warnings.push(warning));
 
-    expect(config.overlay).toEqual({ layout: "full", experimentalPiWrap: false });
+    expect(config.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
     expect(warnings).toEqual([
       expect.stringContaining("invalid overlay.layout"),
       expect.stringContaining("invalid overlay.experimentalPiWrap"),

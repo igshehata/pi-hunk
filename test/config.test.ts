@@ -11,13 +11,13 @@ import {
 } from "../extensions/config.ts";
 
 describe("overlay config", () => {
-  it("ships overlay-only defaults", () => {
+  it("ships a wrapped right-split overlay by default", () => {
     expect(DEFAULT_CONFIG).toEqual(
       expect.objectContaining({
         review: "after-run",
         followEdits: true,
         hunk: { command: "hunk", args: ["diff", "--watch"] },
-        overlay: { layout: "full", experimentalPiWrap: false },
+        overlay: { layout: "right", experimentalPiWrap: true },
         bindings: { prefix: "ctrl+space", toggle: "h", show: "s" },
       }),
     );

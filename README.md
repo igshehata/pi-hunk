@@ -163,7 +163,7 @@ A typical sparse project configuration:
   "review": "live",
   "overlay": {
     "layout": "right",
-    "experimentalPiWrap": false
+    "experimentalPiWrap": true
   },
   "bindings": {
     "prefix": "ctrl+space",
@@ -179,8 +179,9 @@ Configuration precedence, from lowest to highest:
 shipped defaults → ~/.pi/agent/hunk.json → trusted .pi/hunk.json → PI_HUNK_REVIEW
 ```
 
-Available layouts are `full`, `left`, `right`, and `float`. Optional Pi wrapping keeps Pi visible in
-the remaining half of a left or right layout.
+By default, Hunk opens in the right half of the terminal and Pi wraps into the left half. Available
+layouts are `full`, `left`, `right`, and `float`; Pi wrapping can be toggled for left and right
+layouts.
 
 Pi-hunk does not own Hunk's theme, transparency, presentation, or keybindings. Configure those in
 Hunk's `~/.config/hunk/config.toml` or repository-local `.hunk/config.toml`.

@@ -85,10 +85,10 @@ describe("interactive /hunk config", () => {
       "live",
       "Follow edits: on",
       "off",
-      "Overlay layout: full",
-      "Right — 50% split pane",
-      "Pi word wrap: off",
-      "On — wrap Pi beside Hunk (experimental)",
+      "Overlay layout: right",
+      "Left — 50% split pane",
+      "Pi word wrap: on (experimental)",
+      "Off — overlay only (stable)",
       "Done",
     ]);
     const store = new ConfigStore();
@@ -99,12 +99,12 @@ describe("interactive /hunk config", () => {
     expect(store.get()).toMatchObject({
       review: "live",
       followEdits: false,
-      overlay: { layout: "right", experimentalPiWrap: true },
+      overlay: { layout: "left", experimentalPiWrap: false },
     });
     expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
       review: "live",
       followEdits: false,
-      overlay: { layout: "right", experimentalPiWrap: true },
+      overlay: { layout: "left", experimentalPiWrap: false },
     });
     expect(ctx.ui.select).not.toHaveBeenCalledWith("Save Hunk config", expect.anything());
   });
@@ -236,17 +236,17 @@ describe("interactive /hunk config", () => {
 });
 
 describe("direct /hunk config", () => {
-  it("persists directly to the project with no scope argument", async () => {
+  it("persists a changed layout directly to the project with no scope argument", async () => {
     const { ctx, projectPath } = await testProject([]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
-    await handleConfigCommand("right experimental-wrap", ctx, store, inactiveCoordinator);
+    await handleConfigCommand("left no-wrap", ctx, store, inactiveCoordinator);
 
     expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
-      overlay: { layout: "right", experimentalPiWrap: true },
+      overlay: { layout: "left", experimentalPiWrap: false },
     });
-    expect(store.get().overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(store.get().overlay).toEqual({ layout: "left", experimentalPiWrap: false });
   });
 
   it("rejects experimental wrapping for non-split layouts instead of discarding it", async () => {
