@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+### Minor Changes
+
+- 5fb9f2d: Open Hunk in a right-side split with Pi word wrapping enabled by default.
+- f343d60: Route automatic reviews to every Hunk-reported repository touched by structured mutation targets,
+  support explicit cwd routing for pathless shell changes, and skip Hunk-confirmed empty reviews.
+
 ## 0.1.0 — 2026-07-18
 
 Initial public release of pi-hunk:
