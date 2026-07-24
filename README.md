@@ -44,7 +44,7 @@ Pi changes code  →  Hunk opens  →  You annotate  →  Notes return to Pi  �
 ### Requirements
 
 - [Pi](https://github.com/earendil-works/pi) **0.80+**
-- [Hunk](https://github.com/modem-dev/hunk) **0.17+** available on `PATH`
+- [Hunk](https://github.com/modem-dev/hunk) **0.17.3+** available on `PATH`
 - Node.js **22.19+**
 - macOS arm64, or glibc Linux x64/arm64
 
@@ -84,20 +84,34 @@ hotkey from `/hunk config` by pressing the actual key—identifiers are never en
 ## Review workflow
 
 Pi-hunk opens one managed Hunk review at a time. Hiding it preserves the review position, selection,
-and comments. `/hunk close`, Hunk exit, or a Pi session boundary ends the review.
+and comments. When one run changes multiple repositories, pi-hunk reviews them sequentially—one Hunk
+process and approval flow per Hunk-reported repository root. `/hunk close`, Hunk exit, or a Pi
+session boundary ends the current review without falsely approving queued repositories.
 
 The agent-facing `hunk_review` tool blocks until review finishes:
 
 - **Hide with new comments:** submit only notes not previously returned in this loaded Pi extension.
-- **Hide with no new comments:** return `approved`; this is the human's no-new-findings signal.
+- **Hide with no new comments:** continue to the next repository, or return `approved` after all
+  discovered repositories are complete.
+- **No Hunk review files:** skip that repository and return `no-diff` when every candidate is empty.
 - **Close Hunk or press `Q`:** cancel the wait rather than report approval.
 
 Automatic review is deliberately mutation-driven. Conversation-only turns, read-only tools, and
-out-of-band workspace changes do not open Hunk. `live` opens at the first mutation preflight so you
-can watch the tool, but only successful tool completions count as review evidence. If no mutation
-succeeds, pi-hunk closes only the early surface it created for that run and leaves pre-existing or
-manual Hunk sessions alone. `approved`, `/hunk close`, and a clean Hunk exit suppress same-run
-auto-open; a non-zero Hunk crash can still be recovered by the live policy.
+out-of-band changes do not open Hunk. Structured mutation paths are resolved from Pi's startup
+directory and may point outside it; Hunk is launched from a safe existing directory near the target.
+Hunk remains authoritative for VCS detection and the repository root. Targets covered by the root
+reported by Hunk share one review, while genuinely separate roots are queued.
+
+`live` opens at the first path-bearing mutation preflight so you can watch the tool, but only
+successful tool completions count as settled review evidence. Shell commands can change directory
+through arbitrary syntax, so pi-hunk does not guess their target: when a successful pathless shell
+mutation cannot be paired with a structured path, the agent must call `hunk_review` with an explicit
+`cwd` (relative values resolve from Pi's startup directory). If no mutation succeeds or Hunk reports
+no reviewable files after a bounded reload wait, pi-hunk closes only the automatic surface it
+created for that run and leaves pre-existing/manual sessions alone. Explicit `/hunk` on a clean
+repository continues to open a watched session for future changes. `approved`, `no-diff`,
+`/hunk close`, and a clean Hunk exit suppress same-run auto-open; a non-zero Hunk crash can still be
+recovered by the live policy.
 
 ## Commands
 
@@ -135,8 +149,13 @@ Change policy interactively with `/hunk config` or directly:
 
 ## Git, Jujutsu, and Sapling
 
-Pi-hunk launches Hunk from Pi's current workspace and passes supported arguments through unchanged.
-Hunk remains responsible for repository detection, revision semantics, and diff loading.
+Manual commands launch Hunk from Pi's current workspace and pass supported arguments through
+unchanged. Automatic review instead follows successful path-bearing mutation targets, including
+absolute and parent-relative paths outside Pi's startup directory. Hunk—not pi-hunk—detects the
+nearest Git, Jujutsu, or Sapling repository and reports the authoritative root used for routing,
+comment handoff, and follow-edit navigation. Dynamically selected review targets never change where
+pi-hunk loads its own `.pi/hunk.json` configuration; that remains scoped to the original trusted Pi
+session directory.
 
 ```text
 /hunk                         # detected VCS working-copy changes

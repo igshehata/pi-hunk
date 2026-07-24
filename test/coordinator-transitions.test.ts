@@ -6,6 +6,9 @@ import type { OverlaySurface } from "../extensions/overlay/surface.ts";
 function fakeOverlay(): OverlaySurface & { calls: string[] } {
   let state: "closed" | "visible" | "hidden" = "closed";
   let listener: (() => void) | undefined;
+  let launchCwd = "/repo";
+  let sessionId: string | undefined;
+  let repoRoot: string | undefined;
   const calls: string[] = [];
 
   return {
@@ -15,13 +18,30 @@ function fakeOverlay(): OverlaySurface & { calls: string[] } {
     },
     getState: () => state,
     isLive: () => state !== "closed",
-    getInfo: () => (state === "closed" ? null : { state, argsKey: "[]", pid: 4242 }),
-    async ensure() {
+    getInfo: () =>
+      state === "closed"
+        ? null
+        : {
+            state,
+            argsKey: "[]",
+            launchCwd,
+            source: "manual",
+            pid: 4242,
+            sessionId,
+            repoRoot,
+          },
+    async ensure(_ctx: unknown, request: { cwd: string }) {
       calls.push("ensure:start");
+      launchCwd = request.cwd;
       await new Promise((resolve) => setTimeout(resolve, 10));
       state = "visible";
       calls.push("ensure:end");
       listener?.();
+    },
+    adoptManagedSession(session: { sessionId: string; repoRoot?: string }) {
+      sessionId = session.sessionId;
+      repoRoot = session.repoRoot;
+      return true;
     },
     async show() {
       calls.push("show");
@@ -129,6 +149,41 @@ describe("ReviewCoordinator overlay lifecycle", () => {
       expect(notify).toHaveBeenCalledWith(
         expect.stringContaining("ambiguous managed session"),
         "warning",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the adopted Hunk repo root and exact session for follow-edit navigation", async () => {
+    const overlay = fakeOverlay();
+    const navigateHunk = vi.fn(async () => undefined);
+    const coordinator = new ReviewCoordinator({ overlay, navigateHunk });
+    const config = cloneConfig(DEFAULT_CONFIG);
+    const followCtx = { ...ctx, ui: { notify: vi.fn() } } as any;
+    await coordinator.ensureOpen(followCtx, config, [], "manual", "/repo-b/packages/app");
+    coordinator.adoptManagedSession({
+      sessionId: "repo-b-session",
+      pid: 4242,
+      cwd: "/repo-b/packages/app",
+      repoRoot: "/repo-b",
+      launchedAt: "2026-01-01T00:00:00.000Z",
+      fileCount: 1,
+      files: [{ path: "packages/app/src/a.ts" }],
+    });
+
+    vi.useFakeTimers();
+    try {
+      coordinator.scheduleFollowEdit(followCtx, config, "/repo-b/packages/app/src/a.ts");
+      await vi.advanceTimersByTimeAsync(350);
+
+      expect(navigateHunk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cwd: "/repo-b",
+          filePath: "/repo-b/packages/app/src/a.ts",
+          sessionId: "repo-b-session",
+          managedPid: 4242,
+        }),
       );
     } finally {
       vi.useRealTimers();

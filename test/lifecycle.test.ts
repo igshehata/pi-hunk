@@ -7,13 +7,28 @@ import { ReviewCoordinator } from "../extensions/coordinator.ts";
 describe("ChangeDetector", () => {
   it("resets mutation evidence and orphaned tool args after settlement", () => {
     const detector = new ChangeDetector();
-    expect(detector.consumeSettled()).toEqual({ mutation: false });
+    expect(detector.consumeSettled()).toEqual({
+      mutation: false,
+      targets: [],
+      unresolved: false,
+      revision: 0,
+    });
     detector.rememberToolArgs("aborted", { path: "orphaned.ts" });
     detector.markChanged();
 
-    expect(detector.consumeSettled()).toEqual({ mutation: true });
+    expect(detector.consumeSettled()).toEqual({
+      mutation: true,
+      targets: [],
+      unresolved: true,
+      revision: 1,
+    });
     expect(detector.takeToolArgs("aborted")).toBeUndefined();
-    expect(detector.consumeSettled()).toEqual({ mutation: false });
+    expect(detector.consumeSettled()).toEqual({
+      mutation: false,
+      targets: [],
+      unresolved: false,
+      revision: 1,
+    });
   });
 
   it("clears remembered tool args on reset", () => {

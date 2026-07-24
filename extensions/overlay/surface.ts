@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
+import { resolve } from "node:path";
 // Type-only import: erased at compile time so zigpty / libghostty are NOT
 // pulled into the module graph at extension startup. The value is loaded lazily
 // inside open() via loadEmbedded so a broken native build fails over instead of
@@ -159,6 +160,11 @@ export class OverlaySurface {
   private handle: OverlayHandle | undefined;
   private component: OverlayComponent | undefined;
   private currentPid: number | undefined;
+  private currentLaunchCwd: string | undefined;
+  private currentSource: OpenRequest["source"] | undefined;
+  private currentSessionId: string | undefined;
+  private currentRepoRoot: string | undefined;
+  private currentFileCount: number | undefined;
   private experimentalPiWrap: ExperimentalPiWrapController | undefined;
   private currentArgsKey: string | undefined;
   private startPromise: Promise<void> | null = null;
@@ -207,7 +213,9 @@ export class OverlaySurface {
   }
 
   private sessionRelation(request: OpenRequest): SessionRelation {
-    return this.currentArgsKey === argsKey(request.command, request.args) ? "same" : "different";
+    return this.currentArgsKey === argsKey(request.command, request.args, resolve(request.cwd))
+      ? "same"
+      : "different";
   }
 
   private async dispatchRequest(
@@ -281,9 +289,28 @@ export class OverlaySurface {
     return {
       state: this.state,
       argsKey: this.currentArgsKey ?? "",
+      launchCwd: this.currentLaunchCwd ?? "",
+      source: this.currentSource ?? "manual",
       pid: this.currentPid,
+      sessionId: this.currentSessionId,
+      repoRoot: this.currentRepoRoot,
+      fileCount: this.currentFileCount,
       detail: this.state,
     };
+  }
+
+  /** Adopt authoritative metadata from the Hunk session selected by managed PID. */
+  adoptManagedSession(metadata: {
+    sessionId: string;
+    pid: number;
+    repoRoot?: string;
+    fileCount: number;
+  }): boolean {
+    if (this.currentPid !== undefined && metadata.pid !== this.currentPid) return false;
+    this.currentSessionId = metadata.sessionId;
+    this.currentRepoRoot = metadata.repoRoot;
+    this.currentFileCount = metadata.fileCount;
+    return true;
   }
 
   async ensure(ctx: ExtensionContext, request: OpenRequest, config: HunkConfig): Promise<void> {
@@ -298,8 +325,11 @@ export class OverlaySurface {
   async open(ctx: ExtensionContext, request: OpenRequest, config: HunkConfig): Promise<void> {
     if (this.startPromise) {
       await this.startPromise;
-      // After concurrent start settles, ensure/show if same args.
-      if (this.isLive() && this.currentArgsKey === argsKey(request.command, request.args)) {
+      // After concurrent start settles, ensure/show if the managed surface identity matches.
+      if (
+        this.isLive() &&
+        this.currentArgsKey === argsKey(request.command, request.args, resolve(request.cwd))
+      ) {
         if (this.state === "hidden") await this.show();
         return;
       }
@@ -325,7 +355,12 @@ export class OverlaySurface {
 
     this.transitionState("starting");
     const gen = ++this.generation;
-    this.currentArgsKey = argsKey(request.command, request.args);
+    this.currentLaunchCwd = resolve(request.cwd);
+    this.currentSource = request.source;
+    this.currentSessionId = undefined;
+    this.currentRepoRoot = undefined;
+    this.currentFileCount = undefined;
+    this.currentArgsKey = argsKey(request.command, request.args, this.currentLaunchCwd);
 
     let startSettled = false;
     this.startPromise = new Promise<void>((resolve, reject) => {
@@ -760,6 +795,11 @@ export class OverlaySurface {
     this.handle = undefined;
     this.component = undefined;
     this.currentPid = undefined;
+    this.currentLaunchCwd = undefined;
+    this.currentSource = undefined;
+    this.currentSessionId = undefined;
+    this.currentRepoRoot = undefined;
+    this.currentFileCount = undefined;
     const experimentalPiWrap = this.experimentalPiWrap;
     this.experimentalPiWrap = undefined;
     try {
