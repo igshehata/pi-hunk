@@ -50,9 +50,9 @@ describe("isMutation", () => {
 describe("isWorkspaceMutation", () => {
   const cwd = "/repo/project";
 
-  it("scopes path-bearing mutation tools to Pi's workspace", () => {
-    expect(isWorkspaceMutation("write", { path: "/tmp/outside.ts" }, cwd)).toBe(false);
-    expect(isWorkspaceMutation("write", { path: "../sibling.ts" }, cwd)).toBe(false);
+  it("accepts path-bearing mutation tools inside and outside Pi's workspace", () => {
+    expect(isWorkspaceMutation("write", { path: "/tmp/outside.ts" }, cwd)).toBe(true);
+    expect(isWorkspaceMutation("write", { path: "../sibling.ts" }, cwd)).toBe(true);
     expect(isWorkspaceMutation("write", { path: "..config/generated.ts" }, cwd)).toBe(true);
     expect(isWorkspaceMutation("write", { path: "src/inside.ts" }, cwd)).toBe(true);
     expect(

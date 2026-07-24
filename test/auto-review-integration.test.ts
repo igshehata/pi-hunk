@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { cloneConfig, ConfigStore, DEFAULT_CONFIG } from "../extensions/config.ts";
-import type { ChangeDetector } from "../extensions/change-detector.ts";
+import { ChangeDetector } from "../extensions/change-detector.ts";
 import { ReviewCoordinator } from "../extensions/coordinator.ts";
 import hunkExtension from "../extensions/index.ts";
 import type { EmbeddedOptions } from "../extensions/overlay/embedded.ts";
@@ -13,37 +13,14 @@ import { OverlaySurface, type OverlayComponent } from "../extensions/overlay/sur
 
 const temporaryDirectories: string[] = [];
 
+class LiveDetector extends ChangeDetector {}
+
 afterEach(async () => {
   delete process.env.PI_HUNK_CONFIG;
   await Promise.all(
     temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
 });
-
-class LiveDetector {
-  changed = false;
-  private readonly toolArgs = new Map<string, unknown>();
-  reset(): void {
-    this.changed = false;
-    this.toolArgs.clear();
-  }
-  markChanged(): void {
-    this.changed = true;
-  }
-  rememberToolArgs(toolCallId: string, args: unknown): void {
-    this.toolArgs.set(toolCallId, args);
-  }
-  takeToolArgs(toolCallId: string): unknown {
-    const args = this.toolArgs.get(toolCallId);
-    this.toolArgs.delete(toolCallId);
-    return args;
-  }
-  consumeSettled() {
-    const mutation = this.changed;
-    this.changed = false;
-    return { mutation };
-  }
-}
 
 function harness(
   cwd: string,
@@ -62,6 +39,7 @@ function harness(
     if (options.failFirstMount && mountAttempts === 1)
       throw new Error("simulated early mount failure");
     const component: OverlayComponent & { visible: boolean } = {
+      pid: 101,
       visible: true,
       render: () => ["hunk"],
       invalidate: () => undefined,
@@ -123,6 +101,48 @@ function harness(
   return { events, tools, commands, mounts, coordinator, pi, ctx, handle };
 }
 
+function reviewableRun(cwd: string) {
+  return async (argv: string[]) => {
+    if (argv.slice(1).join(" ") !== "session list --json") {
+      return { code: 1, stderr: `unexpected argv: ${argv.join(" ")}`, stdout: "" };
+    }
+    return {
+      code: 0,
+      stderr: "",
+      stdout: JSON.stringify({
+        sessions: [
+          {
+            sessionId: "s1",
+            pid: 101,
+            cwd,
+            repoRoot: cwd,
+            launchedAt: "2026-01-01T00:00:00.000Z",
+            fileCount: 1,
+            files: [{ path: "src/a.ts" }],
+          },
+        ],
+      }),
+    };
+  };
+}
+
+function immediateSessionWait(fileCount: number) {
+  return async (options: { cwd: string; managedPid?: number }) => {
+    const session = {
+      sessionId: "s1",
+      pid: options.managedPid ?? 101,
+      cwd: options.cwd,
+      repoRoot: options.cwd,
+      launchedAt: "2026-01-01T00:00:00.000Z",
+      fileCount,
+      files: fileCount === 0 ? [] : [{ path: "src/a.ts" }],
+    };
+    return fileCount === 0
+      ? ({ status: "no-diff", session } as const)
+      : ({ status: "reviewable", session } as const);
+  };
+}
+
 function emptyReviewRun(cwd: string) {
   return async (argv: string[]) => {
     const command = argv.slice(1).join(" ");
@@ -138,6 +158,8 @@ function emptyReviewRun(cwd: string) {
               cwd,
               repoRoot: cwd,
               launchedAt: "2026-01-01T00:00:00.000Z",
+              fileCount: 1,
+              files: [{ path: "src/a.ts" }],
             },
           ],
         }),
@@ -151,9 +173,9 @@ function emptyReviewRun(cwd: string) {
 }
 
 describe("automatic review policies in action", () => {
-  const scopedMutationCases = [
-    ["/tmp absolute path", "write", { path: "/tmp/pi-hunk-outside.ts" }, false],
-    ["../ sibling path", "write", { path: "../sibling.ts" }, false],
+  const liveMutationCases = [
+    ["/tmp absolute path", "write", { path: "/tmp/pi-hunk-outside.ts" }, true],
+    ["../ sibling path", "write", { path: "../sibling.ts" }, true],
     ["relative inside path", "write", { path: "src/inside.ts" }, true],
     [
       "mixed multi-edit",
@@ -161,7 +183,7 @@ describe("automatic review policies in action", () => {
       { edits: [{ path: "/tmp/outside.ts" }, { path: "src/inside.ts" }] },
       true,
     ],
-    ["pathless mutating bash", "bash", { command: "touch generated.ts" }, true],
+    ["pathless mutating bash", "bash", { command: "touch generated.ts" }, false],
   ] as const;
 
   it("opens one visible Hunk session on the first mutation and reuses it when the run settles", async () => {
@@ -176,7 +198,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: detector as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
 
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
@@ -265,7 +287,7 @@ describe("automatic review policies in action", () => {
     expect(runtime.mounts[0]!.component.visible).toBe(true);
   });
 
-  it("closes only a current-run early live surface when no mutation succeeds", async () => {
+  it("closes only a current-run early live surface when an outside-workspace mutation fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-failed-"));
     temporaryDirectories.push(root);
     process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
@@ -276,12 +298,15 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
 
-    const editInput = { path: "src/a.ts", edits: [{ oldText: "a", newText: "b" }] };
+    const editInput = {
+      path: "/tmp/pi-hunk-failed-outside.ts",
+      edits: [{ oldText: "a", newText: "b" }],
+    };
     await runtime.events.get("tool_execution_start")?.(
       {
         type: "tool_execution_start",
@@ -309,6 +334,105 @@ describe("automatic review policies in action", () => {
     expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalled();
   });
 
+  it.each(["after-run", "live"] as const)(
+    "closes an automatic %s surface and returns cached no-diff when Hunk has zero files",
+    async (review) => {
+      const root = await mkdtemp(join(tmpdir(), `pi-hunk-${review}-no-diff-`));
+      temporaryDirectories.push(root);
+      process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+      await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review }));
+
+      const runtime = harness(root);
+      hunkExtension(runtime.pi, {
+        store: new ConfigStore(),
+        detector: new ChangeDetector(),
+        coordinator: runtime.coordinator,
+        reviewRun: reviewableRun(root),
+        reviewWaitForSession: immediateSessionWait(0),
+      });
+      await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+      await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+      const input = { path: "src/a.ts", content: "temporarily changed" };
+      await runtime.events.get("tool_execution_start")?.(
+        {
+          type: "tool_execution_start",
+          toolCallId: "write-reverted",
+          toolName: "write",
+          args: input,
+        },
+        runtime.ctx,
+      );
+      await runtime.events.get("tool_execution_end")?.(
+        {
+          type: "tool_execution_end",
+          toolCallId: "write-reverted",
+          toolName: "write",
+          isError: false,
+        },
+        runtime.ctx,
+      );
+      await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+
+      expect(runtime.mounts).toHaveLength(1);
+      expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalled();
+      expect(runtime.coordinator.getActiveInfo()).toBeNull();
+      await expect(
+        runtime.tools.get("hunk_review")?.execute("call", {}, undefined, undefined, runtime.ctx),
+      ).resolves.toMatchObject({ details: { status: "no-diff" } });
+      expect(runtime.mounts).toHaveLength(1);
+    },
+  );
+
+  it("closes a live surface on a no-diff retry after transient session registration failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-no-diff-retry-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "live" }));
+
+    let lookup = 0;
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      detector: new ChangeDetector(),
+      coordinator: runtime.coordinator,
+      reviewRun: reviewableRun(root),
+      reviewWaitForSession: async (options) => {
+        lookup += 1;
+        if (lookup === 1) return { status: "not-found" } as const;
+        return immediateSessionWait(0)(options);
+      },
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+    const input = { path: "src/a.ts", content: "reverted" };
+    await runtime.events.get("tool_execution_start")?.(
+      {
+        type: "tool_execution_start",
+        toolCallId: "retry-empty",
+        toolName: "write",
+        args: input,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("tool_execution_end")?.(
+      {
+        type: "tool_execution_end",
+        toolCallId: "retry-empty",
+        toolName: "write",
+        isError: false,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+    expect(runtime.coordinator.getActiveInfo()).not.toBeNull();
+
+    await expect(
+      runtime.tools.get("hunk_review")?.execute("call", {}, undefined, undefined, runtime.ctx),
+    ).resolves.toMatchObject({ details: { status: "no-diff" } });
+    expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalled();
+    expect(runtime.coordinator.getActiveInfo()).toBeNull();
+  });
+
   it("preserves a pre-existing live surface with different args through failed and successful mutations", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-preexisting-"));
     temporaryDirectories.push(root);
@@ -320,7 +444,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
 
@@ -407,6 +531,103 @@ describe("automatic review policies in action", () => {
     );
   });
 
+  it("does not destroy a pre-existing manual surface when current-run evidence is empty", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-manual-no-diff-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "live" }));
+
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      detector: new ChangeDetector(),
+      coordinator: runtime.coordinator,
+      reviewRun: reviewableRun(root),
+      reviewWaitForSession: immediateSessionWait(0),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    const config = cloneConfig(DEFAULT_CONFIG);
+    config.review = "live";
+    await runtime.coordinator.ensureOpen(runtime.ctx, config, ["show"], "manual");
+    await runtime.coordinator.toggleOverlay(runtime.ctx, config, ["show"], "shortcut");
+    const manualMount = runtime.mounts[0]!;
+
+    await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+    const input = { path: "src/a.ts", content: "reverted" };
+    await runtime.events.get("tool_execution_start")?.(
+      {
+        type: "tool_execution_start",
+        toolCallId: "manual-empty",
+        toolName: "write",
+        args: input,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("tool_execution_end")?.(
+      {
+        type: "tool_execution_end",
+        toolCallId: "manual-empty",
+        toolName: "write",
+        isError: false,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+
+    expect(runtime.mounts).toHaveLength(1);
+    expect(runtime.mounts[0]).toBe(manualMount);
+    expect(manualMount.component.dispose).not.toHaveBeenCalled();
+    expect(runtime.coordinator.getActiveInfo()?.state).toBe("hidden");
+  });
+
+  it("keeps invalid structured paths as unresolved evidence without throwing from follow-edits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-invalid-target-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "live" }));
+
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      detector: new ChangeDetector(),
+      coordinator: runtime.coordinator,
+      reviewRun: reviewableRun(root),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    const config = cloneConfig(DEFAULT_CONFIG);
+    config.review = "live";
+    await runtime.coordinator.ensureOpen(runtime.ctx, config, config.hunk.args, "manual");
+    await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+
+    const input = { path: "invalid\0target.ts", content: "changed" };
+    await runtime.events.get("tool_execution_start")?.(
+      {
+        type: "tool_execution_start",
+        toolCallId: "invalid-target",
+        toolName: "write",
+        args: input,
+      },
+      runtime.ctx,
+    );
+    await expect(
+      Promise.resolve().then(() =>
+        runtime.events.get("tool_execution_end")?.(
+          {
+            type: "tool_execution_end",
+            toolCallId: "invalid-target",
+            toolName: "write",
+            isError: false,
+          },
+          runtime.ctx,
+        ),
+      ),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      runtime.tools.get("hunk_review")?.execute("call", {}, undefined, undefined, runtime.ctx),
+    ).resolves.toMatchObject({ details: { status: "target-required" } });
+  });
+
   it("does not open for conversation or read-only tools", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-chat-"));
     temporaryDirectories.push(root);
@@ -419,7 +640,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: detector as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
 
@@ -453,8 +674,143 @@ describe("automatic review policies in action", () => {
     expect(runtime.coordinator.getActiveInfo()).toBeNull();
   });
 
-  it.each(scopedMutationCases)(
-    "scopes live preflight mutation evidence for %s",
+  it.each(["absolute", "parent-relative"] as const)(
+    "routes an %s mutation from repo A into repo B",
+    async (targetKind) => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-cross-repo-")));
+      temporaryDirectories.push(root);
+      const repoA = join(root, "repo-a");
+      const repoB = join(root, "repo-b");
+      await Promise.all([
+        mkdir(join(repoA, "src"), { recursive: true }),
+        mkdir(join(repoB, "src"), { recursive: true }),
+      ]);
+      process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+      await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+
+      const runtime = harness(repoA);
+      hunkExtension(runtime.pi, {
+        store: new ConfigStore(),
+        detector: new ChangeDetector(),
+        coordinator: runtime.coordinator,
+        reviewRun: reviewableRun(repoB),
+        reviewWaitForSession: async (options) => ({
+          status: "reviewable",
+          session: {
+            sessionId: "repo-b",
+            pid: options.managedPid ?? 101,
+            cwd: options.cwd,
+            repoRoot: repoB,
+            launchedAt: "2026-01-01T00:00:00.000Z",
+            fileCount: 1,
+            files: [{ path: "src/a.ts" }],
+          },
+        }),
+      });
+      await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+      await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+      const path = targetKind === "absolute" ? join(repoB, "src/a.ts") : "../repo-b/src/a.ts";
+      await runtime.events.get("tool_execution_start")?.(
+        {
+          type: "tool_execution_start",
+          toolCallId: "outside-write",
+          toolName: "write",
+          args: { path, content: "changed" },
+        },
+        runtime.ctx,
+      );
+      await runtime.events.get("tool_execution_end")?.(
+        {
+          type: "tool_execution_end",
+          toolCallId: "outside-write",
+          toolName: "write",
+          isError: false,
+        },
+        runtime.ctx,
+      );
+      await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+
+      expect(runtime.mounts).toHaveLength(1);
+      expect(runtime.mounts[0]!.options.cwd).toBe(join(repoB, "src"));
+      expect(runtime.mounts[0]!.options.cwd).not.toContain(repoA);
+      expect(runtime.coordinator.getActiveInfo()).toMatchObject({ repoRoot: repoB });
+    },
+  );
+
+  it("reconciles a live preflight when successful paired evidence targets another repository", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-live-reconcile-")));
+    temporaryDirectories.push(root);
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    await Promise.all([
+      mkdir(join(repoA, "src"), { recursive: true }),
+      mkdir(join(repoB, "src"), { recursive: true }),
+    ]);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "live" }));
+
+    const runtime = harness(repoA);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      detector: new ChangeDetector(),
+      coordinator: runtime.coordinator,
+      reviewRun: reviewableRun(repoB),
+      reviewWaitForSession: async (options) => ({
+        status: "reviewable",
+        session: {
+          sessionId: "repo-b",
+          pid: options.managedPid ?? 101,
+          cwd: options.cwd,
+          repoRoot: repoB,
+          launchedAt: "2026-01-01T00:00:00.000Z",
+          fileCount: 1,
+          files: [{ path: "src/b.ts" }],
+        },
+      }),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+
+    await runtime.events.get("tool_execution_start")?.(
+      {
+        type: "tool_execution_start",
+        toolCallId: "paired-edit",
+        toolName: "write",
+        args: { path: "src/a.ts", content: "preflight" },
+      },
+      runtime.ctx,
+    );
+    await vi.waitFor(() => expect(runtime.mounts).toHaveLength(1));
+    expect(runtime.mounts[0]!.options.cwd).toBe(join(repoA, "src"));
+
+    await runtime.events.get("tool_call")?.(
+      {
+        type: "tool_call",
+        toolCallId: "paired-edit",
+        toolName: "write",
+        input: { path: join(repoB, "src/b.ts"), content: "settled" },
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("tool_execution_end")?.(
+      {
+        type: "tool_execution_end",
+        toolCallId: "paired-edit",
+        toolName: "write",
+        isError: false,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+
+    expect(runtime.mounts).toHaveLength(2);
+    expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalled();
+    expect(runtime.mounts[1]!.options.cwd).toBe(join(repoB, "src"));
+    expect(runtime.coordinator.getActiveInfo()).toMatchObject({ repoRoot: repoB });
+  });
+
+  it.each(liveMutationCases)(
+    "routes live preflight mutation evidence for %s",
     async (_label, toolName, args, shouldOpen) => {
       const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-scope-"));
       temporaryDirectories.push(root);
@@ -466,7 +822,7 @@ describe("automatic review policies in action", () => {
         store: new ConfigStore(),
         detector: new LiveDetector() as unknown as ChangeDetector,
         coordinator: runtime.coordinator,
-        reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+        reviewRun: reviewableRun(root),
       });
       await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
       await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -486,8 +842,8 @@ describe("automatic review policies in action", () => {
     },
   );
 
-  it.each(scopedMutationCases)(
-    "scopes after-run settled mutation evidence for %s",
+  it.each(liveMutationCases)(
+    "routes after-run settled mutation evidence for %s",
     async (_label, toolName, args, shouldOpen) => {
       const root = await mkdtemp(join(tmpdir(), "pi-hunk-after-run-scope-"));
       temporaryDirectories.push(root);
@@ -499,7 +855,7 @@ describe("automatic review policies in action", () => {
         store: new ConfigStore(),
         detector: new LiveDetector() as unknown as ChangeDetector,
         coordinator: runtime.coordinator,
-        reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+        reviewRun: reviewableRun(root),
       });
       await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
       await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -532,7 +888,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: detector as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
 
@@ -628,7 +984,7 @@ describe("automatic review policies in action", () => {
         store: new ConfigStore(),
         detector: new LiveDetector() as unknown as ChangeDetector,
         coordinator: runtime.coordinator,
-        reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+        reviewRun: reviewableRun(root),
       });
       await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
 
@@ -685,7 +1041,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
     expect(
@@ -742,7 +1098,12 @@ describe("automatic review policies in action", () => {
     await vi.waitFor(() => expect(runtime.coordinator.getActiveInfo()?.state).toBe("visible"));
     runtime.mounts[0]!.options.onToggleRequest?.();
     await vi.waitFor(() => expect(runtime.coordinator.getActiveInfo()?.state).toBe("hidden"));
-    await expect(review).resolves.toMatchObject({ details: { status: "approved" } });
+    const reviewResult = await review;
+    expect(reviewResult?.details).toEqual({
+      status: "approved",
+      message: expect.any(String),
+      notes: [],
+    });
 
     await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
     expect(runtime.coordinator.getActiveInfo()?.state).toBe("hidden");
@@ -761,7 +1122,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -830,7 +1191,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -875,7 +1236,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -921,7 +1282,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: detector as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+      reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);

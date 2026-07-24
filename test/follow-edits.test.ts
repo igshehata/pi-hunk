@@ -21,16 +21,16 @@ describe("mutationTargetPath", () => {
     ).toBe("extensions/index.ts");
   });
 
-  it("chooses an in-workspace target from mixed multi-edit payloads", () => {
+  it("normalizes the first target even when it is outside Pi's workspace", () => {
     expect(
       mutationTargetPath(
         { edits: [{ path: "/tmp/outside.ts" }, { path: "src/inside.ts" }] },
         "/repo",
       ),
-    ).toBe("src/inside.ts");
-    expect(mutationTargetPath({ path: "../sibling.ts" }, "/repo/project")).toBeUndefined();
+    ).toBe("/tmp/outside.ts");
+    expect(mutationTargetPath({ path: "../sibling.ts" }, "/repo/project")).toBe("/repo/sibling.ts");
     expect(mutationTargetPath({ path: "..config/generated.ts" }, "/repo/project")).toBe(
-      "..config/generated.ts",
+      "/repo/project/..config/generated.ts",
     );
   });
 
@@ -85,6 +85,8 @@ describe("navigateHunkSession", () => {
     cwd: "/repo",
     repoRoot: "/repo",
     launchedAt,
+    fileCount: 1,
+    files: [{ path: "src/a.ts" }],
     ...overrides,
   });
 
@@ -146,7 +148,7 @@ describe("navigateHunkSession", () => {
     ]);
   });
 
-  it("rejects ambiguous same-repo sessions with a PID mismatch without navigating", async () => {
+  it("rejects same-repo sessions with a managed PID mismatch without navigating", async () => {
     const run = runner([
       session({ sessionId: "first", pid: 111 }),
       session({ sessionId: "second", pid: 222 }),
@@ -154,8 +156,14 @@ describe("navigateHunkSession", () => {
 
     await expect(
       navigateHunkSession({ cwd: "/repo", filePath: "src/a.ts", managedPid: 999, run }),
-    ).rejects.toThrow(/Ambiguous live Hunk sessions/);
+    ).rejects.toThrow(/No live Hunk session found/);
     expect(run).toHaveBeenCalledTimes(1);
+
+    const uniqueRun = runner([session({ sessionId: "only", pid: 111 })]);
+    await expect(
+      navigateHunkSession({ cwd: "/repo", filePath: "src/a.ts", managedPid: 999, run: uniqueRun }),
+    ).rejects.toThrow(/No live Hunk session found/);
+    expect(uniqueRun).toHaveBeenCalledTimes(1);
   });
 
   it("honors a pinned session id and passes it positionally", async () => {
@@ -232,6 +240,30 @@ describe("navigateHunkSession", () => {
     });
     expect(run).toHaveBeenCalledTimes(2);
   });
+
+  it.runIf(process.platform !== "win32")(
+    "canonicalizes an absolute missing target through a symlink against the adopted root",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "pi-hunk-follow-absolute-symlink-"));
+      const realRepo = join(root, "real-repo");
+      const linkedRepo = join(root, "linked-repo");
+      await mkdir(join(realRepo, "packages", "app"), { recursive: true });
+      await symlink(realRepo, linkedRepo);
+      try {
+        const run = runner([session({ pid: 708, cwd: realRepo, repoRoot: realRepo })], (argv) =>
+          expect(argv[5]).toBe("packages/app/src/missing.ts"),
+        );
+        await navigateHunkSession({
+          cwd: realRepo,
+          filePath: join(linkedRepo, "packages", "app", "src", "missing.ts"),
+          managedPid: 708,
+          run,
+        });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.runIf(process.platform !== "win32")(
     "canonicalizes a symlinked Pi cwd against Hunk's real repo root",

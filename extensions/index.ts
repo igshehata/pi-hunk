@@ -15,12 +15,7 @@ import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 type BeforeAgentStartEvent = Extract<ExtensionEvent, { type: "before_agent_start" }>;
 type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
 type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end" }>;
-import {
-  isWorkspaceMutation,
-  mutationTargetPath,
-  toWorkspaceRelative,
-  ChangeDetector,
-} from "./change-detector.ts";
+import { isMutation, mutationTargetPaths, ChangeDetector } from "./change-detector.ts";
 import {
   ConfigStore,
   explainSettledDecision,
@@ -40,8 +35,10 @@ import {
   ReviewHandoffGate,
   type BlockingReviewResult,
   type HunkReviewNote,
+  type ReviewSessionWaiter,
 } from "./review-handoff.ts";
 import type { HunkRunner } from "./hunk-session.ts";
+import { resolveLaunchDirectory } from "./path-routing.ts";
 
 /**
  * Injectable collaborators so tests can drive the registered /hunk command and
@@ -55,6 +52,8 @@ export interface HunkExtensionDeps {
   coordinator?: ReviewCoordinator;
   /** Fake-runner seam for the isolated review handoff module. */
   reviewRun?: HunkRunner;
+  /** Deterministic managed-session polling seam for integration tests. */
+  reviewWaitForSession?: ReviewSessionWaiter;
 }
 
 /** Last settled auto-open decision, kept per extension instance for /hunk status. */
@@ -70,6 +69,7 @@ interface LifecycleDeps {
   store: ConfigStore;
   detector: ChangeDetector;
   coordinator: ReviewCoordinator;
+  reviewGate: ReviewHandoffGate;
   diagnostics: SettledDiagnostics;
   /** Registers the config-driven prefix; see the factory for why registration is late-bound. */
   registerPrefix: (ctx: ExtensionContext) => void;
@@ -81,7 +81,12 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
   const store = deps.store ?? new ConfigStore();
   const detector = deps.detector ?? new ChangeDetector();
   const coordinator = deps.coordinator ?? new ReviewCoordinator();
-  const reviewGate = new ReviewHandoffGate(coordinator, () => store.get(), deps.reviewRun);
+  const reviewGate = new ReviewHandoffGate(
+    coordinator,
+    () => store.get(),
+    deps.reviewRun,
+    deps.reviewWaitForSession,
+  );
 
   /**
    * The dedicated prefix is configurable, but config only loads inside
@@ -121,6 +126,7 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
     store,
     detector,
     coordinator,
+    reviewGate,
     diagnostics,
     registerPrefix,
     setStatusContext: (ctx) => {
@@ -163,7 +169,15 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
  * key and status line).
  */
 async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promise<void> {
-  const { store, detector, coordinator, diagnostics, registerPrefix, setStatusContext } = deps;
+  const {
+    store,
+    detector,
+    coordinator,
+    reviewGate,
+    diagnostics,
+    registerPrefix,
+    setStatusContext,
+  } = deps;
   setStatusContext(ctx);
   try {
     await coordinator.activateSession();
@@ -172,6 +186,7 @@ async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     coordinator.revive();
   }
   detector.reset();
+  reviewGate.resetSession();
   diagnostics.decision = null;
   try {
     await store.reload(ctx, (message) => ctx.ui.notify(message, "warning"));
@@ -184,13 +199,14 @@ async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promi
 
 /** session_shutdown: release surfaces and clear the status segment. */
 async function onSessionShutdown(ctx: ExtensionContext, deps: LifecycleDeps): Promise<void> {
-  const { detector, coordinator, setStatusContext } = deps;
+  const { detector, coordinator, reviewGate, setStatusContext } = deps;
   detector.reset();
   try {
     await coordinator.shutdown();
   } catch {
     // Best-effort.
   }
+  reviewGate.resetSession();
   setStatusContext(undefined);
   ctx.ui.setStatus("hunk", undefined);
 }
@@ -213,8 +229,9 @@ function onBeforeAgentStart(
       `${event.systemPrompt}\n\n` +
       `Pi-hunk automatic review policy is "${review}". ` +
       `If this run successfully changes code, you MUST call hunk_review after the changes and before finishing. ` +
-      `The tool blocks until the human hides Hunk; it returns fresh notes, approved when there are no new notes, or cancelled when Hunk closes/Q. ` +
-      `Address every returned note, then call hunk_review again after any fixes until it returns approved. ` +
+      `The tool blocks until the human hides Hunk; it returns fresh notes, approved when there are no new notes, no-diff when Hunk finds no reviewable changes, or cancelled when Hunk closes/Q. ` +
+      `When you changed files through a pathless shell command or after changing directories, call hunk_review with cwd set to that repository. ` +
+      `Address every returned note, then call hunk_review again after any fixes until it returns approved or no-diff. ` +
       `Do not call hunk_review for conversation-only or read-only turns.`,
   };
 }
@@ -230,6 +247,9 @@ function onAgentStart(_ctx: ExtensionContext, deps: LifecycleDeps): void {
  * detached; agent_settled awaits and clears it.
  */
 function onToolCall(event: ToolCallEvent, ctx: ExtensionContext, deps: LifecycleDeps): void {
+  // Keep the latest paired args. Pi normally emits execution_start first, while
+  // dynamically registered tools may provide the more complete payload here.
+  deps.detector.rememberToolArgs(event.toolCallId, event.input);
   maybeOpenLiveReview(event.toolName, event.input, ctx, deps);
 }
 
@@ -257,17 +277,33 @@ function maybeOpenLiveReview(
   ) {
     return;
   }
-  if (!isWorkspaceMutation(toolName, input, ctx.cwd)) return;
-
-  coordinator.markOpenedForRun();
-  if (coordinator.hasLiveSurface()) return;
-
-  const promise = coordinator.ensureOpen(ctx, config, config.hunk.args, "live").catch((error) => {
+  if (!isMutation(toolName, input)) return;
+  let target: string | undefined;
+  try {
+    target = mutationTargetPaths(input, ctx.cwd)[0];
+  } catch (error) {
     ctx.ui.notify(
-      `Early Hunk open failed: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not resolve Hunk mutation target: ${error instanceof Error ? error.message : String(error)}`,
       "warning",
     );
-  });
+    return;
+  }
+  // Pathless shell commands are intentionally not guessed. hunk_review.cwd is
+  // the explicit boundary for commands that may have changed directories.
+  if (!target) return;
+
+  coordinator.markOpenedForRun();
+  // A speculative live preflight must never replace a pre-existing/manual
+  // surface. Successful settled evidence can reconcile a different repository.
+  if (coordinator.hasLiveSurface()) return;
+  const promise = resolveLaunchDirectory(target)
+    .then((launchCwd) => coordinator.ensureOpen(ctx, config, config.hunk.args, "live", launchCwd))
+    .catch((error) => {
+      ctx.ui.notify(
+        `Early Hunk open failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    });
   coordinator.setEarlyOpenPromise(promise);
 }
 
@@ -290,20 +326,31 @@ function onToolExecutionEnd(
   ctx: ExtensionContext,
   deps: LifecycleDeps,
 ): void {
-  const { store, detector, coordinator } = deps;
+  const { store, detector, coordinator, reviewGate } = deps;
   const args = detector.takeToolArgs(event.toolCallId);
-  if (event.isError || !isWorkspaceMutation(event.toolName, args, ctx.cwd)) return;
-  detector.markChanged();
+  if (event.isError || !isMutation(event.toolName, args)) return;
+  let evidence;
+  try {
+    evidence = detector.recordSuccessfulMutation(event.toolName, args, ctx.cwd);
+  } catch (error) {
+    // Invalid structured paths remain unresolved evidence rather than being
+    // interpolated into a process launch.
+    evidence = detector.markChanged();
+    ctx.ui.notify(
+      `Could not normalize Hunk mutation target: ${error instanceof Error ? error.message : String(error)}`,
+      "warning",
+    );
+  }
+  reviewGate.addEvidence(evidence);
 
   const config = store.get();
   if (ctx.mode !== "tui") return;
   if (!config.followEdits) return;
   if (!coordinator.hasLiveSurface() && !coordinator.getEarlyOpenPromise()) return;
 
-  const target = mutationTargetPath(args, ctx.cwd);
+  const target = evidence.targets[0];
   if (!target) return;
-  const relative = toWorkspaceRelative(target, ctx.cwd);
-  coordinator.scheduleFollowEdit(ctx, config, relative);
+  coordinator.scheduleFollowEdit(ctx, config, target);
 }
 
 /**
@@ -312,7 +359,7 @@ function onToolExecutionEnd(
  * evidence.
  */
 async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promise<void> {
-  const { store, detector, coordinator, diagnostics } = deps;
+  const { store, detector, coordinator, reviewGate, diagnostics } = deps;
   const config = store.get();
   const early = coordinator.getEarlyOpenPromise();
   if (early) {
@@ -343,12 +390,11 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
 
   // Automatic review is mutation-tool driven across every policy. Conversation
   // and read-only work never pop open Hunk, regardless of the workspace VCS.
-  const shouldReview = evidence.mutation;
   const action = settledAutoOpenAction({
     review: config.review,
     uiMode: ctx.mode,
     activeBlocking: coordinator.isBlocking(),
-    shouldReview,
+    shouldReview: evidence.mutation,
     hasLiveSurface: coordinator.hasLiveSurface(),
     autoOpenSuppression: suppression,
   });
@@ -366,22 +412,47 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
   });
   diagnostics.decision = decision;
 
-  try {
-    if (action === "skip") return;
+  const canPresent =
+    evidence.mutation &&
+    config.review !== "off" &&
+    ctx.mode === "tui" &&
+    !coordinator.isBlocking() &&
+    !suppression;
 
-    await coordinator.ensureOpen(
-      ctx,
-      config,
-      config.hunk.args,
-      action === "recover" ? "recover" : "auto",
+  try {
+    if (!canPresent) return;
+
+    // Even an existing live surface must be reconciled: its cwd may belong to
+    // a failed preflight or a different/manual repository.
+    const source =
+      config.review === "live" ? (coordinator.hasLiveSurface() ? "live" : "recover") : "auto";
+    const presented = await reviewGate.presentAutomatic(ctx, source);
+    if (presented.status === "reviewable") {
+      updateStatus(ctx, store.get(), coordinator);
+      return;
+    }
+    if (presented.status === "no-diff") {
+      diagnostics.decision = { action: "skipped", reason: "no-diff" };
+      updateStatus(ctx, store.get(), coordinator);
+      return;
+    }
+    if (presented.status === "target-required") {
+      diagnostics.decision = { action: "skipped", reason: "target-required" };
+      ctx.ui.notify(
+        "Automatic Hunk review needs an explicit target for a pathless mutation; call hunk_review with cwd.",
+        "warning",
+      );
+      return;
+    }
+    if (presented.status === "no-evidence") return;
+    throw new Error(
+      presented.detail ? `${presented.reason}: ${presented.detail}` : presented.reason,
     );
-    updateStatus(ctx, store.get(), coordinator);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // The change evidence (why the open was attempted) survives the failure.
     diagnostics.decision = {
       action: "failed",
-      reason: decision.action === "opened" ? decision.reason : "mutation",
+      reason: action === "recover" ? "recover" : "mutation",
       error: message,
     };
     ctx.ui.notify(`Auto Hunk review failed: ${message}`, "warning");
@@ -493,7 +564,10 @@ export async function handleFeedback(
     return;
   }
 
-  ctx.ui.notify(result.message, result.status === "approved" ? "info" : "warning");
+  ctx.ui.notify(
+    result.message,
+    result.status === "approved" || result.status === "no-diff" ? "info" : "warning",
+  );
 }
 
 async function handleOpen(
@@ -642,11 +716,15 @@ async function handleStatus(
 ): Promise<void> {
   const config = store.get();
   const info = coordinator.getActiveInfo();
-  const active = info ? `overlay:${info.state}${info.detail ? `(${info.detail})` : ""}` : "none";
+  const active = info
+    ? `overlay:${info.state}${info.detail ? `(${info.detail})` : ""}` +
+      ` launchCwd=${info.launchCwd}${info.repoRoot ? ` repoRoot=${info.repoRoot}` : ""}`
+    : "none";
   let openNotes = "no-live-session";
   try {
     const review = await readHunkReview({
-      cwd: ctx.cwd,
+      cwd: info?.repoRoot ?? info?.launchCwd ?? ctx.cwd,
+      sessionId: info?.sessionId,
       managedPid: info?.pid,
       hunkBinary: config.hunk.command,
       run: reviewRun,
@@ -729,6 +807,7 @@ export {
   isMutation,
   isWorkspaceMutation,
   mutationTargetPath,
+  mutationTargetPaths,
   toWorkspaceRelative,
   ChangeDetector,
 } from "./change-detector.ts";

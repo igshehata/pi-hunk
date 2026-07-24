@@ -23,6 +23,8 @@ export type SettledSkipReason =
   | "already-open"
   | "not-tui"
   | "blocking"
+  | "no-diff"
+  | "target-required"
   | AutoOpenSuppressionReason;
 
 export type SettledDecision =

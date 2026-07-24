@@ -1,6 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolve } from "node:path";
 import type { AutoOpenSuppressionReason, HunkConfig } from "./config.ts";
-import { navigateHunkSession } from "./hunk-session.ts";
+import { navigateHunkSession, type LiveHunkSession } from "./hunk-session.ts";
+import { canonicalizePotentialPath } from "./path-routing.ts";
 import type { HunkExit } from "./overlay/embedded.ts";
 import { OverlaySurface } from "./overlay/surface.ts";
 import type { LaunchSource, OpenRequest, SurfaceSessionInfo } from "./overlay/types.ts";
@@ -262,11 +264,12 @@ export class ReviewCoordinator {
     config: HunkConfig,
     args: string[],
     source: LaunchSource,
+    launchCwd: string = ctx.cwd,
   ): Promise<void> {
     await this.exclusive(async () => {
       this.assertAlive();
       const hadLiveSurface = this.overlay.isLive();
-      await this.overlay.ensure(ctx, this.buildRequest(ctx, config, args, source), config);
+      await this.overlay.ensure(ctx, this.buildRequest(config, args, source, launchCwd), config);
       if (!this.overlay.isLive()) {
         if (this.overlay.getState() === "closed") return;
         throw new Error("Hunk overlay did not become live.");
@@ -281,19 +284,28 @@ export class ReviewCoordinator {
     this.notifyStateChange();
   }
 
-  /** Enter the blocking review gate without replacing an existing manual session. */
-  async enterReviewGate(ctx: ExtensionContext, config: HunkConfig): Promise<void> {
+  /** Enter the blocking gate, preserving a live review from the same canonical cwd. */
+  async enterReviewGate(
+    ctx: ExtensionContext,
+    config: HunkConfig,
+    launchCwd: string = ctx.cwd,
+  ): Promise<void> {
     await this.exclusive(async () => {
       this.assertAlive();
-      if (this.active?.isLive()) {
-        await this.active.show();
-        this.transitionRun({ type: "early-surface", event: "adopt" });
-        return;
+      const activeInfo = this.active?.getInfo();
+      if (this.active?.isLive() && activeInfo) {
+        const [activeCwd, requestedCwd] = await Promise.all([
+          canonicalizePotentialPath(activeInfo.launchCwd),
+          canonicalizePotentialPath(launchCwd),
+        ]);
+        if (activeCwd === requestedCwd) {
+          await this.active.show();
+          return;
+        }
       }
-
       await this.overlay.ensure(
         ctx,
-        this.buildRequest(ctx, config, config.hunk.args, "manual"),
+        this.buildRequest(config, config.hunk.args, "handoff", launchCwd),
         config,
       );
       if (!this.overlay.isLive()) {
@@ -301,9 +313,22 @@ export class ReviewCoordinator {
         throw new Error("Hunk overlay did not become live.");
       }
       this.active = this.overlay;
-      this.transitionRun({ type: "early-surface", event: "adopt" });
     });
     this.notifyStateChange();
+  }
+
+  adoptManagedSession(session: LiveHunkSession): boolean {
+    const adopted = this.active?.adoptManagedSession(session) ?? false;
+    if (adopted) this.notifyStateChange();
+    return adopted;
+  }
+
+  adoptEarlySurfaceForRun(): void {
+    this.transitionRun({ type: "early-surface", event: "adopt" });
+  }
+
+  isEarlySurfaceOwnedForRun(): boolean {
+    return this.runState.earlySurface === "owned";
   }
 
   async toggleOverlay(
@@ -314,7 +339,7 @@ export class ReviewCoordinator {
   ): Promise<void> {
     await this.exclusive(async () => {
       this.assertAlive();
-      const request = this.buildRequest(ctx, config, args, source);
+      const request = this.buildRequest(config, args, source, ctx.cwd);
       if (this.active?.isLive()) {
         await this.active.toggle(ctx, request, config);
         this.transitionRun({ type: "early-surface", event: "adopt" });
@@ -337,6 +362,22 @@ export class ReviewCoordinator {
     this.notifyReviewCancellation("close");
     const closed = await this.exclusive(() => this.closeActiveUnlocked());
     this.notifyStateChange();
+    return closed;
+  }
+
+  /** Internal queue transition: close without dismissal/cancellation semantics. */
+  async releaseSurfaceForRouting(): Promise<boolean> {
+    const closed = await this.exclusive(async () => {
+      const surface = this.active;
+      if (!surface || (!surface.isLive() && surface.getState() === "closed")) {
+        this.active = null;
+        return false;
+      }
+      const didClose = await surface.release();
+      this.active = null;
+      return didClose;
+    });
+    if (closed) this.notifyStateChange();
     return closed;
   }
 
@@ -448,13 +489,13 @@ export class ReviewCoordinator {
   }
 
   private buildRequest(
-    ctx: ExtensionContext,
     config: HunkConfig,
     args: string[],
     source: LaunchSource,
+    launchCwd: string,
   ): OpenRequest {
     return {
-      cwd: ctx.cwd,
+      cwd: resolve(launchCwd),
       command: config.hunk.command,
       args,
       source,
@@ -492,13 +533,16 @@ export class ReviewCoordinator {
     await this.queueFollowNavigation(async () => {
       if (!this.isCurrentFollow(generation, revision)) return;
 
-      const navigate = () =>
-        this.navigateHunk({
-          cwd: ctx.cwd,
+      const navigate = () => {
+        const info = this.getActiveInfo();
+        return this.navigateHunk({
+          cwd: info?.repoRoot ?? info?.launchCwd ?? ctx.cwd,
           filePath,
           hunkBinary: config.hunk.command,
-          managedPid: this.getActiveInfo()?.pid,
+          sessionId: info?.sessionId,
+          managedPid: info?.pid,
         });
+      };
 
       try {
         await navigate();

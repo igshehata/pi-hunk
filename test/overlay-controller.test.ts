@@ -477,6 +477,22 @@ describe("OverlaySurface state machine", () => {
     await surface.close();
   });
 
+  it("restarts for identical argv launched from a different cwd", async () => {
+    const harness = createHarness();
+    const surface = new OverlaySurface(harness.createComponent);
+    const config = cloneConfig(DEFAULT_CONFIG);
+
+    await surface.ensure(harness.ctx, request(), config);
+    await surface.ensure(harness.ctx, { ...request(), cwd: "/repo-b" }, config);
+
+    expect(harness.components).toHaveLength(2);
+    expect(harness.components[0]?.disposed).toBe(true);
+    expect(harness.components[1]?.options.cwd).toBe("/repo-b");
+    expect(surface.getInfo()).toMatchObject({ launchCwd: "/repo-b" });
+
+    await surface.close();
+  });
+
   it("restarts predictably for different args and ignores stale child completion", async () => {
     const harness = createHarness();
     const surface = new OverlaySurface(harness.createComponent);

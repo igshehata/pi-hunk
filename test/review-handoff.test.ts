@@ -1,8 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../extensions/config.ts";
 import type { ReviewCoordinator } from "../extensions/coordinator.ts";
-import { parseLiveHunkSessions } from "../extensions/hunk-session.ts";
+import { parseLiveHunkSessions, waitForManagedHunkSession } from "../extensions/hunk-session.ts";
 import {
   readHunkReview,
   registerHunkReviewTool,
@@ -19,6 +22,8 @@ function session(overrides: Record<string, unknown> = {}) {
     cwd: "/repo",
     repoRoot: "/repo",
     launchedAt: baseLaunchedAt,
+    fileCount: 1,
+    files: [{ path: "src/a.ts" }],
     ...overrides,
   };
 }
@@ -67,18 +72,53 @@ type FakeState = "closed" | "starting" | "visible" | "hidden" | "closing";
 class FakeCoordinator {
   state: FakeState = "closed";
   pid: number | undefined;
+  launchCwd = "/repo";
+  launchHistory: string[] = [];
+  repoRoot: string | undefined;
+  sessionId: string | undefined;
   blocking = false;
   stateListeners = new Set<() => void>();
   cancelListeners = new Set<(reason: string) => void>();
-  ensureOpen = vi.fn(async () => {
+  ensureOpen = vi.fn(async (...args: unknown[]) => {
+    this.launchCwd = (args[4] as string | undefined) ?? this.launchCwd;
     this.state = "visible";
     this.emit();
   });
-  enterReviewGate() {
-    return this.ensureOpen();
+  enterReviewGate(...args: unknown[]) {
+    const nextCwd = (args[2] as string | undefined) ?? this.launchCwd;
+    if (this.state === "closed" || nextCwd !== this.launchCwd) this.launchHistory.push(nextCwd);
+    this.launchCwd = nextCwd;
+    return this.ensureOpen(...args);
+  }
+  hasLiveSurface() {
+    return this.state === "starting" || this.state === "visible" || this.state === "hidden";
   }
   getActiveInfo() {
-    return this.state === "closed" ? null : { state: this.state, argsKey: "[]", pid: this.pid };
+    return this.state === "closed"
+      ? null
+      : {
+          state: this.state,
+          argsKey: JSON.stringify([this.launchCwd, "hunk", "diff"]),
+          launchCwd: this.launchCwd,
+          source: "handoff" as const,
+          pid: this.pid,
+          repoRoot: this.repoRoot,
+          sessionId: this.sessionId,
+        };
+  }
+  adoptManagedSession(value: { repoRoot?: string; sessionId: string }) {
+    this.repoRoot = value.repoRoot;
+    this.sessionId = value.sessionId;
+    return true;
+  }
+  adoptEarlySurfaceForRun() {}
+  isEarlySurfaceOwnedForRun() {
+    return false;
+  }
+  async releaseSurfaceForRouting() {
+    this.state = "closed";
+    this.emit();
+    return true;
   }
   onStateChange(fn: () => void) {
     this.stateListeners.add(fn);
@@ -113,7 +153,7 @@ function setup(
   } = {},
 ) {
   const coordinator = new FakeCoordinator();
-  coordinator.pid = options.pid;
+  coordinator.pid = options.pid ?? 101;
   const run = runner(comments, options.sessions, options.expectedSessionId);
   const gate = new ReviewHandoffGate(
     coordinator as unknown as ReviewCoordinator,
@@ -144,6 +184,81 @@ describe("fresh Hunk review parsing", () => {
       );
     },
   );
+
+  it("parses and exposes Hunk's zero/non-zero review metadata", () => {
+    expect(
+      parseLiveHunkSessions({ sessions: [session({ fileCount: 0, files: [] })] })[0],
+    ).toMatchObject({ fileCount: 0, files: [] });
+    expect(() => parseLiveHunkSessions({ sessions: [session({ fileCount: 0 })] })).toThrow(
+      /does not match files.length/,
+    );
+  });
+
+  it("polls bounded registration and reload frames until a diff appears", async () => {
+    let lookup = 0;
+    const frames = [[], [session({ fileCount: 0, files: [] })], [session()]];
+    const run = runner([], () => frames[Math.min(lookup++, frames.length - 1)]!);
+
+    await expect(
+      waitForManagedHunkSession({
+        cwd: "/repo",
+        managedPid: 101,
+        run,
+        retryDelaysMs: [0, 0, 0],
+      }),
+    ).resolves.toMatchObject({ status: "reviewable", session: { fileCount: 1 } });
+    expect(run).toHaveBeenCalledTimes(3);
+  });
+
+  it("declares no-diff only after the bounded empty-frame window", async () => {
+    const run = runner([], [session({ fileCount: 0, files: [] })]);
+    await expect(
+      waitForManagedHunkSession({
+        cwd: "/repo",
+        managedPid: 101,
+        run,
+        retryDelaysMs: [0, 0, 0],
+      }),
+    ).resolves.toMatchObject({ status: "no-diff", session: { fileCount: 0 } });
+    expect(run).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not report a stale no-diff frame after the managed session disappears", async () => {
+    let lookup = 0;
+    const frames = [[session({ fileCount: 0, files: [] })], []];
+    const run = runner([], () => frames[Math.min(lookup++, frames.length - 1)]!);
+
+    await expect(
+      waitForManagedHunkSession({
+        cwd: "/repo",
+        managedPid: 101,
+        run,
+        retryDelaysMs: [0, 0],
+      }),
+    ).resolves.toEqual({ status: "not-found" });
+  });
+
+  it("waits for the exact managed PID instead of adopting a same-repo session", async () => {
+    let lookup = 0;
+    const frames = [
+      [session({ sessionId: "unrelated", pid: 202 })],
+      [session({ sessionId: "managed", pid: 101 })],
+    ];
+    const run = runner([], () => frames[Math.min(lookup++, frames.length - 1)]!);
+
+    await expect(
+      waitForManagedHunkSession({
+        cwd: "/repo",
+        managedPid: 101,
+        run,
+        retryDelaysMs: [0, 0],
+      }),
+    ).resolves.toMatchObject({
+      status: "reviewable",
+      session: { sessionId: "managed", pid: 101 },
+    });
+    expect(run).toHaveBeenCalledTimes(2);
+  });
 
   it("gates comment list on a live repo session", async () => {
     const run = runner([], []);
@@ -337,6 +452,12 @@ describe("fresh Hunk review parsing", () => {
         run: runner([], [session({ repoRoot: "" })]),
       }),
     ).rejects.toThrow("repoRoot");
+    await expect(
+      readHunkReview({
+        cwd: "/repo",
+        run: runner([], [session({ cwd: "relative/repo", repoRoot: "/repo" })]),
+      }),
+    ).rejects.toThrow("absolute path");
   });
 });
 
@@ -363,7 +484,7 @@ describe("blocking hunk_review gate", () => {
       status: "submitted",
       notes: [{ noteId: "user:1", summary: "Fix this" }],
     });
-    expect(run).toHaveBeenCalledTimes(2); // one list + one comment probe, exactly once
+    expect(run).toHaveBeenCalledTimes(3); // launch list + hide refresh + one comment probe
     expect(coordinator.state).toBe("hidden");
     expect(coordinator.blocking).toBe(false);
     expect(coordinator.stateListeners.size).toBe(0);
@@ -436,6 +557,7 @@ describe("blocking hunk_review gate", () => {
     const pending = gate.wait(ctx);
     await vi.waitFor(() => expect(coordinator.ensureOpen).toHaveBeenCalled());
     coordinator.transition("closing");
+    coordinator.cancel("hunk-closed");
     await expect(pending).resolves.toMatchObject({ status: "cancelled", reason: "hunk-closed" });
   });
 
@@ -452,6 +574,54 @@ describe("blocking hunk_review gate", () => {
     expect(coordinator.stateListeners.size).toBe(0);
   });
 
+  it("retains a routed target after a transient open failure", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-route-retry-")));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    await Promise.all([mkdir(repoA), mkdir(repoB)]);
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      coordinator.ensureOpen.mockRejectedValueOnce(new Error("transient open failure"));
+      const waitForSession = vi.fn(async (options: { cwd: string; managedPid?: number }) => ({
+        status: "reviewable" as const,
+        session: session({
+          pid: options.managedPid,
+          cwd: options.cwd,
+          repoRoot: options.cwd,
+        }),
+      }));
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([]),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [join(repoB, "src/a.ts")],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: repoA, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.wait(ctx)).resolves.toMatchObject({
+        status: "cancelled",
+        reason: "open-failed",
+      });
+
+      const retried = gate.wait(ctx);
+      await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
+      expect(waitForSession).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cwd: repoB, managedPid: 101 }),
+      );
+      coordinator.transition("hidden");
+      await expect(retried).resolves.toMatchObject({ status: "approved" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("passes the managed surface PID through to select the exact Hunk session", async () => {
     const sessions = [
       session({ sessionId: "managed", pid: 4242, launchedAt: "2026-01-01T00:00:00.000Z" }),
@@ -466,7 +636,7 @@ describe("blocking hunk_review gate", () => {
     await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
     coordinator.transition("hidden");
     await expect(pending).resolves.toMatchObject({ status: "submitted" });
-    expect(run).toHaveBeenNthCalledWith(2, [
+    expect(run).toHaveBeenNthCalledWith(3, [
       "hunk",
       "session",
       "comment",
@@ -478,13 +648,32 @@ describe("blocking hunk_review gate", () => {
     ]);
   });
 
+  it("refuses to adopt repository metadata without a managed surface PID", async () => {
+    const coordinator = new FakeCoordinator();
+    const waitForSession = vi.fn();
+    const gate = new ReviewHandoffGate(
+      coordinator as unknown as ReviewCoordinator,
+      () => DEFAULT_CONFIG,
+      runner([]),
+      waitForSession,
+    );
+
+    await expect(
+      gate.wait({ cwd: process.cwd(), mode: "tui" } as ExtensionContext),
+    ).resolves.toMatchObject({
+      status: "unavailable",
+      reason: "managed-pid-missing",
+    });
+    expect(waitForSession).not.toHaveBeenCalled();
+  });
+
   it("returns approved on an empty first hide", async () => {
     const { gate, coordinator, ctx, run } = setup([]);
     const pending = gate.wait(ctx);
     await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
     coordinator.transition("hidden", true);
     await expect(pending).resolves.toMatchObject({ status: "approved", notes: [] });
-    expect(run).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenCalledTimes(3);
     expect(coordinator.blocking).toBe(false);
     expect(coordinator.markReviewCompleteForRun).toHaveBeenCalledOnce();
   });
@@ -520,6 +709,216 @@ describe("blocking hunk_review gate", () => {
     });
   });
 
+  it("collapses multiple mutation targets covered by one Hunk repository root", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-one-root-")));
+    await Promise.all([mkdir(join(root, "src")), mkdir(join(root, "test"))]);
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const managedSession = session({ cwd: root, repoRoot: root });
+      const waitForSession = vi.fn(
+        async () => ({ status: "reviewable", session: managedSession }) as const,
+      );
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [managedSession]),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [join(root, "src/a.ts"), join(root, "test/a.test.ts")],
+        unresolved: false,
+        revision: 1,
+      });
+
+      const pending = gate.wait({ cwd: root, mode: "tui" } as ExtensionContext);
+      await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
+      coordinator.transition("hidden");
+      await expect(pending).resolves.toMatchObject({ status: "approved" });
+      expect(coordinator.launchHistory).toEqual([join(root, "src")]);
+      expect(waitForSession).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the current repository after notes, then reviews a sibling repository", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-review-queue-")));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    await Promise.all([mkdir(repoA), mkdir(repoB)]);
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const run = vi.fn(async (argv: string[]) => {
+        const currentRoot = coordinator.launchCwd;
+        const currentId = currentRoot === repoA ? "repo-a" : "repo-b";
+        if (argv.slice(1).join(" ") === "session list --json") {
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              sessions: [
+                session({
+                  sessionId: currentId,
+                  cwd: currentRoot,
+                  repoRoot: currentRoot,
+                  files: [{ path: "src/a.ts" }],
+                }),
+              ],
+            }),
+          };
+        }
+        if (argv[1] === "session" && argv[2] === "comment") {
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({ comments: argv[4] === "repo-a" ? [note()] : [] }),
+          };
+        }
+        return { code: 1, stderr: `unexpected argv: ${argv.join(" ")}`, stdout: "" };
+      });
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        run,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [join(repoA, "src/a.ts"), join(repoB, "src/b.ts")],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      const first = gate.wait(ctx);
+      await vi.waitFor(() => expect(coordinator.launchCwd).toBe(repoA));
+      coordinator.transition("hidden");
+      await expect(first).resolves.toMatchObject({ status: "submitted" });
+      expect(coordinator.launchHistory).toEqual([repoA]);
+
+      const second = gate.wait(ctx);
+      await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
+      coordinator.transition("hidden");
+      await vi.waitFor(() => expect(coordinator.launchCwd).toBe(repoB));
+      expect(coordinator.state).toBe("visible");
+      expect(coordinator.launchHistory).toEqual([repoA, repoB]);
+      expect(coordinator.launchHistory).not.toContain(root);
+
+      coordinator.transition("hidden");
+      await expect(second).resolves.toMatchObject({ status: "approved" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("skips an empty repository and continues to a reviewable pending repository", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-empty-queue-")));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    await Promise.all([mkdir(repoA), mkdir(repoB)]);
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const sessionFor = (repoRoot: string, fileCount: number) =>
+        session({
+          sessionId: repoRoot === repoA ? "repo-a" : "repo-b",
+          cwd: repoRoot,
+          repoRoot,
+          fileCount,
+          files: fileCount === 0 ? [] : [{ path: "src/a.ts" }],
+        });
+      const waitForSession = vi.fn(async (options: { cwd: string }) => {
+        const current = sessionFor(options.cwd, options.cwd === repoA ? 0 : 1);
+        return options.cwd === repoA
+          ? ({ status: "no-diff", session: current } as const)
+          : ({ status: "reviewable", session: current } as const);
+      });
+      const run = runner([], () => [sessionFor(repoB, 1)], "repo-b");
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        run,
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [join(repoA, "a.ts"), join(repoB, "b.ts")],
+        unresolved: false,
+        revision: 1,
+      });
+
+      const pending = gate.wait({ cwd: root, mode: "tui" } as ExtensionContext);
+      await vi.waitFor(() => expect(coordinator.launchCwd).toBe(repoB));
+      expect(coordinator.launchHistory).toEqual([repoA, repoB]);
+      coordinator.transition("hidden");
+      await expect(pending).resolves.toMatchObject({ status: "approved" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns target-required for pathless evidence and accepts an explicit cwd", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-explicit-target-")));
+    try {
+      const { gate, coordinator } = setup([]);
+      gate.addEvidence({ mutation: true, targets: [], unresolved: true, revision: 1 });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+      await expect(gate.wait(ctx)).resolves.toMatchObject({
+        status: "target-required",
+        reason: "pathless-mutation",
+      });
+      expect(coordinator.ensureOpen).not.toHaveBeenCalled();
+
+      const pending = gate.wait(ctx, undefined, root);
+      await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
+      coordinator.transition("hidden");
+      await expect(pending).resolves.toMatchObject({ status: "approved" });
+      expect(coordinator.launchCwd).toBe(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns and caches no-diff without waiting for a hide", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-no-diff-")));
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const emptySession = session({
+        cwd: root,
+        repoRoot: root,
+        fileCount: 0,
+        files: [],
+      });
+      const waitForSession = vi.fn(
+        async () => ({ status: "no-diff", session: emptySession }) as const,
+      );
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [emptySession]),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [join(root, "deleted.ts")],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.wait(ctx)).resolves.toMatchObject({ status: "no-diff" });
+      expect(coordinator.state).toBe("closed");
+      const opens = coordinator.ensureOpen.mock.calls.length;
+      await expect(gate.wait(ctx)).resolves.toMatchObject({ status: "no-diff" });
+      expect(coordinator.ensureOpen).toHaveBeenCalledTimes(opens);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("returns already-waiting for a duplicate call", async () => {
     const { gate, coordinator, ctx } = setup([]);
     const first = gate.wait(ctx);
@@ -527,6 +926,18 @@ describe("blocking hunk_review gate", () => {
     await expect(gate.wait(ctx)).resolves.toMatchObject({ status: "already-waiting" });
     coordinator.cancel("close");
     await expect(first).resolves.toMatchObject({ status: "cancelled", reason: "close" });
+  });
+
+  it("admits only one waiter when explicit targets validate concurrently", async () => {
+    const { gate, coordinator } = setup([]);
+    const ctx = { cwd: process.cwd(), mode: "tui" } as ExtensionContext;
+    const first = gate.wait(ctx, undefined, ctx.cwd);
+    const second = gate.wait(ctx, undefined, ctx.cwd);
+
+    await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
+    coordinator.cancel("close");
+    const results = await Promise.all([first, second]);
+    expect(results.map((result) => result.status).sort()).toEqual(["already-waiting", "cancelled"]);
   });
 
   it.each(["close", "force-replacement", "session-boundary", "hunk-died"])(
@@ -562,9 +973,55 @@ describe("blocking hunk_review gate", () => {
     expect(coordinator.stateListeners.size).toBe(0);
   });
 
+  it("does not restore stale routing state after a session reset", async () => {
+    const cwd = process.cwd();
+    const coordinator = new FakeCoordinator();
+    coordinator.pid = 101;
+    let finishLookup!: (value: {
+      status: "reviewable";
+      session: ReturnType<typeof session>;
+    }) => void;
+    const waitForSession = vi.fn(
+      () =>
+        new Promise<{ status: "reviewable"; session: ReturnType<typeof session> }>((resolve) => {
+          finishLookup = resolve;
+        }),
+    );
+    const gate = new ReviewHandoffGate(
+      coordinator as unknown as ReviewCoordinator,
+      () => DEFAULT_CONFIG,
+      runner([]),
+      waitForSession,
+    );
+    const ctx = { cwd, mode: "tui" } as ExtensionContext;
+
+    const pending = gate.wait(ctx);
+    await vi.waitFor(() => expect(finishLookup).toBeTypeOf("function"));
+    gate.resetSession();
+    await expect(pending).resolves.toMatchObject({
+      status: "cancelled",
+      reason: "session-boundary",
+    });
+
+    const managedSession = session({ cwd, repoRoot: cwd });
+    finishLookup({ status: "reviewable", session: managedSession });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(coordinator.repoRoot).toBeUndefined();
+
+    waitForSession.mockResolvedValue({ status: "reviewable", session: managedSession });
+    const next = gate.wait(ctx);
+    await vi.waitFor(() => expect(coordinator.repoRoot).toBe(cwd));
+    coordinator.transition("hidden");
+    await expect(next).resolves.toMatchObject({ status: "approved" });
+  });
+
   it("turns a comment probe failure into cancellation with full cleanup", async () => {
     const { gate, coordinator, ctx, run } = setup([]);
-    run.mockRejectedValueOnce(new Error("probe exploded"));
+    const baseRun = run.getMockImplementation()!;
+    run.mockImplementation(async (argv) => {
+      if (argv.includes("comment")) throw new Error("probe exploded");
+      return baseRun(argv);
+    });
     const pending = gate.wait(ctx);
     await vi.waitFor(() => expect(coordinator.state).toBe("visible"));
     coordinator.transition("hidden");
