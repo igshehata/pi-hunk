@@ -3,16 +3,23 @@ import { ReviewCoordinator } from "../extensions/coordinator.ts";
 import { cloneConfig, DEFAULT_CONFIG } from "../extensions/config.ts";
 import type { OverlaySurface } from "../extensions/overlay/surface.ts";
 
-function fakeOverlay(): OverlaySurface & { calls: string[] } {
+interface FakeOverlay extends OverlaySurface {
+  calls: string[];
+  requestCwds: string[];
+}
+
+function fakeOverlay(): FakeOverlay {
   let state: "closed" | "visible" | "hidden" = "closed";
   let listener: (() => void) | undefined;
   let launchCwd = "/repo";
   let sessionId: string | undefined;
   let repoRoot: string | undefined;
   const calls: string[] = [];
+  const requestCwds: string[] = [];
 
   return {
     calls,
+    requestCwds,
     setStateListener(next: () => void) {
       listener = next;
     },
@@ -32,6 +39,7 @@ function fakeOverlay(): OverlaySurface & { calls: string[] } {
           },
     async ensure(_ctx: unknown, request: { cwd: string }) {
       calls.push("ensure:start");
+      requestCwds.push(request.cwd);
       launchCwd = request.cwd;
       await new Promise((resolve) => setTimeout(resolve, 10));
       state = "visible";
@@ -48,8 +56,10 @@ function fakeOverlay(): OverlaySurface & { calls: string[] } {
       state = "visible";
       listener?.();
     },
-    async toggle() {
+    async toggle(_ctx: unknown, request: { cwd: string }) {
       calls.push("toggle");
+      requestCwds.push(request.cwd);
+      launchCwd = request.cwd;
       state = state === "visible" ? "hidden" : "visible";
       listener?.();
     },
@@ -61,7 +71,7 @@ function fakeOverlay(): OverlaySurface & { calls: string[] } {
     async close() {
       state = "closed";
     },
-  } as unknown as OverlaySurface & { calls: string[] };
+  } as unknown as FakeOverlay;
 }
 
 const ctx = { cwd: "/repo", mode: "tui", ui: {} } as any;
@@ -81,17 +91,41 @@ describe("ReviewCoordinator overlay lifecycle", () => {
     expect(coordinator.hasLiveSurface()).toBe(true);
   });
 
-  it("enters the review gate without replacing an existing manual review", async () => {
+  it("keeps a routed repository cwd when Pi toggles the active review", async () => {
     const overlay = fakeOverlay();
     const coordinator = new ReviewCoordinator({ overlay });
     const config = cloneConfig(DEFAULT_CONFIG);
+    const repoACtx = { ...ctx, cwd: "/repo-a" };
 
-    await coordinator.ensureOpen(ctx, config, ["show", "HEAD~1"], "manual");
-    overlay.calls.length = 0;
-    await coordinator.enterReviewGate(ctx, config);
+    await coordinator.ensureOpen(repoACtx, config, config.hunk.args, "auto", "/repo-b");
+    overlay.requestCwds.length = 0;
 
-    expect(overlay.calls).toEqual(["show"]);
-    expect(coordinator.getActiveInfo()?.state).toBe("visible");
+    await coordinator.toggleOverlay(repoACtx, config, config.hunk.args);
+    expect(coordinator.getActiveInfo()).toMatchObject({
+      state: "hidden",
+      launchCwd: "/repo-b",
+    });
+
+    await coordinator.toggleOverlay(repoACtx, config, config.hunk.args);
+    expect(coordinator.getActiveInfo()).toMatchObject({
+      state: "visible",
+      launchCwd: "/repo-b",
+    });
+    expect(overlay.requestCwds).toEqual(["/repo-b", "/repo-b"]);
+  });
+
+  it("keeps a routed repository cwd when a shortcut switches review arguments", async () => {
+    const overlay = fakeOverlay();
+    const coordinator = new ReviewCoordinator({ overlay });
+    const config = cloneConfig(DEFAULT_CONFIG);
+    const repoACtx = { ...ctx, cwd: "/repo-a" };
+
+    await coordinator.ensureOpen(repoACtx, config, config.hunk.args, "auto", "/repo-b");
+    overlay.requestCwds.length = 0;
+    await coordinator.ensureOpen(repoACtx, config, ["show"], "shortcut");
+
+    expect(overlay.requestCwds).toEqual(["/repo-b"]);
+    expect(coordinator.getActiveInfo()?.launchCwd).toBe("/repo-b");
   });
 
   it("recovers after a rejected queued transition", async () => {
@@ -105,19 +139,6 @@ describe("ReviewCoordinator overlay lifecycle", () => {
     await coordinator.ensureOpen(ctx, config, [], "manual");
 
     expect(coordinator.hasLiveSurface()).toBe(true);
-  });
-
-  it("notifies cancellation listeners on close", async () => {
-    const overlay = fakeOverlay();
-    const coordinator = new ReviewCoordinator({ overlay });
-    const cancellation = vi.fn();
-    coordinator.onReviewCancellation(cancellation);
-    const config = cloneConfig(DEFAULT_CONFIG);
-
-    await coordinator.ensureOpen(ctx, config, [], "manual");
-    await coordinator.closeActive();
-
-    expect(cancellation).toHaveBeenCalledWith("close");
   });
 
   it("passes the managed PID and reports one final follow-edit failure", async () => {

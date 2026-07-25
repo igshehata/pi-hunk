@@ -80,6 +80,7 @@ async function setup(
     store: new ConfigStore(),
     coordinator,
     reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
+    reviewWaitForSession: async () => ({ status: "not-found" }),
   });
 
   const ctx = createContext(root, trusted, prefixAction);
@@ -256,14 +257,18 @@ describe("extension overlay integration", () => {
     await hunk?.("toggle extra", ctx);
     await hunk?.("status verbose", ctx);
     await hunk?.("feedback extra", ctx);
+    await hunk?.("submit extra", ctx);
+    await hunk?.("next extra", ctx);
 
     expect(mounts).toHaveLength(0);
     expect(coordinator.hasLiveSurface()).toBe(false);
-    expect(ctx.ui.notify).toHaveBeenCalledTimes(4);
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(6);
     expect(ctx.ui.notify).toHaveBeenNthCalledWith(1, "Usage: /hunk close", "warning");
     expect(ctx.ui.notify).toHaveBeenNthCalledWith(2, "Usage: /hunk toggle", "warning");
     expect(ctx.ui.notify).toHaveBeenNthCalledWith(3, "Usage: /hunk status", "warning");
     expect(ctx.ui.notify).toHaveBeenNthCalledWith(4, "Usage: /hunk feedback", "warning");
+    expect(ctx.ui.notify).toHaveBeenNthCalledWith(5, "Usage: /hunk submit", "warning");
+    expect(ctx.ui.notify).toHaveBeenNthCalledWith(6, "Usage: /hunk next", "warning");
   });
 
   it("rejects patch, pager, and difftool instead of opening broken overlays", async () => {

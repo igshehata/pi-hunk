@@ -71,7 +71,7 @@ Do not include generated `dist/` output; the package build creates it during pre
 
 - Pi-hunk owns one native persistent overlay and one managed Hunk process.
 - Hunk remains authoritative for diff presentation and comments.
-- The `hunk_review` tool is read-only: it must never create, edit, apply, resolve, or clear
+- Comment handoff is read-only: pi-hunk must never create, edit, apply, resolve, remove, or clear
   comments.
 - Project-local config is loaded only for trusted projects.
 - Native dependencies must remain optional Pi peers or bounded runtime dependencies; run

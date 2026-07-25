@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { spawnOverlayPty } from "../extensions/overlay/pty.ts";
 
@@ -208,43 +211,57 @@ describe.runIf(process.platform === "darwin" || process.platform === "linux")(
   "zigpty native PTY",
   () => {
     it("provides a TTY and propagates resize dimensions", async () => {
-      const pty = spawnOverlayPty({
-        ...options,
-        args: [
-          "-c",
-          "test -t 0 && printf 'isatty=yes\\n'; stty size; trap 'stty size; exit 0' WINCH; while :; do sleep 1; done",
-        ],
-      });
-      let output = "";
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let dataSubscription: { dispose(): void } | undefined;
+      const barrierDirectory = await mkdtemp(join(tmpdir(), "pi-hunk-zigpty-ready-"));
+      const barrier = join(barrierDirectory, "start");
       try {
-        const resized = new Promise<void>((resolve, reject) => {
-          timer = setTimeout(
-            () => reject(new Error(`native PTY output timed out: ${JSON.stringify(output)}`)),
-            5000,
-          );
-          dataSubscription = pty.onData((chunk) => {
-            output += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-            if (/37 101/.test(output)) {
-              clearTimeout(timer);
-              timer = undefined;
-              resolve();
-            }
-          });
+        const pty = spawnOverlayPty({
+          ...options,
+          args: [
+            "-c",
+            "while [ ! -f \"$1\" ]; do sleep 0.01; done; test -t 0 && printf 'isatty=yes\\n'; stty size; trap 'stty size; exit 0' WINCH; printf 'trap-ready\\n'; while :; do sleep 0.1; done",
+            "pi-hunk-zigpty-test",
+            barrier,
+          ],
         });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        pty.resize(101, 37);
-        await resized;
-        expect(output).toContain("isatty=yes");
-        expect(output).toMatch(/24 80/);
-        expect(output).toMatch(/37 101/);
+        let output = "";
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let dataSubscription: { dispose(): void } | undefined;
+        try {
+          const resized = new Promise<void>((resolve, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`native PTY output timed out: ${JSON.stringify(output)}`)),
+              8000,
+            );
+            let resizeSent = false;
+            dataSubscription = pty.onData((chunk) => {
+              output += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+              if (!resizeSent && /24 80[\s\S]*trap-ready/.test(output)) {
+                resizeSent = true;
+                queueMicrotask(() => pty.resize(101, 37));
+              }
+              if (resizeSent && /37 101/.test(output)) {
+                clearTimeout(timer);
+                timer = undefined;
+                resolve();
+              }
+            });
+          });
+          // Release the child only after the data listener is attached, so
+          // the initial dimensions cannot be emitted into a subscription gap.
+          await writeFile(barrier, "");
+          await resized;
+          expect(output).toContain("isatty=yes");
+          expect(output).toMatch(/24 80/);
+          expect(output).toMatch(/37 101/);
+        } finally {
+          if (timer) clearTimeout(timer);
+          dataSubscription?.dispose();
+          pty.dispose();
+        }
       } finally {
-        if (timer) clearTimeout(timer);
-        dataSubscription?.dispose();
-        pty.dispose();
+        await rm(barrierDirectory, { recursive: true, force: true });
       }
-    });
+    }, 10_000);
 
     it("force-cleans a real PTY that ignores graceful termination", async () => {
       const pty = spawnOverlayPty({

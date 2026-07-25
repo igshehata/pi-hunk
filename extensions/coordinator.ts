@@ -2,7 +2,6 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
 import type { AutoOpenSuppressionReason, HunkConfig } from "./config.ts";
 import { navigateHunkSession, type LiveHunkSession } from "./hunk-session.ts";
-import { canonicalizePotentialPath } from "./path-routing.ts";
 import type { HunkExit } from "./overlay/embedded.ts";
 import { OverlaySurface } from "./overlay/surface.ts";
 import type { LaunchSource, OpenRequest, SurfaceSessionInfo } from "./overlay/types.ts";
@@ -125,8 +124,6 @@ export class ReviewCoordinator {
   private runState = initialRunState();
   private lifecycle: CoordinatorLifecycleState = { phase: "active", revision: 0 };
   private readonly stateListeners = new Set<() => void>();
-  private readonly cancellationListeners = new Set<(reason: string) => void>();
-  private blockingState: "idle" | "blocking" = "idle";
 
   constructor(deps: CoordinatorDeps = {}) {
     this.overlay = deps.overlay ?? new OverlaySurface();
@@ -220,29 +217,6 @@ export class ReviewCoordinator {
     this.transitionRun({ type: "suppress", reason });
   }
 
-  isBlocking(): boolean {
-    return this.blockingState === "blocking";
-  }
-
-  setBlockingReview(blocking: boolean): void {
-    this.blockingState = blocking ? "blocking" : "idle";
-  }
-
-  onReviewCancellation(listener: (reason: string) => void): () => void {
-    this.cancellationListeners.add(listener);
-    return () => this.cancellationListeners.delete(listener);
-  }
-
-  private notifyReviewCancellation(reason: string): void {
-    for (const listener of [...this.cancellationListeners]) {
-      try {
-        listener(reason);
-      } catch {
-        // Cancellation delivery is best-effort; cleanup still proceeds.
-      }
-    }
-  }
-
   hasLiveSurface(): boolean {
     return Boolean(this.active?.isLive());
   }
@@ -269,7 +243,11 @@ export class ReviewCoordinator {
     await this.exclusive(async () => {
       this.assertAlive();
       const hadLiveSurface = this.overlay.isLive();
-      await this.overlay.ensure(ctx, this.buildRequest(config, args, source, launchCwd), config);
+      const requestCwd =
+        source === "shortcut" && hadLiveSurface
+          ? (this.active?.getInfo()?.launchCwd ?? launchCwd)
+          : launchCwd;
+      await this.overlay.ensure(ctx, this.buildRequest(config, args, source, requestCwd), config);
       if (!this.overlay.isLive()) {
         if (this.overlay.getState() === "closed") return;
         throw new Error("Hunk overlay did not become live.");
@@ -284,43 +262,32 @@ export class ReviewCoordinator {
     this.notifyStateChange();
   }
 
-  /** Enter the blocking gate, preserving a live review from the same canonical cwd. */
-  async enterReviewGate(
-    ctx: ExtensionContext,
-    config: HunkConfig,
-    launchCwd: string = ctx.cwd,
-  ): Promise<void> {
-    await this.exclusive(async () => {
-      this.assertAlive();
-      const activeInfo = this.active?.getInfo();
-      if (this.active?.isLive() && activeInfo) {
-        const [activeCwd, requestedCwd] = await Promise.all([
-          canonicalizePotentialPath(activeInfo.launchCwd),
-          canonicalizePotentialPath(launchCwd),
-        ]);
-        if (activeCwd === requestedCwd) {
-          await this.active.show();
-          return;
-        }
-      }
-      await this.overlay.ensure(
-        ctx,
-        this.buildRequest(config, config.hunk.args, "handoff", launchCwd),
-        config,
-      );
-      if (!this.overlay.isLive()) {
-        if (this.overlay.getState() === "closed") return;
-        throw new Error("Hunk overlay did not become live.");
-      }
-      this.active = this.overlay;
-    });
-    this.notifyStateChange();
-  }
-
   adoptManagedSession(session: LiveHunkSession): boolean {
     const adopted = this.active?.adoptManagedSession(session) ?? false;
     if (adopted) this.notifyStateChange();
     return adopted;
+  }
+
+  /** Restore one exact hidden managed review without changing its argv or source. */
+  async showManagedSurface(managedPid: number, sessionId?: string): Promise<boolean> {
+    const shown = await this.exclusive(async () => {
+      this.assertAlive();
+      const surface = this.active;
+      const info = surface?.getInfo();
+      if (
+        !surface?.isLive() ||
+        info?.pid !== managedPid ||
+        (sessionId !== undefined && info.sessionId !== sessionId)
+      ) {
+        return false;
+      }
+      await surface.show();
+      if (surface.getState() !== "visible") return false;
+      this.transitionRun({ type: "early-surface", event: "adopt" });
+      return true;
+    });
+    if (shown) this.notifyStateChange();
+    return shown;
   }
 
   adoptEarlySurfaceForRun(): void {
@@ -339,7 +306,12 @@ export class ReviewCoordinator {
   ): Promise<void> {
     await this.exclusive(async () => {
       this.assertAlive();
-      const request = this.buildRequest(config, args, source, ctx.cwd);
+      const request = this.buildRequest(
+        config,
+        args,
+        source,
+        this.active?.isLive() ? (this.active.getInfo()?.launchCwd ?? ctx.cwd) : ctx.cwd,
+      );
       if (this.active?.isLive()) {
         await this.active.toggle(ctx, request, config);
         this.transitionRun({ type: "early-surface", event: "adopt" });
@@ -359,7 +331,6 @@ export class ReviewCoordinator {
 
   async closeActive(): Promise<boolean> {
     this.suppressAutoOpenForRun("dismissed");
-    this.notifyReviewCancellation("close");
     const closed = await this.exclusive(() => this.closeActiveUnlocked());
     this.notifyStateChange();
     return closed;
@@ -445,8 +416,6 @@ export class ReviewCoordinator {
   }
 
   private async cleanupAll(): Promise<void> {
-    this.notifyReviewCancellation("session-boundary");
-    this.blockingState = "idle";
     this.generation += 1;
     if (this.followTimer) clearTimeout(this.followTimer);
     this.followTimer = null;
@@ -481,7 +450,6 @@ export class ReviewCoordinator {
   }
 
   private onChildExit(result: HunkExit): void {
-    this.notifyReviewCancellation("hunk-died");
     this.transitionRun({ type: "early-surface", event: "adopt" });
     if (result.exitCode === 0 && (result.signal ?? 0) === 0) {
       this.suppressAutoOpenForRun("dismissed");

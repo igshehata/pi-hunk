@@ -15,7 +15,7 @@ describe("/hunk subcommand routing invariants", () => {
 
   it("reserves exactly the settings/lifecycle words", () => {
     expect([...RESERVED_SUBCOMMANDS].sort()).toEqual(
-      ["close", "config", "feedback", "review", "status", "toggle"].sort(),
+      ["close", "config", "feedback", "next", "review", "status", "submit", "toggle"].sort(),
     );
   });
 });
@@ -28,6 +28,8 @@ describe("hunkArgumentCompletions", () => {
     const first = values("");
     expect(first).toContain("close");
     expect(first).toContain("feedback");
+    expect(first).toContain("submit");
+    expect(first).toContain("next");
     expect(first).toContain("review");
     expect(first).toContain("config");
     expect(first).not.toContain("send");

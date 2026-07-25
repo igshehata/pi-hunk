@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SettledEvidence } from "./change-detector.ts";
 import type { HunkConfig } from "./config.ts";
 import type { ReviewCoordinator } from "./coordinator.ts";
@@ -11,12 +11,7 @@ import {
   type ManagedHunkSessionWaitOptions,
   type ManagedHunkSessionWaitResult,
 } from "./hunk-session.ts";
-import {
-  canonicalizePotentialPath,
-  normalizeCandidatePath,
-  pathIsInside,
-  resolveLaunchDirectory,
-} from "./path-routing.ts";
+import { canonicalizePotentialPath, pathIsInside, resolveLaunchDirectory } from "./path-routing.ts";
 
 /** The deliberately small, read-only note shape exposed to the agent. */
 export interface HunkReviewNote {
@@ -42,14 +37,11 @@ export type HunkReviewResult =
       notes: HunkReviewNote[];
     };
 
-export type BlockingReviewResult =
+export type HunkFeedbackResult =
   | { status: "submitted"; message: string; notes: HunkReviewNote[] }
-  | { status: "approved"; message: string; notes: [] }
+  | { status: "pending"; message: string; notes: [] }
   | { status: "no-diff"; message: string; notes: [] }
-  | { status: "target-required"; reason: string; message: string; notes: [] }
-  | { status: "already-waiting"; message: string; notes: [] }
-  | { status: "unavailable"; reason: string; message: string; notes: [] }
-  | { status: "cancelled"; reason: string; message: string; notes: [] };
+  | { status: "unavailable"; reason: string; message: string; notes: [] };
 
 export type AutomaticReviewResult =
   | { status: "reviewable"; repoRoot: string; fileCount: number }
@@ -60,12 +52,13 @@ export type AutomaticReviewResult =
 
 export interface ReviewHandoffOptions {
   cwd: string;
-  /** Pin subsequent probes to the exact Hunk session selected for this gate. */
+  /** Pin subsequent probes to one exact Hunk session. */
   sessionId?: string;
   /** OS pid of the managed Pi-owned PTY leader, when available. */
   managedPid?: number;
   hunkBinary?: string;
   run?: HunkRunner;
+  signal?: AbortSignal;
 }
 
 interface CurrentComment {
@@ -207,54 +200,78 @@ interface CurrentRepository {
   closeWhenEmpty: boolean;
 }
 
-type WaiterState = "routing" | "visible" | "probing";
-
-interface Waiter {
-  ctx: ExtensionContext;
-  resolve: (result: BlockingReviewResult) => void;
-  unsubscribe: () => void;
-  removeAbort: () => void;
-  state: WaiterState;
-  signal?: AbortSignal;
-  replacementTimer?: ReturnType<typeof setTimeout>;
-}
-
 export type ReviewSessionWaiter = (
   options: ManagedHunkSessionWaitOptions,
 ) => Promise<ManagedHunkSessionWaitResult>;
 
-const SURFACE_REPLACEMENT_GRACE_MS = 250;
+interface ManagedReviewTarget {
+  launchCwd: string;
+  repoRoot?: string;
+  sessionId?: string;
+  managedPid: number;
+  fileCount: number;
+}
 
-/** One blocking gate and one repository queue per loaded Pi extension/session. */
+interface PendingReviewNote {
+  note: HunkReviewNote;
+}
+
+type ManagedReviewInspection =
+  | { status: "not-found" }
+  | { status: "surface-changed" }
+  | { status: "no-diff"; session: LiveHunkSession }
+  | { status: "reviewable"; session: LiveHunkSession; notes: HunkReviewNote[] };
+
+export type LateReviewSubmissionHandler = (notes: HunkReviewNote[]) => Promise<void> | void;
+
+/** One asynchronous comment handoff and repository queue per Pi session. */
 export class ReviewHandoffGate {
-  private waiter: Waiter | null = null;
   private readonly submittedNoteKeys = new Set<string>();
   private readonly pending: ReviewCandidate[] = [];
   private readonly pendingKeys = new Set<string>();
   private current: CurrentRepository | null = null;
   private unresolved = false;
   private evidenceRevision = 0;
-  private reviewedAny = false;
   private terminalNoDiffRevision: number | null = null;
   private sessionEpoch = 0;
+  private inspectionQueue: Promise<void> = Promise.resolve();
+  private readonly pendingReviewNotes = new Map<string, PendingReviewNote>();
+  private lateSubmissionHandler: LateReviewSubmissionHandler | null = null;
+  private lateStateUnsubscribe: (() => void) | null = null;
+  private lateSurfaceSnapshot: { key: string; state: string } | null = null;
+  private lateDelivery: Promise<void> | null = null;
 
   constructor(
     private readonly coordinator: ReviewCoordinator,
     private readonly getConfig: () => HunkConfig,
     private readonly run?: HunkRunner,
     private readonly waitForSession: ReviewSessionWaiter = waitForManagedHunkSession,
-  ) {
-    coordinator.onReviewCancellation((reason) => this.cancel(reason));
-  }
+  ) {}
 
-  isWaiting(): boolean {
-    return this.waiter !== null;
+  /** Deliver unseen comments whenever a managed Hunk surface is hidden. */
+  onLateSubmission(handler: LateReviewSubmissionHandler): () => void {
+    this.lateSubmissionHandler = handler;
+    if (!this.lateStateUnsubscribe) {
+      this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
+      this.lateStateUnsubscribe = this.coordinator.onStateChange(() =>
+        this.observeCoordinatorState(),
+      );
+    }
+    void this.dispatchLateNotes();
+    return () => {
+      if (this.lateSubmissionHandler !== handler) return;
+      this.lateSubmissionHandler = null;
+      this.lateStateUnsubscribe?.();
+      this.lateStateUnsubscribe = null;
+      this.lateSurfaceSnapshot = null;
+    };
   }
 
   resetSession(): void {
     this.sessionEpoch += 1;
-    this.cancel("session-boundary");
     this.evidenceRevision = 0;
+    this.pendingReviewNotes.clear();
+    this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
     this.resetPlan();
   }
 
@@ -303,81 +320,33 @@ export class ReviewHandoffGate {
     }
   }
 
-  async wait(
-    ctx: ExtensionContext,
-    signal?: AbortSignal,
-    explicitCwd?: string,
-  ): Promise<BlockingReviewResult> {
-    if (ctx.mode !== "tui") return this.unavailable("not-tui");
-    if (this.waiter) return this.alreadyWaiting(ctx);
-    if (signal?.aborted) return this.cancelled("abort-signal");
-    const waitEpoch = this.sessionEpoch;
-
-    if (explicitCwd !== undefined) {
-      let target: string;
-      try {
-        target = normalizeCandidatePath(explicitCwd, ctx.cwd);
-        // Validate that a safe existing launch directory can be derived before
-        // mutating queue state.
-        await resolveLaunchDirectory(target);
-      } catch (error) {
-        return this.unavailable(
-          "invalid-target",
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-      // Validation yields to the event loop. Recheck every admission condition
-      // before mutating queue state or installing the single waiter.
-      if (this.waiter) return this.alreadyWaiting(ctx);
-      if (signal?.aborted) return this.cancelled("abort-signal");
-      if (waitEpoch !== this.sessionEpoch) return this.cancelled("session-boundary");
-
-      const key = target;
-      if (this.terminalNoDiffRevision !== null && !this.pendingKeys.has(key)) {
-        this.terminalNoDiffRevision = null;
-        this.resetPlan();
-      }
-      this.addCandidate(target);
-      // Explicit cwd is the agent's resolution for all pathless evidence seen
-      // so far; later pathless mutations will set this flag again.
-      this.unresolved = false;
-    } else if (this.terminalNoDiffRevision !== null && this.pending.length === 0 && !this.current) {
-      return this.noDiffResult();
-    }
-
-    if (!this.current && this.pending.length === 0) {
-      if (this.unresolved) return this.targetRequired();
-      // Preserve direct/manual hunk_review and /hunk feedback behavior when no
-      // mutation evidence exists at all. Automatic pathless evidence takes the
-      // explicit target-required branch above instead.
-      this.addCandidate(ctx.cwd);
-    }
-
-    let resolveResult!: (value: BlockingReviewResult) => void;
-    const result = new Promise<BlockingReviewResult>((done) => {
-      resolveResult = done;
-    });
-    const onAbort = () => this.cancel("abort-signal");
-    signal?.addEventListener("abort", onAbort, { once: true });
-    const waiter: Waiter = {
-      ctx,
-      resolve: resolveResult,
-      unsubscribe: () => {},
-      removeAbort: () => signal?.removeEventListener("abort", onAbort),
-      state: "routing",
-      signal,
-    };
-    this.waiter = waiter;
-    this.coordinator.setBlockingReview(true);
-    waiter.unsubscribe = this.coordinator.onStateChange(() => this.observe(waiter));
-    void this.advance(waiter);
-    return result;
+  /** Force the same fresh-comment probe that normally runs on hide. */
+  async submit(ctx: ExtensionContext): Promise<HunkFeedbackResult> {
+    return this.runReviewAction(ctx);
   }
 
-  cancel(reason: string, detail?: string): void {
-    const waiter = this.waiter;
-    if (!waiter) return;
-    this.finish(waiter, this.cancelled(reason, detail));
+  /** Move to the next repository without implying human approval. */
+  async next(ctx: ExtensionContext): Promise<AutomaticReviewResult> {
+    if (ctx.mode !== "tui") {
+      return { status: "unavailable", reason: "not-tui" };
+    }
+    if (this.pending.length === 0) return { status: "no-evidence" };
+
+    // Probe even a still-visible review, then wait behind every inspection that
+    // was already queued by a hide. Replacing the process earlier could make
+    // its inline comments permanently unreachable.
+    const actionEpoch = this.sessionEpoch;
+    const probe = this.activeReviewTarget() ? await this.runReviewAction(ctx) : null;
+    await this.runInspection(async () => undefined);
+    if (actionEpoch !== this.sessionEpoch) {
+      return { status: "unavailable", reason: "session-boundary" };
+    }
+    if (probe?.status === "unavailable") {
+      return { status: "unavailable", reason: probe.reason, detail: probe.message };
+    }
+    if (this.pending.length === 0) return { status: "no-evidence" };
+    this.current = null;
+    return this.presentAutomatic(ctx, "auto");
   }
 
   private addCandidate(target: string): void {
@@ -394,58 +363,9 @@ export class ReviewHandoffGate {
     this.pendingKeys.delete(candidate.key);
   }
 
-  private async advance(waiter: Waiter): Promise<void> {
-    while (this.waiter === waiter) {
-      waiter.state = "routing";
-      try {
-        const routed = await this.routeNext(waiter.ctx, "handoff", waiter.signal);
-        if (this.waiter !== waiter) return;
-        if (routed.status === "unavailable") {
-          this.finish(
-            waiter,
-            routed.reason === "surface-not-live"
-              ? this.cancelled("hunk-closed")
-              : this.unavailable(routed.reason, routed.detail),
-          );
-          return;
-        }
-        if (routed.status === "no-diff") {
-          this.current = null;
-          if (routed.closeSurface) await this.coordinator.releaseSurfaceForRouting();
-          if (this.waiter !== waiter) return;
-          if (this.pending.length > 0) continue;
-          if (this.unresolved) {
-            this.finish(waiter, this.targetRequired());
-            return;
-          }
-          if (this.reviewedAny) {
-            this.completeApproved(waiter);
-          } else {
-            this.completeNoDiff();
-            this.finish(waiter, this.noDiffResult());
-          }
-          return;
-        }
-
-        this.coordinator.adoptEarlySurfaceForRun();
-        waiter.state = "visible";
-        this.observe(waiter);
-        return;
-      } catch (error) {
-        if (this.waiter !== waiter) return;
-        this.finish(
-          waiter,
-          this.cancelled("open-failed", error instanceof Error ? error.message : String(error)),
-        );
-        return;
-      }
-    }
-  }
-
   private async routeNext(
     ctx: ExtensionContext,
-    source: "auto" | "live" | "recover" | "handoff",
-    signal?: AbortSignal,
+    source: "auto" | "live" | "recover",
   ): Promise<
     | { status: "reviewable"; repository: CurrentRepository }
     | { status: "no-diff"; closeSurface: boolean }
@@ -462,7 +382,7 @@ export class ReviewHandoffGate {
 
     const existing = this.current;
     // Peek rather than consume: launch/session-registration failures must leave
-    // the target available for a later hunk_review retry.
+    // the target available for a later routing retry.
     const candidate = existing?.candidate ?? this.pending[0];
     if (!candidate) {
       return { status: "unavailable", reason: "no-review-target" };
@@ -485,12 +405,10 @@ export class ReviewHandoffGate {
     if (!isCurrentRoute()) return staleRoute();
     const config = this.getConfig();
     const reuseManualSurface =
-      source !== "handoff" &&
       (before?.source === "manual" || before?.source === "shortcut") &&
       beforeLaunchCwd === launchCwd;
-    if (source === "handoff") {
-      await this.coordinator.enterReviewGate(ctx, config, launchCwd);
-    } else if (!reuseManualSurface) {
+    const restoreManualSurface = reuseManualSurface && before?.state === "hidden";
+    if (!reuseManualSurface) {
       await this.coordinator.ensureOpen(ctx, config, config.hunk.args, source, launchCwd);
     }
     if (!isCurrentRoute()) return staleRoute();
@@ -520,7 +438,6 @@ export class ReviewHandoffGate {
       managedPid,
       hunkBinary: config.hunk.command,
       run: this.run,
-      signal,
     });
     if (!isCurrentRoute()) return staleRoute();
     if (lookup.status === "not-found") {
@@ -586,6 +503,17 @@ export class ReviewHandoffGate {
     if (lookup.status === "no-diff") {
       return { status: "no-diff", closeSurface: repository.closeWhenEmpty };
     }
+    if (
+      restoreManualSurface &&
+      !(await this.coordinator.showManagedSurface(repository.managedPid, repository.sessionId))
+    ) {
+      return {
+        status: "unavailable",
+        reason: "surface-changed",
+        detail: "The reused Hunk surface changed before it could be restored.",
+      };
+    }
+    if (!isCurrentRoute()) return staleRoute();
     return { status: "reviewable", repository };
   }
 
@@ -609,141 +537,303 @@ export class ReviewHandoffGate {
     return true;
   }
 
-  private observe(waiter: Waiter): void {
-    if (this.waiter !== waiter) return;
-    const state = this.coordinator.getActiveInfo()?.state;
-    if (waiter.state === "routing") return;
-    if (waiter.state !== "visible") return;
-    if (state === "hidden") {
-      this.clearReplacementTimer(waiter);
-      waiter.state = "probing";
-      void this.probe(waiter);
-      return;
-    }
-    if (state === "visible" || state === "starting") {
-      this.clearReplacementTimer(waiter);
-      return;
-    }
-    this.armReplacementTimer(waiter);
-  }
-
-  private armReplacementTimer(waiter: Waiter): void {
-    if (waiter.replacementTimer) return;
-    waiter.replacementTimer = setTimeout(() => {
-      waiter.replacementTimer = undefined;
-      if (this.waiter !== waiter || waiter.state !== "visible") return;
-      const state = this.coordinator.getActiveInfo()?.state;
-      if (!state || state === "closed" || state === "closing") this.cancel("hunk-closed");
-    }, SURFACE_REPLACEMENT_GRACE_MS);
-    waiter.replacementTimer.unref?.();
-  }
-
-  private clearReplacementTimer(waiter: Waiter): void {
-    if (!waiter.replacementTimer) return;
-    clearTimeout(waiter.replacementTimer);
-    waiter.replacementTimer = undefined;
-  }
-
   private noteKey(sessionId: string, note: HunkReviewNote): string {
     return `${sessionId}\0${note.noteId}`;
   }
 
-  private async probe(waiter: Waiter): Promise<void> {
-    const current = this.current;
-    if (this.waiter !== waiter || waiter.state !== "probing" || !current) return;
-    try {
-      const config = this.getConfig();
-      const refreshed = await this.waitForSession({
-        cwd: current.repoRoot,
-        sessionId: current.sessionId,
-        managedPid: current.managedPid,
-        hunkBinary: config.hunk.command,
-        run: this.run,
-        signal: waiter.signal,
-      });
-      if (this.waiter !== waiter) return;
-      if (refreshed.status === "not-found") {
-        this.cancel("hunk-died");
-        return;
-      }
-      if (refreshed.status === "no-diff") {
-        this.current = null;
-        if (current.closeWhenEmpty) await this.coordinator.releaseSurfaceForRouting();
-        if (this.waiter !== waiter) return;
-        if (this.pending.length > 0) {
-          waiter.state = "routing";
-          void this.advance(waiter);
-          return;
-        }
-        if (this.unresolved) {
-          this.finish(waiter, this.targetRequired());
-          return;
-        }
-        if (this.reviewedAny) this.completeApproved(waiter);
-        else {
-          this.completeNoDiff();
-          this.finish(waiter, this.noDiffResult());
-        }
-        return;
-      }
+  private runInspection<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.inspectionQueue.then(operation);
+    this.inspectionQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
 
-      const review = await readHunkReviewForSession(refreshed.session, {
-        cwd: current.repoRoot,
-        sessionId: current.sessionId,
-        managedPid: current.managedPid,
-        hunkBinary: config.hunk.command,
-        run: this.run,
-      });
-      if (this.waiter !== waiter) return;
-      current.sessionId = review.sessionId;
-      current.managedPid = review.pid;
-      current.fileCount = review.fileCount;
-      const unseenNotes = review.notes.filter(
-        (note) => !this.submittedNoteKeys.has(this.noteKey(review.sessionId, note)),
+  private async inspectTarget(
+    target: ManagedReviewTarget,
+    signal?: AbortSignal,
+  ): Promise<ManagedReviewInspection> {
+    const config = this.getConfig();
+    const refreshed = await this.waitForSession({
+      cwd: target.repoRoot ?? target.launchCwd,
+      sessionId: target.sessionId,
+      managedPid: target.managedPid,
+      hunkBinary: config.hunk.command,
+      run: this.run,
+      signal,
+    });
+    if (refreshed.status === "not-found") return { status: "not-found" };
+    if (
+      (target.sessionId !== undefined && refreshed.session.sessionId !== target.sessionId) ||
+      refreshed.session.pid !== target.managedPid
+    ) {
+      throw new Error("The managed Hunk session changed while comments were being collected.");
+    }
+
+    if (!this.sessionMatchesActiveSurface(refreshed.session)) {
+      return { status: "surface-changed" };
+    }
+    if (refreshed.status === "no-diff") {
+      return { status: "no-diff", session: refreshed.session };
+    }
+
+    const review = await readHunkReviewForSession(refreshed.session, {
+      cwd: refreshed.session.repoRoot ?? refreshed.session.cwd,
+      sessionId: refreshed.session.sessionId,
+      managedPid: refreshed.session.pid,
+      hunkBinary: config.hunk.command,
+      run: this.run,
+      signal,
+    });
+    return { status: "reviewable", session: refreshed.session, notes: review.notes };
+  }
+
+  private unseenNotes(sessionId: string, notes: HunkReviewNote[]): HunkReviewNote[] {
+    return notes.filter((note) => {
+      const key = this.noteKey(sessionId, note);
+      return !this.submittedNoteKeys.has(key) && !this.pendingReviewNotes.has(key);
+    });
+  }
+
+  private submittedResult(
+    notes: HunkReviewNote[],
+    totalOpenNotes = notes.length,
+  ): Extract<HunkFeedbackResult, { status: "submitted" }> {
+    return {
+      status: "submitted",
+      message:
+        notes.length === totalOpenNotes
+          ? `${notes.length} open Hunk review note(s).`
+          : `${notes.length} new Hunk review note(s); ${totalOpenNotes - notes.length} already submitted in this Pi extension.`,
+      notes,
+    };
+  }
+
+  private pendingResult(message: string): Extract<HunkFeedbackResult, { status: "pending" }> {
+    return { status: "pending", message, notes: [] };
+  }
+
+  private submitDetectedNotes(
+    sessionId: string,
+    notes: HunkReviewNote[],
+    totalOpenNotes: number,
+  ): HunkFeedbackResult {
+    const result = this.submittedResult(notes, totalOpenNotes);
+    this.terminalNoDiffRevision = null;
+    for (const note of notes) {
+      const key = this.noteKey(sessionId, note);
+      if (!this.submittedNoteKeys.has(key) && !this.pendingReviewNotes.has(key)) {
+        this.pendingReviewNotes.set(key, { note });
+      }
+    }
+    void this.dispatchLateNotes();
+    return result;
+  }
+
+  private async runReviewAction(ctx: ExtensionContext): Promise<HunkFeedbackResult> {
+    if (ctx.mode !== "tui") return this.unavailable("not-tui");
+    const actionEpoch = this.sessionEpoch;
+    if (this.lateDelivery) await this.lateDelivery;
+    if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
+
+    const queuedEntries = [...this.pendingReviewNotes.entries()];
+    if (queuedEntries.length > 0) {
+      await this.dispatchLateNotes();
+      if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
+      const delivered = queuedEntries.every(
+        ([key, entry]) => this.pendingReviewNotes.get(key) !== entry,
       );
-      if (unseenNotes.length > 0) {
-        for (const note of unseenNotes) {
-          this.submittedNoteKeys.add(this.noteKey(review.sessionId, note));
-        }
-        this.finish(waiter, {
-          status: "submitted",
-          message:
-            unseenNotes.length === review.notes.length
-              ? review.message
-              : `${unseenNotes.length} new Hunk review note(s); ${
-                  review.notes.length - unseenNotes.length
-                } already submitted in this Pi extension.`,
-          notes: unseenNotes,
-        });
-        return;
+      return delivered
+        ? this.submittedResult(queuedEntries.map(([, entry]) => entry.note))
+        : this.pendingResult(
+            "Fresh Hunk notes remain queued; run /hunk feedback if automatic delivery keeps failing.",
+          );
+    }
+
+    return this.runInspection(async () => {
+      if (actionEpoch !== this.sessionEpoch) {
+        return this.unavailable("session-boundary");
+      }
+      const target = this.reviewActionTarget();
+      if (!target) {
+        return this.unavailable(
+          "no-managed-review",
+          "No managed Hunk review is available to inspect for comments.",
+        );
       }
 
-      this.reviewedAny = true;
+      try {
+        const inspected = await this.inspectTarget(target);
+        if (actionEpoch !== this.sessionEpoch) {
+          return this.unavailable("session-boundary");
+        }
+        if (inspected.status === "not-found") return this.unavailable("hunk-died");
+        if (inspected.status === "surface-changed") {
+          return this.unavailable("surface-changed");
+        }
+        if (!this.adoptInspectedSession(target, inspected.session)) {
+          return this.unavailable("surface-changed");
+        }
+        if (inspected.status === "no-diff") {
+          if (this.current === target) {
+            const current = this.current;
+            this.current = null;
+            if (current.closeWhenEmpty) await this.coordinator.releaseSurfaceForRouting();
+            if (this.pending.length === 0 && !this.unresolved) this.completeNoDiff();
+          }
+          return this.noDiffResult();
+        }
+
+        const sessionId = inspected.session.sessionId;
+        const unseen = this.unseenNotes(sessionId, inspected.notes);
+        if (unseen.length === 0) {
+          return this.pendingResult("No new Hunk notes were found.");
+        }
+
+        const result = this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
+        if (this.lateDelivery) await this.lateDelivery;
+        return unseen.some((note) => this.pendingReviewNotes.has(this.noteKey(sessionId, note)))
+          ? this.pendingResult(
+              "Fresh Hunk notes remain queued; run /hunk feedback if automatic delivery keeps failing.",
+            )
+          : result;
+      } catch (error) {
+        return this.unavailable(
+          "comment-probe-failed",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    });
+  }
+
+  private sessionMatchesActiveSurface(session: LiveHunkSession): boolean {
+    const active = this.activeReviewTarget();
+    return Boolean(
+      active &&
+      active.managedPid === session.pid &&
+      (active.sessionId === undefined || active.sessionId === session.sessionId),
+    );
+  }
+
+  private adoptInspectedSession(target: ManagedReviewTarget, session: LiveHunkSession): boolean {
+    if (!this.sessionMatchesActiveSurface(session)) return false;
+    if (!this.coordinator.adoptManagedSession(session)) return false;
+    target.sessionId = session.sessionId;
+    target.repoRoot = session.repoRoot;
+    target.managedPid = session.pid;
+    target.fileCount = session.fileCount;
+    return true;
+  }
+
+  private currentMatchesActiveTarget(active: ManagedReviewTarget | null): boolean {
+    return Boolean(
+      active &&
+      this.current?.managedPid === active.managedPid &&
+      this.current.sessionId === active.sessionId,
+    );
+  }
+
+  private reviewActionTarget(): ManagedReviewTarget | null {
+    const active = this.activeReviewTarget();
+    return this.currentMatchesActiveTarget(active) ? this.current : active;
+  }
+
+  private activeReviewTarget(): ManagedReviewTarget | null {
+    const info = this.coordinator.getActiveInfo();
+    if (
+      !info ||
+      (info.state !== "visible" && info.state !== "hidden") ||
+      info.pid === undefined ||
+      !Number.isInteger(info.pid) ||
+      info.pid <= 0
+    ) {
+      return null;
+    }
+    return {
+      launchCwd: info.launchCwd,
+      repoRoot: info.repoRoot,
+      sessionId: info.sessionId,
+      managedPid: info.pid,
+      fileCount: info.fileCount ?? 0,
+    };
+  }
+
+  private currentSurfaceSnapshot(): { key: string; state: string } | null {
+    const info = this.coordinator.getActiveInfo();
+    if (!info) return null;
+    return {
+      // Session metadata may be adopted between visible and hidden without a
+      // distinct surface transition. The managed PID + argv identity remains
+      // stable for that same persistent review.
+      key: `${info.argsKey}\0${info.pid ?? ""}`,
+      state: info.state,
+    };
+  }
+
+  private observeCoordinatorState(): void {
+    if (this.current && !this.currentMatchesActiveTarget(this.activeReviewTarget())) {
       this.current = null;
-      if (this.pending.length > 0) {
-        waiter.state = "routing";
-        void this.advance(waiter);
-        return;
+    }
+    this.observeLateSurface();
+  }
+
+  private observeLateSurface(): void {
+    const previous = this.lateSurfaceSnapshot;
+    const current = this.currentSurfaceSnapshot();
+    this.lateSurfaceSnapshot = current;
+    if (
+      !previous ||
+      !current ||
+      previous.key !== current.key ||
+      previous.state !== "visible" ||
+      current.state !== "hidden"
+    ) {
+      return;
+    }
+    const target = this.activeReviewTarget();
+    if (!target) return;
+    const epoch = this.sessionEpoch;
+    void this.runInspection(() => this.probeLateTarget(target, epoch));
+  }
+
+  private async probeLateTarget(target: ManagedReviewTarget, epoch: number): Promise<void> {
+    try {
+      const inspected = await this.inspectTarget(target);
+      if (epoch !== this.sessionEpoch || inspected.status !== "reviewable") return;
+      if (!this.adoptInspectedSession(target, inspected.session)) return;
+      const sessionId = inspected.session.sessionId;
+      const unseen = this.unseenNotes(sessionId, inspected.notes);
+      if (unseen.length > 0) {
+        this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
       }
-      if (this.unresolved) {
-        this.finish(waiter, this.targetRequired());
-        return;
-      }
-      this.completeApproved(waiter);
-    } catch (error) {
-      this.cancel("comment-probe-failed", error instanceof Error ? error.message : String(error));
+    } catch {
+      // /hunk feedback remains the explicit recovery path after a failed late probe.
     }
   }
 
-  private completeApproved(waiter: Waiter): void {
-    this.coordinator.markReviewCompleteForRun();
-    this.resetPlan();
-    this.finish(waiter, {
-      status: "approved",
-      message:
-        "No new Hunk user notes were found across all discovered repositories; hiding Hunk is treated as approval.",
-      notes: [],
-    });
+  private async dispatchLateNotes(): Promise<void> {
+    const handler = this.lateSubmissionHandler;
+    if (!handler || this.lateDelivery || this.pendingReviewNotes.size === 0) return;
+    const batch = [...this.pendingReviewNotes.entries()];
+    let delivered = false;
+    const delivery = (async () => {
+      try {
+        await handler(batch.map(([, entry]) => entry.note));
+        delivered = true;
+        for (const [key, entry] of batch) {
+          if (this.pendingReviewNotes.get(key) !== entry) continue;
+          this.pendingReviewNotes.delete(key);
+          this.submittedNoteKeys.add(key);
+        }
+      } catch {
+        // Keep the notes queued so /hunk feedback can recover them.
+      }
+    })();
+    this.lateDelivery = delivery;
+    await delivery;
+    if (this.lateDelivery === delivery) this.lateDelivery = null;
+    if (delivered && this.pendingReviewNotes.size > 0) void this.dispatchLateNotes();
   }
 
   private completeNoDiff(): void {
@@ -757,19 +847,10 @@ export class ReviewHandoffGate {
     this.pendingKeys.clear();
     this.current = null;
     this.unresolved = false;
-    this.reviewedAny = false;
     if (!preserveNoDiff) this.terminalNoDiffRevision = null;
   }
 
-  private alreadyWaiting(ctx: ExtensionContext): BlockingReviewResult {
-    return {
-      status: "already-waiting",
-      message: `A Hunk review is already waiting for ${this.current?.repoRoot ?? ctx.cwd}.`,
-      notes: [],
-    };
-  }
-
-  private noDiffResult(): BlockingReviewResult {
+  private noDiffResult(): HunkFeedbackResult {
     return {
       status: "no-diff",
       message: "Hunk reported no reviewable changes for any discovered repository.",
@@ -777,28 +858,7 @@ export class ReviewHandoffGate {
     };
   }
 
-  private targetRequired(): BlockingReviewResult {
-    return {
-      status: "target-required",
-      reason: "pathless-mutation",
-      message:
-        "Successful pathless mutation evidence has no safe review target. Call hunk_review again with cwd set to the repository or a path inside it.",
-      notes: [],
-    };
-  }
-
-  private cancelled(reason: string, detail?: string): BlockingReviewResult {
-    return {
-      status: "cancelled",
-      reason,
-      message: detail
-        ? `Hunk review cancelled (${reason}): ${detail}`
-        : `Hunk review cancelled (${reason}).`,
-      notes: [],
-    };
-  }
-
-  private unavailable(reason: string, detail?: string): BlockingReviewResult {
+  private unavailable(reason: string, detail?: string): HunkFeedbackResult {
     return {
       status: "unavailable",
       reason,
@@ -811,47 +871,4 @@ export class ReviewHandoffGate {
       notes: [],
     };
   }
-
-  private finish(waiter: Waiter, value: BlockingReviewResult): void {
-    if (this.waiter !== waiter) return;
-    this.waiter = null;
-    this.clearReplacementTimer(waiter);
-    waiter.unsubscribe();
-    waiter.removeAbort();
-    this.coordinator.setBlockingReview(false);
-    waiter.resolve(value);
-  }
-}
-
-/** Register the blocking, read-only review gate tool. */
-export function registerHunkReviewTool(pi: ExtensionAPI, gate: ReviewHandoffGate): void {
-  pi.registerTool({
-    name: "hunk_review",
-    label: "Hunk Review",
-    description:
-      "Open Hunk for inferred mutation targets (or an explicit cwd) and wait for the human to hide it. Returns only previously unseen user notes. Read-only: never create, edit, apply, resolve, or clear comments.",
-    promptSnippet: "Wait for fresh human review notes in Hunk (read-only)",
-    promptGuidelines: [
-      "Call hunk_review when review is requested and address every returned note comment-by-comment.",
-      "Pass cwd when changes came from a pathless shell command or after changing directories and the target cannot be inferred.",
-      "Treat status=approved or status=no-diff as terminal; do not keep waiting or retry unless new changes need review.",
-      "Never create, edit, apply, resolve, or clear Hunk comments; hunk_review is read-only.",
-    ],
-    parameters: {
-      type: "object",
-      properties: {
-        cwd: {
-          type: "string",
-          description:
-            "Optional repository or path to review. Relative values resolve from Pi's startup cwd.",
-        },
-      },
-      additionalProperties: false,
-    } as const,
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      const cwd = (params as { cwd?: string }).cwd;
-      const value = await gate.wait(ctx, signal, cwd);
-      return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }], details: value };
-    },
-  });
 }

@@ -12,7 +12,6 @@ import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
  * interface; derive the tool-execution shapes instead of redeclaring them so
  * they can never drift from the package.
  */
-type BeforeAgentStartEvent = Extract<ExtensionEvent, { type: "before_agent_start" }>;
 type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
 type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end" }>;
 import { isMutation, mutationTargetPaths, ChangeDetector } from "./change-detector.ts";
@@ -31,9 +30,9 @@ import { ReviewCoordinator } from "./coordinator.ts";
 import { handleConfigCommand } from "./config-command.ts";
 import {
   readHunkReview,
-  registerHunkReviewTool,
   ReviewHandoffGate,
-  type BlockingReviewResult,
+  type AutomaticReviewResult,
+  type HunkFeedbackResult,
   type HunkReviewNote,
   type ReviewSessionWaiter,
 } from "./review-handoff.ts";
@@ -120,6 +119,33 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
   coordinator.onStateChange(() => {
     if (statusContext) updateStatus(statusContext, store.get(), coordinator);
   });
+  reviewGate.onLateSubmission(async (notes) => {
+    const ctx = statusContext;
+    if (!ctx) throw new Error("The Pi session ended before late Hunk feedback was delivered.");
+    try {
+      const message = formatManualFeedback(notes);
+      if (ctx.isIdle()) pi.sendUserMessage(message);
+      else pi.sendUserMessage(message, { deliverAs: "followUp" });
+    } catch (error) {
+      try {
+        ctx.ui.notify(
+          `Could not send Hunk feedback; it remains queued for /hunk feedback: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      } catch {
+        // Delivery failure is still reflected by the rejected handler below.
+      }
+      throw error;
+    }
+    try {
+      ctx.ui.notify(
+        `Sent ${notes.length} Hunk feedback note${notes.length === 1 ? "" : "s"} to the agent.`,
+        "info",
+      );
+    } catch {
+      // The user turn was sent; a notification failure must not duplicate it.
+    }
+  });
 
   const diagnostics: SettledDiagnostics = { decision: null };
   const lifecycle: LifecycleDeps = {
@@ -136,29 +162,18 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
 
   pi.on("session_start", (_event, ctx) => onSessionStart(ctx, lifecycle));
   pi.on("session_shutdown", (_event, ctx) => onSessionShutdown(ctx, lifecycle));
-  pi.on("before_agent_start", (event, ctx) => onBeforeAgentStart(event, ctx, store));
   pi.on("agent_start", (_event, ctx) => onAgentStart(ctx, lifecycle));
   pi.on("agent_settled", (_event, ctx) => onAgentSettled(ctx, lifecycle));
   pi.on("tool_call", (event, ctx) => onToolCall(event, ctx, lifecycle));
   pi.on("tool_execution_start", (event, ctx) => onToolExecutionStart(event, ctx, lifecycle));
   pi.on("tool_execution_end", (event, ctx) => onToolExecutionEnd(event, ctx, lifecycle));
 
-  registerHunkReviewTool(pi, reviewGate);
   pi.registerCommand("hunk", {
     description:
-      "Hunk review: /hunk [target] · feedback · close · toggle · status · review [policy] · config",
+      "Hunk review: /hunk [target] · submit · feedback · next · close · toggle · status · review [policy] · config",
     getArgumentCompletions: (argumentText) => hunkArgumentCompletions(argumentText),
     handler: (input, ctx) =>
-      routeHunkCommand(
-        input,
-        ctx,
-        store,
-        coordinator,
-        diagnostics,
-        deps.reviewRun,
-        reviewGate,
-        (message) => pi.sendUserMessage(message),
-      ),
+      routeHunkCommand(input, ctx, store, coordinator, diagnostics, deps.reviewRun, reviewGate),
   });
 }
 
@@ -211,31 +226,6 @@ async function onSessionShutdown(ctx: ExtensionContext, deps: LifecycleDeps): Pr
   ctx.ui.setStatus("hunk", undefined);
 }
 
-/**
- * Tell the agent to enter the blocking hunk_review gate only after a coding
- * mutation. This keeps chat/read-only turns quiet while ensuring automatic
- * policies actually wait for human comments (or Hunk close/Q) before the agent
- * can finish and receive review notes.
- */
-function onBeforeAgentStart(
-  event: BeforeAgentStartEvent,
-  ctx: ExtensionContext,
-  store: ConfigStore,
-): { systemPrompt: string } | undefined {
-  const review = store.get().review;
-  if (review === "off" || ctx.mode !== "tui") return undefined;
-  return {
-    systemPrompt:
-      `${event.systemPrompt}\n\n` +
-      `Pi-hunk automatic review policy is "${review}". ` +
-      `If this run successfully changes code, you MUST call hunk_review after the changes and before finishing. ` +
-      `The tool blocks until the human hides Hunk; it returns fresh notes, approved when there are no new notes, no-diff when Hunk finds no reviewable changes, or cancelled when Hunk closes/Q. ` +
-      `When you changed files through a pathless shell command or after changing directories, call hunk_review with cwd set to that repository. ` +
-      `Address every returned note, then call hunk_review again after any fixes until it returns approved or no-diff. ` +
-      `Do not call hunk_review for conversation-only or read-only turns.`,
-  };
-}
-
 /** agent_start: reset coordinator flags for the new agent turn. */
 function onAgentStart(_ctx: ExtensionContext, deps: LifecycleDeps): void {
   deps.coordinator.resetRunFlags();
@@ -272,7 +262,6 @@ function maybeOpenLiveReview(
       review: config.review,
       uiMode: ctx.mode,
       alreadyOpenedForRun: coordinator.hasOpenedForRun(),
-      activeBlocking: coordinator.isBlocking(),
     })
   ) {
     return;
@@ -288,8 +277,8 @@ function maybeOpenLiveReview(
     );
     return;
   }
-  // Pathless shell commands are intentionally not guessed. hunk_review.cwd is
-  // the explicit boundary for commands that may have changed directories.
+  // Pathless shell commands are intentionally not guessed because they may
+  // have changed directories through arbitrary shell syntax.
   if (!target) return;
 
   coordinator.markOpenedForRun();
@@ -393,7 +382,6 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
   const action = settledAutoOpenAction({
     review: config.review,
     uiMode: ctx.mode,
-    activeBlocking: coordinator.isBlocking(),
     shouldReview: evidence.mutation,
     hasLiveSurface: coordinator.hasLiveSurface(),
     autoOpenSuppression: suppression,
@@ -405,7 +393,6 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     action,
     review: config.review,
     uiMode: ctx.mode,
-    activeBlocking: coordinator.isBlocking(),
     activeVisible: coordinator.hasLiveSurface() && info?.state === "visible",
     activeLive: coordinator.hasLiveSurface(),
     autoOpenSuppression: suppression,
@@ -413,11 +400,7 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
   diagnostics.decision = decision;
 
   const canPresent =
-    evidence.mutation &&
-    config.review !== "off" &&
-    ctx.mode === "tui" &&
-    !coordinator.isBlocking() &&
-    !suppression;
+    evidence.mutation && config.review !== "off" && ctx.mode === "tui" && !suppression;
 
   try {
     if (!canPresent) return;
@@ -439,7 +422,7 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     if (presented.status === "target-required") {
       diagnostics.decision = { action: "skipped", reason: "target-required" };
       ctx.ui.notify(
-        "Automatic Hunk review needs an explicit target for a pathless mutation; call hunk_review with cwd.",
+        "Automatic Hunk review skipped a pathless mutation because its repository could not be inferred safely; open Hunk manually from the target repository.",
         "warning",
       );
       return;
@@ -469,8 +452,7 @@ async function routeHunkCommand(
   coordinator: ReviewCoordinator,
   diagnostics: SettledDiagnostics,
   reviewRun: HunkRunner | undefined,
-  reviewGate: Pick<ReviewHandoffGate, "wait">,
-  sendUserMessage: (message: string) => void,
+  reviewGate: Pick<ReviewHandoffGate, "submit" | "next">,
 ): Promise<void> {
   const trimmed = input.trim();
   const first = trimmed.split(/\s+/)[0] ?? "";
@@ -490,7 +472,15 @@ async function routeHunkCommand(
       return;
     case "feedback":
       if (!acceptsNoArguments("feedback", rest, ctx)) return;
-      await handleFeedback(ctx, reviewGate, sendUserMessage);
+      await handleFeedback(ctx, reviewGate);
+      return;
+    case "submit":
+      if (!acceptsNoArguments("submit", rest, ctx)) return;
+      await handleReviewAction(ctx, reviewGate);
+      return;
+    case "next":
+      if (!acceptsNoArguments("next", rest, ctx)) return;
+      await handleNextRepository(ctx, reviewGate);
       return;
     case "review":
       await handleReviewCommand(rest, ctx, store);
@@ -509,7 +499,7 @@ async function routeHunkCommand(
 }
 
 function acceptsNoArguments(
-  subcommand: "close" | "toggle" | "status" | "feedback",
+  subcommand: "close" | "toggle" | "status" | "feedback" | "submit" | "next",
   input: string,
   ctx: ExtensionContext,
 ): boolean {
@@ -520,26 +510,24 @@ function acceptsNoArguments(
 
 export function formatManualFeedback(notes: HunkReviewNote[]): string {
   return [
-    "Manual Hunk feedback was submitted. Address every note below comment-by-comment, then run the relevant checks.",
+    "Hunk feedback was submitted. Address every note below comment-by-comment, then run the relevant checks.",
     JSON.stringify({ status: "submitted", notes }, null, 2),
   ].join("\n\n");
 }
 
-/** Manual fallback when an agent finishes without entering the blocking hunk_review tool. */
-export async function handleFeedback(
+/** Force an immediate fresh-comment probe; normal hides do this automatically. */
+export async function handleReviewAction(
   ctx: ExtensionCommandContext,
-  gate: Pick<ReviewHandoffGate, "wait">,
-  sendUserMessage: (message: string) => void,
+  gate: Pick<ReviewHandoffGate, "submit">,
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify("Hunk feedback requires Pi's interactive TUI mode.", "warning");
     return;
   }
 
-  await ctx.waitForIdle();
-  let result: BlockingReviewResult;
+  let result: HunkFeedbackResult;
   try {
-    result = await gate.wait(ctx);
+    result = await gate.submit(ctx);
   } catch (error) {
     ctx.ui.notify(
       `Could not collect Hunk feedback: ${error instanceof Error ? error.message : String(error)}`,
@@ -547,27 +535,48 @@ export async function handleFeedback(
     );
     return;
   }
+  ctx.ui.notify(
+    result.message,
+    result.status === "submitted" || result.status === "pending" || result.status === "no-diff"
+      ? "info"
+      : "warning",
+  );
+}
 
-  if (result.status === "submitted") {
-    try {
-      sendUserMessage(formatManualFeedback(result.notes));
-      ctx.ui.notify(
-        `Sent ${result.notes.length} Hunk feedback note${result.notes.length === 1 ? "" : "s"} to the agent.`,
-        "info",
-      );
-    } catch (error) {
-      ctx.ui.notify(
-        `Could not send Hunk feedback to the agent: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-    }
+/** Manual recovery alias for the same immediate probe used by /hunk submit. */
+export async function handleFeedback(
+  ctx: ExtensionCommandContext,
+  gate: Pick<ReviewHandoffGate, "submit">,
+): Promise<void> {
+  await handleReviewAction(ctx, gate);
+}
+
+async function handleNextRepository(
+  ctx: ExtensionCommandContext,
+  gate: Pick<ReviewHandoffGate, "next">,
+): Promise<void> {
+  let result: AutomaticReviewResult;
+  try {
+    result = await gate.next(ctx);
+  } catch (error) {
+    ctx.ui.notify(
+      `Could not open the next Hunk review: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
     return;
   }
 
-  ctx.ui.notify(
-    result.message,
-    result.status === "approved" || result.status === "no-diff" ? "info" : "warning",
-  );
+  if (result.status === "reviewable") {
+    ctx.ui.notify(`Opened the next Hunk review (${result.repoRoot}).`, "info");
+  } else if (result.status === "no-evidence") {
+    ctx.ui.notify("No additional repository is queued for review.", "info");
+  } else if (result.status === "no-diff") {
+    ctx.ui.notify("No additional queued repository has a reviewable diff.", "info");
+  } else if (result.status === "target-required") {
+    ctx.ui.notify("The next review target could not be inferred safely.", "warning");
+  } else {
+    ctx.ui.notify(`Could not open the next Hunk review (${result.reason}).`, "warning");
+  }
 }
 
 async function handleOpen(
