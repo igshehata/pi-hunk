@@ -218,14 +218,9 @@ interface PendingReviewNote {
 
 type ManagedReviewInspection =
   | { status: "not-found" }
-  | { status: "no-diff" }
-  | {
-      status: "reviewable";
-      sessionId: string;
-      pid: number;
-      fileCount: number;
-      notes: HunkReviewNote[];
-    };
+  | { status: "surface-changed" }
+  | { status: "no-diff"; session: LiveHunkSession }
+  | { status: "reviewable"; session: LiveHunkSession; notes: HunkReviewNote[] };
 
 export type LateReviewSubmissionHandler = (notes: HunkReviewNote[]) => Promise<void> | void;
 
@@ -258,7 +253,9 @@ export class ReviewHandoffGate {
     this.lateSubmissionHandler = handler;
     if (!this.lateStateUnsubscribe) {
       this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
-      this.lateStateUnsubscribe = this.coordinator.onStateChange(() => this.observeLateSurface());
+      this.lateStateUnsubscribe = this.coordinator.onStateChange(() =>
+        this.observeCoordinatorState(),
+      );
     }
     void this.dispatchLateNotes();
     return () => {
@@ -548,11 +545,12 @@ export class ReviewHandoffGate {
       throw new Error("The managed Hunk session changed while comments were being collected.");
     }
 
-    target.sessionId = refreshed.session.sessionId;
-    target.repoRoot = refreshed.session.repoRoot;
-    target.fileCount = refreshed.session.fileCount;
-    this.coordinator.adoptManagedSession(refreshed.session);
-    if (refreshed.status === "no-diff") return { status: "no-diff" };
+    if (!this.sessionMatchesActiveSurface(refreshed.session)) {
+      return { status: "surface-changed" };
+    }
+    if (refreshed.status === "no-diff") {
+      return { status: "no-diff", session: refreshed.session };
+    }
 
     const review = await readHunkReviewForSession(refreshed.session, {
       cwd: refreshed.session.repoRoot ?? refreshed.session.cwd,
@@ -562,13 +560,7 @@ export class ReviewHandoffGate {
       run: this.run,
       signal,
     });
-    return {
-      status: "reviewable",
-      sessionId: review.sessionId,
-      pid: review.pid,
-      fileCount: review.fileCount,
-      notes: review.notes,
-    };
+    return { status: "reviewable", session: refreshed.session, notes: review.notes };
   }
 
   private unseenNotes(sessionId: string, notes: HunkReviewNote[]): HunkReviewNote[] {
@@ -632,7 +624,7 @@ export class ReviewHandoffGate {
 
     return this.runInspection(async () => {
       const actionEpoch = this.sessionEpoch;
-      const target: ManagedReviewTarget | null = this.current ?? this.activeReviewTarget();
+      const target = this.reviewActionTarget();
       if (!target) {
         return this.unavailable(
           "no-managed-review",
@@ -646,6 +638,12 @@ export class ReviewHandoffGate {
           return this.unavailable("session-boundary");
         }
         if (inspected.status === "not-found") return this.unavailable("hunk-died");
+        if (inspected.status === "surface-changed") {
+          return this.unavailable("surface-changed");
+        }
+        if (!this.adoptInspectedSession(target, inspected.session)) {
+          return this.unavailable("surface-changed");
+        }
         if (inspected.status === "no-diff") {
           if (this.current === target) {
             const current = this.current;
@@ -656,23 +654,15 @@ export class ReviewHandoffGate {
           return this.noDiffResult();
         }
 
-        target.sessionId = inspected.sessionId;
-        target.managedPid = inspected.pid;
-        target.fileCount = inspected.fileCount;
-        const unseen = this.unseenNotes(inspected.sessionId, inspected.notes);
+        const sessionId = inspected.session.sessionId;
+        const unseen = this.unseenNotes(sessionId, inspected.notes);
         if (unseen.length === 0) {
           return this.pendingResult("No new Hunk notes were found.");
         }
 
-        const result = this.submitDetectedNotes(
-          inspected.sessionId,
-          unseen,
-          inspected.notes.length,
-        );
+        const result = this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
         if (this.lateDelivery) await this.lateDelivery;
-        return unseen.some((note) =>
-          this.pendingReviewNotes.has(this.noteKey(inspected.sessionId, note)),
-        )
+        return unseen.some((note) => this.pendingReviewNotes.has(this.noteKey(sessionId, note)))
           ? this.pendingResult(
               "Fresh Hunk notes remain queued; run /hunk feedback if automatic delivery keeps failing.",
             )
@@ -684,6 +674,38 @@ export class ReviewHandoffGate {
         );
       }
     });
+  }
+
+  private sessionMatchesActiveSurface(session: LiveHunkSession): boolean {
+    const active = this.activeReviewTarget();
+    return Boolean(
+      active &&
+      active.managedPid === session.pid &&
+      (active.sessionId === undefined || active.sessionId === session.sessionId),
+    );
+  }
+
+  private adoptInspectedSession(target: ManagedReviewTarget, session: LiveHunkSession): boolean {
+    if (!this.sessionMatchesActiveSurface(session)) return false;
+    if (!this.coordinator.adoptManagedSession(session)) return false;
+    target.sessionId = session.sessionId;
+    target.repoRoot = session.repoRoot;
+    target.managedPid = session.pid;
+    target.fileCount = session.fileCount;
+    return true;
+  }
+
+  private currentMatchesActiveTarget(active: ManagedReviewTarget | null): boolean {
+    return Boolean(
+      active &&
+      this.current?.managedPid === active.managedPid &&
+      this.current.sessionId === active.sessionId,
+    );
+  }
+
+  private reviewActionTarget(): ManagedReviewTarget | null {
+    const active = this.activeReviewTarget();
+    return this.currentMatchesActiveTarget(active) ? this.current : active;
   }
 
   private activeReviewTarget(): ManagedReviewTarget | null {
@@ -718,6 +740,13 @@ export class ReviewHandoffGate {
     };
   }
 
+  private observeCoordinatorState(): void {
+    if (this.current && !this.currentMatchesActiveTarget(this.activeReviewTarget())) {
+      this.current = null;
+    }
+    this.observeLateSurface();
+  }
+
   private observeLateSurface(): void {
     const previous = this.lateSurfaceSnapshot;
     const current = this.currentSurfaceSnapshot();
@@ -741,17 +770,11 @@ export class ReviewHandoffGate {
     try {
       const inspected = await this.inspectTarget(target);
       if (epoch !== this.sessionEpoch || inspected.status !== "reviewable") return;
-      const active = this.activeReviewTarget();
-      if (
-        !active ||
-        active.managedPid !== inspected.pid ||
-        (active.sessionId !== undefined && active.sessionId !== inspected.sessionId)
-      ) {
-        return;
-      }
-      const unseen = this.unseenNotes(inspected.sessionId, inspected.notes);
+      if (!this.adoptInspectedSession(target, inspected.session)) return;
+      const sessionId = inspected.session.sessionId;
+      const unseen = this.unseenNotes(sessionId, inspected.notes);
       if (unseen.length > 0) {
-        this.submitDetectedNotes(inspected.sessionId, unseen, inspected.notes.length);
+        this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
       }
     } catch {
       // /hunk feedback remains the explicit recovery path after a failed late probe.

@@ -6,14 +6,8 @@ export function shouldEarlyOpenOnMutation(options: {
   review: ReviewPolicy;
   uiMode: string;
   alreadyOpenedForRun: boolean;
-  activeBlocking: boolean;
 }): boolean {
-  return (
-    options.review === "live" &&
-    options.uiMode === "tui" &&
-    !options.alreadyOpenedForRun &&
-    !options.activeBlocking
-  );
+  return options.review === "live" && options.uiMode === "tui" && !options.alreadyOpenedForRun;
 }
 
 export type SettledOpenReason = "mutation" | "recover";
@@ -22,7 +16,6 @@ export type SettledSkipReason =
   | "review-off"
   | "already-open"
   | "not-tui"
-  | "blocking"
   | "no-diff"
   | "target-required"
   | AutoOpenSuppressionReason;
@@ -35,7 +28,6 @@ export type SettledDecision =
 export function settledAutoOpenAction(options: {
   review: ReviewPolicy;
   uiMode: string;
-  activeBlocking: boolean;
   shouldReview: boolean;
   hasLiveSurface: boolean;
   autoOpenSuppression?: AutoOpenSuppressionReason | null;
@@ -44,7 +36,6 @@ export function settledAutoOpenAction(options: {
     options.autoOpenSuppression ||
     !options.shouldReview ||
     options.review === "off" ||
-    options.activeBlocking ||
     options.uiMode !== "tui"
   ) {
     return "skip";
@@ -57,7 +48,6 @@ export function explainSettledDecision(options: {
   action: "skip" | "launch" | "recover";
   review: ReviewPolicy;
   uiMode: string;
-  activeBlocking: boolean;
   activeVisible: boolean;
   activeLive?: boolean;
   autoOpenSuppression?: AutoOpenSuppressionReason | null;
@@ -65,7 +55,6 @@ export function explainSettledDecision(options: {
   if (options.action === "skip") {
     if (options.review === "off") return { action: "skipped", reason: "review-off" };
     if (options.uiMode !== "tui") return { action: "skipped", reason: "not-tui" };
-    if (options.activeBlocking) return { action: "skipped", reason: "blocking" };
     if (options.autoOpenSuppression)
       return { action: "skipped", reason: options.autoOpenSuppression };
     if (options.review === "live" && (options.activeLive ?? options.activeVisible)) {

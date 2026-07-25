@@ -262,7 +262,6 @@ function maybeOpenLiveReview(
       review: config.review,
       uiMode: ctx.mode,
       alreadyOpenedForRun: coordinator.hasOpenedForRun(),
-      activeBlocking: false,
     })
   ) {
     return;
@@ -383,7 +382,6 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
   const action = settledAutoOpenAction({
     review: config.review,
     uiMode: ctx.mode,
-    activeBlocking: false,
     shouldReview: evidence.mutation,
     hasLiveSurface: coordinator.hasLiveSurface(),
     autoOpenSuppression: suppression,
@@ -395,7 +393,6 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     action,
     review: config.review,
     uiMode: ctx.mode,
-    activeBlocking: false,
     activeVisible: coordinator.hasLiveSurface() && info?.state === "visible",
     activeLive: coordinator.hasLiveSurface(),
     autoOpenSuppression: suppression,

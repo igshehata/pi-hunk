@@ -3,4 +3,5 @@
 ---
 
 Route automatic reviews to every Hunk-reported repository touched by structured mutation targets,
-support explicit cwd routing for pathless shell changes, and skip Hunk-confirmed empty reviews.
+warn instead of guessing when pathless shell mutations cannot be routed safely, and skip
+Hunk-confirmed empty reviews.

@@ -13,19 +13,17 @@ describe("shouldEarlyOpenOnMutation", () => {
     review: "live" as const,
     uiMode: "tui",
     alreadyOpenedForRun: false,
-    activeBlocking: false,
   };
 
   it("allows the first live overlay mutation open", () => {
     expect(shouldEarlyOpenOnMutation(base)).toBe(true);
   });
 
-  it("rejects after-run, off, non-tui, already-open, and blocking modes", () => {
+  it("rejects after-run, off, non-tui, and already-open modes", () => {
     expect(shouldEarlyOpenOnMutation({ ...base, review: "after-run" })).toBe(false);
     expect(shouldEarlyOpenOnMutation({ ...base, review: "off" })).toBe(false);
     expect(shouldEarlyOpenOnMutation({ ...base, uiMode: "rpc" })).toBe(false);
     expect(shouldEarlyOpenOnMutation({ ...base, alreadyOpenedForRun: true })).toBe(false);
-    expect(shouldEarlyOpenOnMutation({ ...base, activeBlocking: true })).toBe(false);
   });
 
   it("pairs with isMutation so reads never trigger early open", () => {
@@ -39,12 +37,11 @@ describe("shouldEarlyOpenOnMutation", () => {
 });
 
 describe("settledAutoOpenAction", () => {
-  it("skips when there is nothing to review, UI is blocked, or review was completed", () => {
+  it("skips when there is nothing to review, TUI is unavailable, or review was completed", () => {
     expect(
       settledAutoOpenAction({
         review: "after-run",
         uiMode: "tui",
-        activeBlocking: false,
         shouldReview: false,
         hasLiveSurface: false,
       }),
@@ -54,7 +51,15 @@ describe("settledAutoOpenAction", () => {
       settledAutoOpenAction({
         review: "off",
         uiMode: "tui",
-        activeBlocking: false,
+        shouldReview: true,
+        hasLiveSurface: false,
+      }),
+    ).toBe("skip");
+
+    expect(
+      settledAutoOpenAction({
+        review: "after-run",
+        uiMode: "rpc",
         shouldReview: true,
         hasLiveSurface: false,
       }),
@@ -64,17 +69,6 @@ describe("settledAutoOpenAction", () => {
       settledAutoOpenAction({
         review: "after-run",
         uiMode: "tui",
-        activeBlocking: true,
-        shouldReview: true,
-        hasLiveSurface: false,
-      }),
-    ).toBe("skip");
-
-    expect(
-      settledAutoOpenAction({
-        review: "after-run",
-        uiMode: "tui",
-        activeBlocking: false,
         shouldReview: true,
         hasLiveSurface: false,
         autoOpenSuppression: "review-complete",
@@ -87,7 +81,6 @@ describe("settledAutoOpenAction", () => {
       settledAutoOpenAction({
         review: "after-run",
         uiMode: "tui",
-        activeBlocking: false,
         shouldReview: true,
         hasLiveSurface: false,
       }),
@@ -99,7 +92,6 @@ describe("settledAutoOpenAction", () => {
       settledAutoOpenAction({
         review: "live",
         uiMode: "tui",
-        activeBlocking: false,
         shouldReview: true,
         hasLiveSurface: true,
       }),
@@ -109,7 +101,6 @@ describe("settledAutoOpenAction", () => {
       settledAutoOpenAction({
         review: "live",
         uiMode: "tui",
-        activeBlocking: false,
         shouldReview: true,
         hasLiveSurface: false,
       }),
@@ -121,7 +112,6 @@ describe("explainSettledDecision (T17)", () => {
   const base = {
     review: "after-run" as const,
     uiMode: "tui",
-    activeBlocking: false,
     activeVisible: false,
   };
 
@@ -137,10 +127,6 @@ describe("explainSettledDecision (T17)", () => {
     expect(explainSettledDecision({ ...base, action: "skip", uiMode: "rpc" })).toEqual({
       action: "skipped",
       reason: "not-tui",
-    });
-    expect(explainSettledDecision({ ...base, action: "skip", activeBlocking: true })).toEqual({
-      action: "skipped",
-      reason: "blocking",
     });
     expect(
       explainSettledDecision({
