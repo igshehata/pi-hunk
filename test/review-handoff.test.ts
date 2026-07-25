@@ -102,6 +102,14 @@ class FakeCoordinator {
     this.sessionId = value.sessionId;
     return true;
   }
+  showManagedSurface = vi.fn(async (managedPid: number, sessionId?: string) => {
+    if (this.pid !== managedPid || (sessionId !== undefined && this.sessionId !== sessionId)) {
+      return false;
+    }
+    this.state = "visible";
+    this.emit();
+    return true;
+  });
   adoptEarlySurfaceForRun() {}
   isEarlySurfaceOwnedForRun() {
     return false;
@@ -767,6 +775,65 @@ describe("asynchronous Hunk comment handoff", () => {
     expect(run).not.toHaveBeenCalled();
     expect(delivery).not.toHaveBeenCalled();
     expect(coordinator.sessionId).toBeUndefined();
+  });
+
+  it("rejects an explicit probe queued across a Pi session boundary", async () => {
+    const coordinator = new FakeCoordinator();
+    coordinator.state = "visible";
+    coordinator.pid = 101;
+    coordinator.repoRoot = "/old-repo";
+    coordinator.sessionId = "old-session";
+    const oldSession = session({
+      sessionId: "old-session",
+      cwd: "/old-repo",
+      repoRoot: "/old-repo",
+    });
+    const newSession = session({
+      sessionId: "new-session",
+      pid: 202,
+      cwd: "/new-repo",
+      repoRoot: "/new-repo",
+    });
+    let lookup = 0;
+    let finishOldProbe!: (value: { status: "reviewable"; session: typeof oldSession }) => void;
+    const waitForSession = vi.fn(() => {
+      lookup += 1;
+      if (lookup === 1) {
+        return new Promise<{ status: "reviewable"; session: typeof oldSession }>((resolve) => {
+          finishOldProbe = resolve;
+        });
+      }
+      return Promise.resolve({ status: "reviewable" as const, session: newSession });
+    });
+    const run = runner([note("New session note")], [newSession], "new-session");
+    const gate = new ReviewHandoffGate(
+      coordinator as unknown as ReviewCoordinator,
+      () => DEFAULT_CONFIG,
+      run,
+      waitForSession,
+    );
+    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    gate.onLateSubmission(delivery);
+    const ctx = { cwd: "/old-repo", mode: "tui" } as ExtensionContext;
+
+    coordinator.transition("hidden");
+    await vi.waitFor(() => expect(finishOldProbe).toBeTypeOf("function"));
+    const queued = gate.submit(ctx);
+    gate.resetSession();
+    coordinator.pid = 202;
+    coordinator.launchCwd = "/new-repo";
+    coordinator.repoRoot = "/new-repo";
+    coordinator.sessionId = "new-session";
+    coordinator.transition("visible");
+    finishOldProbe({ status: "reviewable", session: oldSession });
+
+    await expect(queued).resolves.toMatchObject({
+      status: "unavailable",
+      reason: "session-boundary",
+    });
+    expect(waitForSession).toHaveBeenCalledTimes(1);
+    expect(run).not.toHaveBeenCalled();
+    expect(delivery).not.toHaveBeenCalled();
   });
 
   it("opens the next queued repository without approval semantics", async () => {

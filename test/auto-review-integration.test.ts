@@ -449,7 +449,7 @@ describe("automatic review policies in action", () => {
     expect(runtime.coordinator.getActiveInfo()).toBeNull();
   });
 
-  it("preserves a pre-existing live surface with different args through failed and successful mutations", async () => {
+  it("preserves and restores a pre-existing live surface with different args", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-preexisting-"));
     temporaryDirectories.push(root);
     process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
@@ -478,18 +478,19 @@ describe("automatic review policies in action", () => {
     vi.mocked(runtime.handle.setHidden).mockClear();
     vi.mocked(runtime.handle.focus).mockClear();
 
-    const assertPreExistingUnchanged = () => {
+    const assertPreExistingUnchanged = (visible: boolean) => {
       expect(runtime.mounts).toHaveLength(1);
       expect(runtime.mounts[0]).toBe(mount);
       expect(runtime.coordinator.getActiveInfo()).toMatchObject({
-        state: "hidden",
+        state: visible ? "visible" : "hidden",
         argsKey: info.argsKey,
       });
       expect(runtime.mounts[0]!.options.args).toEqual(["show"]);
       expect(runtime.mounts[0]!.component).toBe(mount.component);
-      expect(runtime.mounts[0]!.component.visible).toBe(false);
+      expect(runtime.mounts[0]!.component.visible).toBe(visible);
       expect(runtime.mounts[0]!.component.dispose).not.toHaveBeenCalled();
-      expect(runtime.handle.setHidden).not.toHaveBeenCalled();
+      if (visible) expect(runtime.handle.setHidden).toHaveBeenCalledWith(false);
+      else expect(runtime.handle.setHidden).not.toHaveBeenCalled();
       expect(runtime.handle.focus).not.toHaveBeenCalled();
     };
 
@@ -515,7 +516,7 @@ describe("automatic review policies in action", () => {
       runtime.ctx,
     );
     await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
-    assertPreExistingUnchanged();
+    assertPreExistingUnchanged(false);
 
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
     await runtime.events.get("tool_execution_start")?.(
@@ -538,7 +539,7 @@ describe("automatic review policies in action", () => {
       runtime.ctx,
     );
     await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
-    assertPreExistingUnchanged();
+    assertPreExistingUnchanged(true);
 
     await runtime.commands.get("hunk")?.("status", runtime.ctx);
     expect(runtime.ctx.ui.notify).toHaveBeenLastCalledWith(

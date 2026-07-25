@@ -268,6 +268,28 @@ export class ReviewCoordinator {
     return adopted;
   }
 
+  /** Restore one exact hidden managed review without changing its argv or source. */
+  async showManagedSurface(managedPid: number, sessionId?: string): Promise<boolean> {
+    const shown = await this.exclusive(async () => {
+      this.assertAlive();
+      const surface = this.active;
+      const info = surface?.getInfo();
+      if (
+        !surface?.isLive() ||
+        info?.pid !== managedPid ||
+        (sessionId !== undefined && info.sessionId !== sessionId)
+      ) {
+        return false;
+      }
+      await surface.show();
+      if (surface.getState() !== "visible") return false;
+      this.transitionRun({ type: "early-surface", event: "adopt" });
+      return true;
+    });
+    if (shown) this.notifyStateChange();
+    return shown;
+  }
+
   adoptEarlySurfaceForRun(): void {
     this.transitionRun({ type: "early-surface", event: "adopt" });
   }

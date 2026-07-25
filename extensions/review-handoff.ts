@@ -407,6 +407,7 @@ export class ReviewHandoffGate {
     const reuseManualSurface =
       (before?.source === "manual" || before?.source === "shortcut") &&
       beforeLaunchCwd === launchCwd;
+    const restoreManualSurface = reuseManualSurface && before?.state === "hidden";
     if (!reuseManualSurface) {
       await this.coordinator.ensureOpen(ctx, config, config.hunk.args, source, launchCwd);
     }
@@ -502,6 +503,17 @@ export class ReviewHandoffGate {
     if (lookup.status === "no-diff") {
       return { status: "no-diff", closeSurface: repository.closeWhenEmpty };
     }
+    if (
+      restoreManualSurface &&
+      !(await this.coordinator.showManagedSurface(repository.managedPid, repository.sessionId))
+    ) {
+      return {
+        status: "unavailable",
+        reason: "surface-changed",
+        detail: "The reused Hunk surface changed before it could be restored.",
+      };
+    }
+    if (!isCurrentRoute()) return staleRoute();
     return { status: "reviewable", repository };
   }
 
@@ -621,11 +633,14 @@ export class ReviewHandoffGate {
 
   private async runReviewAction(ctx: ExtensionContext): Promise<HunkFeedbackResult> {
     if (ctx.mode !== "tui") return this.unavailable("not-tui");
+    const actionEpoch = this.sessionEpoch;
     if (this.lateDelivery) await this.lateDelivery;
+    if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
 
     const queuedEntries = [...this.pendingReviewNotes.entries()];
     if (queuedEntries.length > 0) {
       await this.dispatchLateNotes();
+      if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
       const delivered = queuedEntries.every(
         ([key, entry]) => this.pendingReviewNotes.get(key) !== entry,
       );
@@ -637,7 +652,9 @@ export class ReviewHandoffGate {
     }
 
     return this.runInspection(async () => {
-      const actionEpoch = this.sessionEpoch;
+      if (actionEpoch !== this.sessionEpoch) {
+        return this.unavailable("session-boundary");
+      }
       const target = this.reviewActionTarget();
       if (!target) {
         return this.unavailable(
