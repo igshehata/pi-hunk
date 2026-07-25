@@ -1,7 +1,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { formatManualFeedback, handleFeedback } from "../extensions/index.ts";
-import type { BlockingReviewResult, HunkReviewNote } from "../extensions/review-handoff.ts";
+import { formatManualFeedback, handleFeedback, handleReviewAction } from "../extensions/index.ts";
+import type { HunkReviewNote } from "../extensions/review-handoff.ts";
 
 function note(): HunkReviewNote {
   return {
@@ -25,55 +25,56 @@ function context(mode: "tui" | "rpc" = "tui") {
   } as unknown as ExtensionCommandContext;
 }
 
-describe("/hunk feedback", () => {
-  it("waits for review and sends submitted notes back as a user turn", async () => {
-    const ctx = context();
-    const result: BlockingReviewResult = {
-      status: "submitted",
-      message: "1 open Hunk review note(s).",
-      notes: [note()],
-    };
-    const gate = { wait: vi.fn(async () => result) };
-    const sendUserMessage = vi.fn();
-
-    await handleFeedback(ctx, gate, sendUserMessage);
-
-    expect(ctx.waitForIdle).toHaveBeenCalledOnce();
-    expect(gate.wait).toHaveBeenCalledWith(ctx);
-    expect(sendUserMessage).toHaveBeenCalledOnce();
-    expect(sendUserMessage.mock.calls[0]?.[0]).toBe(formatManualFeedback(result.notes));
-    expect(sendUserMessage.mock.calls[0]?.[0]).toContain("Handle the failure");
-    expect(ctx.ui.notify).toHaveBeenCalledWith("Sent 1 Hunk feedback note to the agent.", "info");
-  });
-
-  it("reports approval without starting an unnecessary agent turn", async () => {
+describe("feedback commands", () => {
+  it("forces an immediate comment probe without waiting for agent idle", async () => {
     const ctx = context();
     const gate = {
-      wait: vi.fn(async () => ({
-        status: "approved" as const,
-        message: "No new Hunk user notes were found.",
+      submit: vi.fn(async () => ({
+        status: "pending" as const,
+        message: "No new notes were found.",
         notes: [] as [],
       })),
     };
-    const sendUserMessage = vi.fn();
 
-    await handleFeedback(ctx, gate, sendUserMessage);
-
-    expect(sendUserMessage).not.toHaveBeenCalled();
-    expect(ctx.ui.notify).toHaveBeenCalledWith("No new Hunk user notes were found.", "info");
-  });
-
-  it("does not start feedback collection outside TUI mode", async () => {
-    const ctx = context("rpc");
-    const gate = { wait: vi.fn() };
-
-    await handleFeedback(ctx, gate, vi.fn());
+    await handleReviewAction(ctx, gate);
 
     expect(ctx.waitForIdle).not.toHaveBeenCalled();
-    expect(gate.wait).not.toHaveBeenCalled();
+    expect(gate.submit).toHaveBeenCalledWith(ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("No new notes were found.", "info");
+  });
+
+  it("keeps /hunk feedback as an alias for the immediate probe", async () => {
+    const ctx = context();
+    const gate = {
+      submit: vi.fn(async () => ({
+        status: "submitted" as const,
+        message: "1 open Hunk review note(s).",
+        notes: [note()],
+      })),
+    };
+
+    await handleFeedback(ctx, gate);
+
+    expect(gate.submit).toHaveBeenCalledWith(ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("1 open Hunk review note(s).", "info");
+  });
+
+  it("does not probe outside TUI mode", async () => {
+    const ctx = context("rpc");
+    const gate = { submit: vi.fn() };
+
+    await handleFeedback(ctx, gate);
+
+    expect(gate.submit).not.toHaveBeenCalled();
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       "Hunk feedback requires Pi's interactive TUI mode.",
       "warning",
     );
+  });
+
+  it("formats comments for automatic user-turn delivery", () => {
+    const message = formatManualFeedback([note()]);
+    expect(message).toContain("Hunk feedback was submitted");
+    expect(message).toContain("Handle the failure");
   });
 });

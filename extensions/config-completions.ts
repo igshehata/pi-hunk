@@ -59,6 +59,8 @@ export const RESERVED_SUBCOMMANDS = new Set([
   "toggle",
   "status",
   "feedback",
+  "submit",
+  "next",
   "review",
   "config",
 ]);

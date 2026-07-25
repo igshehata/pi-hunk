@@ -1,6 +1,6 @@
 import type { OverlaySize } from "../config.ts";
 
-export type LaunchSource = "auto" | "live" | "manual" | "shortcut" | "recover" | "handoff";
+export type LaunchSource = "auto" | "live" | "manual" | "shortcut" | "recover";
 export type SurfaceState = "closed" | "starting" | "visible" | "hidden" | "closing";
 
 export interface OpenRequest {

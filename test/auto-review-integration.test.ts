@@ -24,7 +24,11 @@ afterEach(async () => {
 
 function harness(
   cwd: string,
-  options: { failFirstMount?: boolean; mode?: "tui" | "rpc" | "print" } = {},
+  options: {
+    failFirstMount?: boolean;
+    mode?: "tui" | "rpc" | "print";
+    idle?: boolean;
+  } = {},
 ) {
   const events = new Map<string, (event: any, ctx: ExtensionCommandContext) => any>();
   const tools = new Map<string, any>();
@@ -52,6 +56,7 @@ function harness(
     return component;
   });
   const coordinator = new ReviewCoordinator({ overlay });
+  const sendUserMessage = vi.fn();
   const pi = {
     on: (
       name: string,
@@ -62,6 +67,7 @@ function harness(
     registerShortcut: vi.fn(),
     registerCommand: (name: string, spec: any) => commands.set(name, spec.handler),
     registerTool: (tool: any) => tools.set(tool.name, tool),
+    sendUserMessage,
   } as unknown as ExtensionAPI;
   const tui = {
     terminal: { columns: 100, rows: 40, write: vi.fn() },
@@ -83,7 +89,9 @@ function harness(
   const ctx = {
     cwd,
     mode: options.mode ?? "tui",
+    isIdle: () => options.idle ?? true,
     isProjectTrusted: () => false,
+    waitForIdle: vi.fn(async () => undefined),
     ui: {
       notify: vi.fn(),
       setStatus: vi.fn(),
@@ -98,7 +106,7 @@ function harness(
       },
     },
   } as unknown as ExtensionCommandContext;
-  return { events, tools, commands, mounts, coordinator, pi, ctx, handle };
+  return { events, tools, commands, mounts, coordinator, pi, ctx, handle, sendUserMessage };
 }
 
 function reviewableRun(cwd: string) {
@@ -126,24 +134,7 @@ function reviewableRun(cwd: string) {
   };
 }
 
-function immediateSessionWait(fileCount: number) {
-  return async (options: { cwd: string; managedPid?: number }) => {
-    const session = {
-      sessionId: "s1",
-      pid: options.managedPid ?? 101,
-      cwd: options.cwd,
-      repoRoot: options.cwd,
-      launchedAt: "2026-01-01T00:00:00.000Z",
-      fileCount,
-      files: fileCount === 0 ? [] : [{ path: "src/a.ts" }],
-    };
-    return fileCount === 0
-      ? ({ status: "no-diff", session } as const)
-      : ({ status: "reviewable", session } as const);
-  };
-}
-
-function emptyReviewRun(cwd: string) {
+function commentReviewRun(cwd: string, comments: () => unknown[]) {
   return async (argv: string[]) => {
     const command = argv.slice(1).join(" ");
     if (command === "session list --json") {
@@ -166,9 +157,26 @@ function emptyReviewRun(cwd: string) {
       };
     }
     if (command === "session comment list s1 --type user --json") {
-      return { code: 0, stderr: "", stdout: JSON.stringify({ comments: [] }) };
+      return { code: 0, stderr: "", stdout: JSON.stringify({ comments: comments() }) };
     }
     return { code: 1, stderr: `unexpected argv: ${argv.join(" ")}`, stdout: "" };
+  };
+}
+
+function immediateSessionWait(fileCount: number) {
+  return async (options: { cwd: string; managedPid?: number }) => {
+    const session = {
+      sessionId: "s1",
+      pid: options.managedPid ?? 101,
+      cwd: options.cwd,
+      repoRoot: options.cwd,
+      launchedAt: "2026-01-01T00:00:00.000Z",
+      fileCount,
+      files: fileCount === 0 ? [] : [{ path: "src/a.ts" }],
+    };
+    return fileCount === 0
+      ? ({ status: "no-diff", session } as const)
+      : ({ status: "reviewable", session } as const);
   };
 }
 
@@ -202,15 +210,8 @@ describe("automatic review policies in action", () => {
     });
 
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
-    const promptPatch = await runtime.events.get("before_agent_start")?.(
-      {
-        type: "before_agent_start",
-        systemPrompt: "base prompt",
-      },
-      runtime.ctx,
-    );
-    expect(promptPatch?.systemPrompt).toContain("MUST call hunk_review");
-    expect(promptPatch?.systemPrompt).toContain("Do not call hunk_review for conversation-only");
+    expect(runtime.events.has("before_agent_start")).toBe(false);
+    expect(runtime.tools.has("hunk_review")).toBe(false);
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
 
     const editInput = { path: "src/a.ts", edits: [{ oldText: "a", newText: "b" }] };
@@ -335,7 +336,7 @@ describe("automatic review policies in action", () => {
   });
 
   it.each(["after-run", "live"] as const)(
-    "closes an automatic %s surface and returns cached no-diff when Hunk has zero files",
+    "closes an automatic %s surface when Hunk has zero files",
     async (review) => {
       const root = await mkdtemp(join(tmpdir(), `pi-hunk-${review}-no-diff-`));
       temporaryDirectories.push(root);
@@ -376,10 +377,7 @@ describe("automatic review policies in action", () => {
       expect(runtime.mounts).toHaveLength(1);
       expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalled();
       expect(runtime.coordinator.getActiveInfo()).toBeNull();
-      await expect(
-        runtime.tools.get("hunk_review")?.execute("call", {}, undefined, undefined, runtime.ctx),
-      ).resolves.toMatchObject({ details: { status: "no-diff" } });
-      expect(runtime.mounts).toHaveLength(1);
+      expect(runtime.tools.has("hunk_review")).toBe(false);
     },
   );
 
@@ -426,9 +424,27 @@ describe("automatic review policies in action", () => {
     await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
     expect(runtime.coordinator.getActiveInfo()).not.toBeNull();
 
-    await expect(
-      runtime.tools.get("hunk_review")?.execute("call", {}, undefined, undefined, runtime.ctx),
-    ).resolves.toMatchObject({ details: { status: "no-diff" } });
+    await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+    await runtime.events.get("tool_execution_start")?.(
+      {
+        type: "tool_execution_start",
+        toolCallId: "retry-empty-again",
+        toolName: "write",
+        args: input,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("tool_execution_end")?.(
+      {
+        type: "tool_execution_end",
+        toolCallId: "retry-empty-again",
+        toolName: "write",
+        isError: false,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+
     expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalled();
     expect(runtime.coordinator.getActiveInfo()).toBeNull();
   });
@@ -623,9 +639,12 @@ describe("automatic review policies in action", () => {
       ),
     ).resolves.toBeUndefined();
 
-    await expect(
-      runtime.tools.get("hunk_review")?.execute("call", {}, undefined, undefined, runtime.ctx),
-    ).resolves.toMatchObject({ details: { status: "target-required" } });
+    await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+    expect(runtime.ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("repository could not be inferred safely"),
+      "warning",
+    );
+    expect(runtime.tools.has("hunk_review")).toBe(false);
   });
 
   it("does not open for conversation or read-only tools", async () => {
@@ -972,7 +991,7 @@ describe("automatic review policies in action", () => {
   });
 
   it.each(["rpc", "print"] as const)(
-    "does not patch prompts or open hunk_review outside TUI (%s)",
+    "does not open automatic Hunk outside TUI (%s)",
     async (mode) => {
       const root = await mkdtemp(join(tmpdir(), `pi-hunk-non-tui-${mode}-`));
       temporaryDirectories.push(root);
@@ -987,16 +1006,6 @@ describe("automatic review policies in action", () => {
         reviewRun: reviewableRun(root),
       });
       await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
-
-      expect(
-        await runtime.events.get("before_agent_start")?.(
-          {
-            type: "before_agent_start",
-            systemPrompt: "base prompt",
-          },
-          runtime.ctx,
-        ),
-      ).toBeUndefined();
 
       await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
       const editInput = { path: "src/a.ts", edits: [{ oldText: "a", newText: "b" }] };
@@ -1023,14 +1032,12 @@ describe("automatic review policies in action", () => {
       expect(runtime.mounts).toHaveLength(0);
       expect(runtime.coordinator.getActiveInfo()).toBeNull();
 
-      await expect(
-        runtime.tools.get("hunk_review")?.execute("call", {}, undefined, undefined, runtime.ctx),
-      ).resolves.toMatchObject({ details: { status: "unavailable", reason: "not-tui" } });
+      expect(runtime.tools.has("hunk_review")).toBe(false);
       expect(runtime.mounts).toHaveLength(0);
     },
   );
 
-  it("does not inject the blocking review instruction when automatic review is off", async () => {
+  it("does not register a prompt hook or blocking review tool when review is off", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-review-off-"));
     temporaryDirectories.push(root);
     process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
@@ -1044,71 +1051,120 @@ describe("automatic review policies in action", () => {
       reviewRun: reviewableRun(root),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
-    expect(
-      await runtime.events.get("before_agent_start")?.(
-        {
-          type: "before_agent_start",
-          systemPrompt: "base prompt",
-        },
-        runtime.ctx,
-      ),
-    ).toBeUndefined();
+    expect(runtime.events.has("before_agent_start")).toBe(false);
+    expect(runtime.tools.has("hunk_review")).toBe(false);
   });
 
-  it("does not reopen after hunk_review returns approved from a hide", async () => {
-    const root = await mkdtemp(join(tmpdir(), "pi-hunk-approved-"));
+  it("submits comments on every manual Hunk hide without hunk_review", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-late-feedback-"));
     temporaryDirectories.push(root);
     process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
     await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
 
+    let comments: unknown[] = [
+      {
+        noteId: "user:1",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [1, 1],
+        body: "First note",
+      },
+    ];
+    const runtime = harness(root, { idle: false });
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      coordinator: runtime.coordinator,
+      reviewRun: commentReviewRun(root, () => comments),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+
+    await runtime.commands.get("hunk")?.("", runtime.ctx);
+    expect(runtime.coordinator.getActiveInfo()).toMatchObject({
+      state: "visible",
+      sessionId: undefined,
+    });
+    runtime.mounts[0]!.options.onToggleRequest?.();
+    await vi.waitFor(() => expect(runtime.sendUserMessage).toHaveBeenCalledOnce());
+    expect(runtime.sendUserMessage.mock.calls[0]?.[0]).toContain('"noteId": "user:1"');
+    expect(runtime.coordinator.getActiveInfo()).toMatchObject({
+      state: "hidden",
+      sessionId: "s1",
+      repoRoot: root,
+    });
+
+    comments = [
+      ...comments,
+      {
+        noteId: "user:2",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [4, 4],
+        body: "Late note\nHandle this too.",
+      },
+    ];
+    await runtime.commands.get("hunk")?.("toggle", runtime.ctx);
+    expect(runtime.coordinator.getActiveInfo()?.state).toBe("visible");
+    runtime.mounts[0]!.options.onToggleRequest?.();
+
+    await vi.waitFor(() => expect(runtime.sendUserMessage).toHaveBeenCalledTimes(2));
+    expect(runtime.sendUserMessage.mock.calls[1]?.[0]).toContain('"noteId": "user:2"');
+    expect(runtime.sendUserMessage.mock.calls[1]?.[0]).not.toContain('"noteId": "user:1"');
+    expect(runtime.sendUserMessage.mock.calls[1]?.[1]).toEqual({ deliverAs: "followUp" });
+
+    await runtime.commands.get("hunk")?.("toggle", runtime.ctx);
+    runtime.mounts[0]!.options.onToggleRequest?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runtime.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("submits comments when prefix+S hides and restores a show review", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-show-feedback-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+
+    let comments: unknown[] = [
+      {
+        noteId: "show:1",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [2, 2],
+        body: "Show review note",
+      },
+    ];
     const runtime = harness(root);
     hunkExtension(runtime.pi, {
       store: new ConfigStore(),
-      detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: emptyReviewRun(root),
+      reviewRun: commentReviewRun(root, () => comments),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
-    await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+    const config = cloneConfig(DEFAULT_CONFIG);
 
-    const editInput = { path: "src/a.ts", edits: [{ oldText: "a", newText: "b" }] };
-    await runtime.events.get("tool_execution_start")?.(
+    await runtime.coordinator.ensureOpen(runtime.ctx, config, ["show"], "shortcut");
+    expect(runtime.mounts[0]!.options.args).toEqual(["show"]);
+    runtime.mounts[0]!.options.onShowRequest?.();
+    await vi.waitFor(() => expect(runtime.sendUserMessage).toHaveBeenCalledOnce());
+    expect(runtime.sendUserMessage.mock.calls[0]?.[0]).toContain('"noteId": "show:1"');
+
+    comments = [
+      ...comments,
       {
-        type: "tool_execution_start",
-        toolCallId: "edit-1",
-        toolName: "edit",
-        args: editInput,
+        noteId: "show:2",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [5, 5],
+        body: "Second show review note",
       },
-      runtime.ctx,
-    );
-    await runtime.events.get("tool_execution_end")?.(
-      {
-        type: "tool_execution_end",
-        toolCallId: "edit-1",
-        toolName: "edit",
-        result: {},
-        isError: false,
-      },
-      runtime.ctx,
-    );
+    ];
+    await runtime.coordinator.ensureOpen(runtime.ctx, config, ["show"], "shortcut");
+    expect(runtime.coordinator.getActiveInfo()?.state).toBe("visible");
+    runtime.mounts[0]!.options.onShowRequest?.();
 
-    const review = runtime.tools
-      .get("hunk_review")
-      ?.execute("call", {}, undefined, undefined, runtime.ctx);
-    await vi.waitFor(() => expect(runtime.coordinator.getActiveInfo()?.state).toBe("visible"));
-    runtime.mounts[0]!.options.onToggleRequest?.();
-    await vi.waitFor(() => expect(runtime.coordinator.getActiveInfo()?.state).toBe("hidden"));
-    const reviewResult = await review;
-    expect(reviewResult?.details).toEqual({
-      status: "approved",
-      message: expect.any(String),
-      notes: [],
-    });
-
-    await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
-    expect(runtime.coordinator.getActiveInfo()?.state).toBe("hidden");
+    await vi.waitFor(() => expect(runtime.sendUserMessage).toHaveBeenCalledTimes(2));
+    expect(runtime.sendUserMessage.mock.calls[1]?.[0]).toContain('"noteId": "show:2"');
+    expect(runtime.sendUserMessage.mock.calls[1]?.[0]).not.toContain('"noteId": "show:1"');
     expect(runtime.mounts).toHaveLength(1);
-    expect(runtime.mounts[0]!.component.visible).toBe(false);
   });
 
   it("does not reopen after explicit close and resets suppression on the next run", async () => {

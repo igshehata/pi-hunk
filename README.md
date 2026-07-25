@@ -31,7 +31,7 @@ Pi changes code  →  Hunk opens  →  You annotate  →  Notes return to Pi  �
 | ----------------------------- | --------------------------------------------------------------------------------- |
 | **Native overlay**            | Hunk lives inside Pi—no tmux, pane manager, or takeover mode.                     |
 | **Persistent review**         | Hide and restore a review without losing position, selection, or comments.        |
-| **Human-in-the-loop handoff** | The read-only `hunk_review` tool returns your notes to the active agent run.      |
+| **Human-in-the-loop handoff** | Hiding Hunk sends each unseen inline comment back to Pi automatically.            |
 | **Automatic or live review**  | Open after successful mutations, or watch live from the first mutation attempt.   |
 | **Real terminal behavior**    | Mouse, scrolling, resize, colors, comments, and keyboard input survive embedding. |
 | **VCS-neutral launch**        | Hunk detects Git, Jujutsu, or Sapling; pi-hunk does not second-guess it.          |
@@ -65,10 +65,9 @@ Then reload Pi:
 1. Ask Pi to make a code change.
 2. Pi-hunk opens after the run using the default `after-run` policy.
 3. Review the diff in Hunk and leave inline comments.
-4. Press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> to hide Hunk and submit fresh notes (or
-   approve when there are no new notes).
-5. Pi receives each unseen note through `hunk_review`, addresses them, and reopens review when
-   needed.
+4. Press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> to hide Hunk.
+5. Pi-hunk automatically sends each unseen comment to Pi as a new feedback turn. A comment-free hide
+   simply returns focus to Pi.
 
 ### Default shortcuts
 
@@ -78,57 +77,57 @@ Then reload Pi:
 | <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>S</kbd> | Open, hide, or restore the `hunk show` review        |
 
 Pi-hunk registers only its dedicated prefix with Pi, then captures the configured action hotkey. The
-same chords work while Pi has focus and while Hunk owns the overlay. Change the prefix or either
-hotkey from `/hunk config` by pressing the actual key—identifiers are never entered as free text.
+same chords work while Pi has focus and while Hunk owns the overlay. Hiding either the working-copy
+review with **H** or the `hunk show` review with **S** runs the same fresh-comment handoff. Change
+the prefix or either hotkey from `/hunk config` by pressing the actual key—identifiers are never
+entered as free text.
 
 ## Review workflow
 
-Pi-hunk opens one managed Hunk review at a time. Hiding it preserves the review position, selection,
-and comments. When one run changes multiple repositories, pi-hunk reviews them sequentially—one Hunk
-process and approval flow per Hunk-reported repository root. `/hunk close`, Hunk exit, or a Pi
-session boundary ends the current review without falsely approving queued repositories.
+Pi-hunk opens one managed Hunk review at a time. Hiding preserves the review position, selection,
+and comments. Every visible-to-hidden transition probes the exact Pi-owned Hunk process, including
+reviews opened manually before session metadata has been loaded. Unseen comments are sent to Pi
+exactly once; if the agent is busy, they are queued as a follow-up turn. A comment-free hide is a
+no-op beyond returning focus to Pi, and the same review can be restored with the toggle chord.
 
-The agent-facing `hunk_review` tool blocks until review finishes:
-
-- **Hide with new comments:** submit only notes not previously returned in this loaded Pi extension.
-- **Hide with no new comments:** continue to the next repository, or return `approved` after all
-  discovered repositories are complete.
-- **No Hunk review files:** skip that repository and return `no-diff` when every candidate is empty.
-- **Close Hunk or press `Q`:** cancel the wait rather than report approval.
+The review workflow is asynchronous and has no blocking approval gate. `/hunk feedback` remains a
+manual recovery path if automatic delivery fails, while `/hunk submit` forces an immediate
+fresh-comment probe.
 
 Automatic review is deliberately mutation-driven. Conversation-only turns, read-only tools, and
 out-of-band changes do not open Hunk. Structured mutation paths are resolved from Pi's startup
 directory and may point outside it; Hunk is launched from a safe existing directory near the target.
 Hunk remains authoritative for VCS detection and the repository root. Targets covered by the root
-reported by Hunk share one review, while genuinely separate roots are queued.
+reported by Hunk share one review, while genuinely separate roots are queued and can be opened with
+`/hunk next` without treating navigation as approval.
 
 `live` opens at the first path-bearing mutation preflight so you can watch the tool, but only
 successful tool completions count as settled review evidence. Shell commands can change directory
-through arbitrary syntax, so pi-hunk does not guess their target: when a successful pathless shell
-mutation cannot be paired with a structured path, the agent must call `hunk_review` with an explicit
-`cwd` (relative values resolve from Pi's startup directory). If no mutation succeeds or Hunk reports
-no reviewable files after a bounded reload wait, pi-hunk closes only the automatic surface it
-created for that run and leaves pre-existing/manual sessions alone. Explicit `/hunk` on a clean
-repository continues to open a watched session for future changes. `approved`, `no-diff`,
-`/hunk close`, and a clean Hunk exit suppress same-run auto-open; a non-zero Hunk crash can still be
-recovered by the live policy.
+through arbitrary syntax, so pi-hunk does not guess their target; it warns when a successful
+pathless mutation cannot be routed safely. If no mutation succeeds or Hunk reports no reviewable
+files after a bounded reload wait, pi-hunk closes only the automatic surface it created for that run
+and leaves pre-existing/manual sessions alone. Explicit `/hunk` on a clean repository continues to
+open a watched session for future changes. `no-diff`, `/hunk close`, and a clean Hunk exit suppress
+same-run auto-open; a non-zero Hunk crash can still be recovered by the live policy.
 
 ## Commands
 
-| Command                             | Purpose                                                  |
-| ----------------------------------- | -------------------------------------------------------- |
-| `/hunk`                             | Open the configured watched working-copy diff            |
-| `/hunk <target>`                    | Review a Git ref or jj/Sapling revset with `hunk diff`   |
-| `/hunk show [target]`               | Review the last commit or a specific revision            |
-| `/hunk staged`                      | Review Git staged changes                                |
-| `/hunk stash show [ref]`            | Review a Git stash                                       |
-| `/hunk toggle`                      | Show or hide the persistent overlay                      |
-| `/hunk close`                       | Terminate the managed Hunk process                       |
-| `/hunk status`                      | Report policy, layout, session, notes, and diagnostics   |
-| `/hunk feedback`                    | Review, then send fresh notes to the agent as a new turn |
-| `/hunk review off\|after-run\|live` | Set the trusted project's automatic-review policy        |
-| `/hunk config`                      | Open the auto-saving project configuration UI            |
-| `/hunk config restore`              | Remove project overrides and restore inherited defaults  |
+| Command                             | Purpose                                                 |
+| ----------------------------------- | ------------------------------------------------------- |
+| `/hunk`                             | Open the configured watched working-copy diff           |
+| `/hunk <target>`                    | Review a Git ref or jj/Sapling revset with `hunk diff`  |
+| `/hunk show [target]`               | Review the last commit or a specific revision           |
+| `/hunk staged`                      | Review Git staged changes                               |
+| `/hunk stash show [ref]`            | Review a Git stash                                      |
+| `/hunk toggle`                      | Show or hide the persistent overlay                     |
+| `/hunk submit`                      | Force an immediate probe for fresh comments             |
+| `/hunk next`                        | Open the next queued repository without approval        |
+| `/hunk close`                       | Terminate the managed Hunk process                      |
+| `/hunk status`                      | Report policy, layout, session, notes, and diagnostics  |
+| `/hunk feedback`                    | Retry an immediate fresh-comment handoff                |
+| `/hunk review off\|after-run\|live` | Set the trusted project's automatic-review policy       |
+| `/hunk config`                      | Open the auto-saving project configuration UI           |
+| `/hunk config restore`              | Remove project overrides and restore inherited defaults |
 
 Hunk's `patch`, `pager`, and `difftool` entrypoints require external stdin or file-pair integration.
 Pi-hunk intentionally rejects them; run those commands directly in a terminal.
