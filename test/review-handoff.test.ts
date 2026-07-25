@@ -777,21 +777,16 @@ describe("asynchronous Hunk comment handoff", () => {
     try {
       const coordinator = new FakeCoordinator();
       coordinator.pid = 101;
-      const waitForSession = vi.fn(async (options: { cwd: string }) => {
-        const repoRoot = options.cwd === repoA ? repoA : repoB;
-        return {
-          status: "reviewable" as const,
-          session: session({
-            sessionId: repoRoot === repoA ? "repo-a" : "repo-b",
-            cwd: repoRoot,
-            repoRoot,
-          }),
-        };
-      });
+      const sessionA = session({ sessionId: "repo-a", cwd: repoA, repoRoot: repoA });
+      const sessionB = session({ sessionId: "repo-b", cwd: repoB, repoRoot: repoB });
+      const waitForSession = vi.fn(async (options: { cwd: string }) => ({
+        status: "reviewable" as const,
+        session: options.cwd === repoA ? sessionA : sessionB,
+      }));
       const gate = new ReviewHandoffGate(
         coordinator as unknown as ReviewCoordinator,
         () => DEFAULT_CONFIG,
-        runner([]),
+        runner([], [sessionA], "repo-a"),
         waitForSession,
       );
       gate.addEvidence({
@@ -817,7 +812,10 @@ describe("asynchronous Hunk comment handoff", () => {
     }
   });
 
-  it("finishes a hide probe before replacing the review with /hunk next", async () => {
+  it.each([
+    { surface: "visible", hide: false },
+    { surface: "hidden with a queued hide probe", hide: true },
+  ])("collects notes from a $surface review before /hunk next replaces it", async ({ hide }) => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-async-next-probe-")));
     const repoA = join(root, "repo-a");
     const repoB = join(root, "repo-b");
@@ -829,16 +827,20 @@ describe("asynchronous Hunk comment handoff", () => {
       const sessionB = session({ sessionId: "repo-b", cwd: repoB, repoRoot: repoB });
       let lookup = 0;
       let finishProbe!: (value: { status: "reviewable"; session: typeof sessionA }) => void;
-      const waitForSession = vi.fn(() => {
+      const waitForSession = vi.fn((options: { cwd: string }) => {
         lookup += 1;
-        if (lookup === 1)
+        if (options.cwd === repoB) {
+          return Promise.resolve({ status: "reviewable" as const, session: sessionB });
+        }
+        if (lookup === 1) {
           return Promise.resolve({ status: "reviewable" as const, session: sessionA });
+        }
         if (lookup === 2) {
           return new Promise<{ status: "reviewable"; session: typeof sessionA }>((resolve) => {
             finishProbe = resolve;
           });
         }
-        return Promise.resolve({ status: "reviewable" as const, session: sessionB });
+        return Promise.resolve({ status: "reviewable" as const, session: sessionA });
       });
       const run = runner([note("Review repo A first")], [sessionA], "repo-a");
       const gate = new ReviewHandoffGate(
@@ -858,7 +860,7 @@ describe("asynchronous Hunk comment handoff", () => {
       const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
 
       await gate.presentAutomatic(ctx);
-      coordinator.transition("hidden");
+      if (hide) coordinator.transition("hidden");
       const nextResult = gate.next(ctx);
       await vi.waitFor(() => expect(finishProbe).toBeTypeOf("function"));
       const opensWhileProbePending = coordinator.ensureOpen.mock.calls.length;
@@ -869,7 +871,7 @@ describe("asynchronous Hunk comment handoff", () => {
         repoRoot: repoB,
       });
       expect(opensWhileProbePending).toBe(1);
-      expect(run).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalled();
       expect(delivery).toHaveBeenCalledWith([
         expect.objectContaining({ summary: "Review repo A first" }),
       ]);

@@ -332,13 +332,17 @@ export class ReviewHandoffGate {
     }
     if (this.pending.length === 0) return { status: "no-evidence" };
 
-    // A hide transition queues its comment probe synchronously. Wait behind it
-    // before replacing the process so notes from the current review cannot be
-    // lost to a surface-changed result.
+    // Probe even a still-visible review, then wait behind every inspection that
+    // was already queued by a hide. Replacing the process earlier could make
+    // its inline comments permanently unreachable.
     const actionEpoch = this.sessionEpoch;
+    const probe = this.activeReviewTarget() ? await this.runReviewAction(ctx) : null;
     await this.runInspection(async () => undefined);
     if (actionEpoch !== this.sessionEpoch) {
       return { status: "unavailable", reason: "session-boundary" };
+    }
+    if (probe?.status === "unavailable") {
+      return { status: "unavailable", reason: probe.reason, detail: probe.message };
     }
     if (this.pending.length === 0) return { status: "no-evidence" };
     this.current = null;
