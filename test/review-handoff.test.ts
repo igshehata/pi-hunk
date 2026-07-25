@@ -817,6 +817,67 @@ describe("asynchronous Hunk comment handoff", () => {
     }
   });
 
+  it("finishes a hide probe before replacing the review with /hunk next", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-async-next-probe-")));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    await Promise.all([mkdir(repoA), mkdir(repoB)]);
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const sessionA = session({ sessionId: "repo-a", cwd: repoA, repoRoot: repoA });
+      const sessionB = session({ sessionId: "repo-b", cwd: repoB, repoRoot: repoB });
+      let lookup = 0;
+      let finishProbe!: (value: { status: "reviewable"; session: typeof sessionA }) => void;
+      const waitForSession = vi.fn(() => {
+        lookup += 1;
+        if (lookup === 1)
+          return Promise.resolve({ status: "reviewable" as const, session: sessionA });
+        if (lookup === 2) {
+          return new Promise<{ status: "reviewable"; session: typeof sessionA }>((resolve) => {
+            finishProbe = resolve;
+          });
+        }
+        return Promise.resolve({ status: "reviewable" as const, session: sessionB });
+      });
+      const run = runner([note("Review repo A first")], [sessionA], "repo-a");
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        run,
+        waitForSession,
+      );
+      const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+      gate.onLateSubmission(delivery);
+      gate.addEvidence({
+        mutation: true,
+        targets: [repoA, repoB],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await gate.presentAutomatic(ctx);
+      coordinator.transition("hidden");
+      const nextResult = gate.next(ctx);
+      await vi.waitFor(() => expect(finishProbe).toBeTypeOf("function"));
+      const opensWhileProbePending = coordinator.ensureOpen.mock.calls.length;
+      finishProbe({ status: "reviewable", session: sessionA });
+
+      await expect(nextResult).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot: repoB,
+      });
+      expect(opensWhileProbePending).toBe(1);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(delivery).toHaveBeenCalledWith([
+        expect.objectContaining({ summary: "Review repo A first" }),
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("returns target-required for unresolved pathless mutations", async () => {
     const { gate, coordinator, ctx } = setup([]);
     gate.addEvidence({ mutation: true, targets: [], unresolved: true, revision: 1 });

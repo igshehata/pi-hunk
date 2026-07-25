@@ -331,6 +331,16 @@ export class ReviewHandoffGate {
       return { status: "unavailable", reason: "not-tui" };
     }
     if (this.pending.length === 0) return { status: "no-evidence" };
+
+    // A hide transition queues its comment probe synchronously. Wait behind it
+    // before replacing the process so notes from the current review cannot be
+    // lost to a surface-changed result.
+    const actionEpoch = this.sessionEpoch;
+    await this.runInspection(async () => undefined);
+    if (actionEpoch !== this.sessionEpoch) {
+      return { status: "unavailable", reason: "session-boundary" };
+    }
+    if (this.pending.length === 0) return { status: "no-evidence" };
     this.current = null;
     return this.presentAutomatic(ctx, "auto");
   }
