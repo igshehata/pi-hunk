@@ -1,6 +1,8 @@
 node_modules/
 dist/
 docs/
+bugs/
+tasks/
 coverage/
 .pi/
 .claude/
