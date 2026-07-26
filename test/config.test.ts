@@ -17,7 +17,11 @@ describe("overlay config", () => {
         review: "after-run",
         followEdits: true,
         hunk: { command: "hunk", args: ["diff", "--watch"] },
-        overlay: { layout: "right", experimentalPiWrap: true },
+        overlay: {
+          layout: "right",
+          experimentalPiWrap: true,
+          experimentalExclusiveFrame: false,
+        },
         bindings: { prefix: "ctrl+space", toggle: "h", show: "s" },
       }),
     );
@@ -42,7 +46,11 @@ describe("overlay config", () => {
       bindings: { prefix: "ctrl+x", toggle: "t", show: "l" },
     });
     expect(config.review).toBe("live");
-    expect(config.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(config.overlay).toEqual({
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    });
     expect(config.bindings).toEqual({ prefix: "ctrl+x", toggle: "t", show: "l" });
   });
 
@@ -69,7 +77,25 @@ describe("overlay config", () => {
   it("does not reset an inherited layout when only the experiment flag is layered", () => {
     const global = applyConfig(cloneConfig(DEFAULT_CONFIG), { overlay: { layout: "right" } });
     const project = applyConfig(global, { overlay: { experimentalPiWrap: true } });
-    expect(project.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(project.overlay).toEqual({
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    });
+  });
+
+  it("enables exclusive painting only for a wrapped split", () => {
+    const enabled = applyConfig(cloneConfig(DEFAULT_CONFIG), {
+      overlay: { experimentalExclusiveFrame: true },
+    });
+    expect(enabled.overlay.experimentalExclusiveFrame).toBe(true);
+    expect(
+      applyConfig(enabled, { overlay: { experimentalPiWrap: false } }).overlay
+        .experimentalExclusiveFrame,
+    ).toBe(false);
+    expect(
+      applyConfig(enabled, { overlay: { layout: "float" } }).overlay.experimentalExclusiveFrame,
+    ).toBe(false);
   });
 
   it("resolves the four named layouts", () => {

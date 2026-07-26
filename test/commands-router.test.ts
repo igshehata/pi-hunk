@@ -65,10 +65,15 @@ describe("hunkArgumentCompletions", () => {
   it("offers only layout modifiers, with no persistence scopes", () => {
     expect(values("review live ")).toEqual([]);
     expect(values("config restore ")).toEqual([]);
-    expect(values("config right e")).toEqual(["config right experimental-wrap"]);
+    expect(values("config right e")).toEqual([
+      "config right experimental-wrap",
+      "config right experimental-exclusive",
+    ]);
     expect(values("config right ")).toEqual([
       "config right experimental-wrap",
       "config right no-wrap",
+      "config right experimental-exclusive",
+      "config right no-exclusive",
     ]);
   });
 
@@ -83,20 +88,30 @@ describe("/hunk config parsing", () => {
     expect(parseConfigCommand("right", false)).toEqual({
       layout: "right",
       experimentalPiWrap: false,
+      experimentalExclusiveFrame: false,
     });
     expect(parseConfigCommand("left experimental-wrap", false)).toEqual({
       layout: "left",
       experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    });
+    expect(parseConfigCommand("right experimental-exclusive", true)).toEqual({
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: true,
     });
   });
 
   it("disables inherited wrapping for non-split layouts and rejects explicit wrap intent", () => {
-    expect(parseConfigCommand("float", true)).toEqual({
+    expect(parseConfigCommand("float", true, true)).toEqual({
       layout: "float",
       experimentalPiWrap: false,
+      experimentalExclusiveFrame: false,
     });
     expect(parseConfigCommand("full experimental-wrap", false)).toBeUndefined();
     expect(parseConfigCommand("float wrap", false)).toBeUndefined();
+    expect(parseConfigCommand("float exclusive", true)).toBeUndefined();
+    expect(parseConfigCommand("right no-wrap exclusive", true)).toBeUndefined();
   });
 
   it("rejects unknown layouts, flags, and removed scopes", () => {

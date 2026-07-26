@@ -181,7 +181,8 @@ A typical sparse project configuration:
   "review": "live",
   "overlay": {
     "layout": "right",
-    "experimentalPiWrap": true
+    "experimentalPiWrap": true,
+    "experimentalExclusiveFrame": false
   },
   "bindings": {
     "prefix": "ctrl+space",
@@ -200,6 +201,12 @@ shipped defaults → ~/.pi/agent/hunk.json → trusted .pi/hunk.json → PI_HUNK
 By default, Hunk opens in the right half of the terminal and Pi wraps into the left half. Available
 layouts are `full`, `left`, `right`, and `float`; Pi wrapping can be toggled for left and right
 layouts.
+
+The default-off exclusive-frame experiment freezes Pi after one composed split frame and paints only
+changed Hunk rows while Hunk remains focused. Enable it with
+`/hunk config right experimental-exclusive`; disable it with `/hunk config right no-exclusive`. Any
+foreign render, resize, focus loss, or ownership uncertainty falls back to a forced authoritative Pi
+redraw. `/hunk status` reports its lease and paint counters.
 
 Pi-hunk does not own Hunk's theme, transparency, presentation, or keybindings. Configure those in
 Hunk's `~/.config/hunk/config.toml` or repository-local `.hunk/config.toml`.

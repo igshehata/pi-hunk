@@ -43,7 +43,11 @@ describe("config loading", () => {
     const config = await loadConfig(context(root));
     expect(config.review).toBe("live");
     expect(config.followEdits).toBe(false);
-    expect(config.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(config.overlay).toEqual({
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    });
     expect(config.bindings.prefix).toBe("ctrl+x");
   });
 
@@ -112,17 +116,26 @@ describe("config loading", () => {
     await writeFile(
       globalPath,
       JSON.stringify({
-        overlay: { layout: "diagonal", experimentalPiWrap: "yes" },
+        overlay: {
+          layout: "diagonal",
+          experimentalPiWrap: "yes",
+          experimentalExclusiveFrame: "yes",
+        },
       }),
     );
     const warnings: string[] = [];
 
     const config = await loadConfig(context(root), (warning) => warnings.push(warning));
 
-    expect(config.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(config.overlay).toEqual({
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    });
     expect(warnings).toEqual([
       expect.stringContaining("invalid overlay.layout"),
       expect.stringContaining("invalid overlay.experimentalPiWrap"),
+      expect.stringContaining("invalid overlay.experimentalExclusiveFrame"),
     ]);
   });
 

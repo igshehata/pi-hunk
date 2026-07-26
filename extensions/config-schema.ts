@@ -20,6 +20,8 @@ export interface OverlayConfig {
   layout: OverlayLayout;
   /** Experimental: re-render Pi beside left/right overlays at the remaining width. */
   experimentalPiWrap: boolean;
+  /** Experimental: freeze Pi and paint focused Hunk split frames directly. */
+  experimentalExclusiveFrame: boolean;
 }
 
 export interface ResolvedOverlayLayout {
@@ -45,6 +47,7 @@ export interface HunkConfig {
 export const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
   layout: "right",
   experimentalPiWrap: true,
+  experimentalExclusiveFrame: false,
 };
 
 const OVERLAY_LAYOUTS: Record<OverlayLayout, ResolvedOverlayLayout> = {
@@ -178,6 +181,12 @@ function applyOverlayConfig(base: OverlayConfig, input: unknown): OverlayConfig 
   if (isOverlayLayout(input.layout)) next.layout = input.layout;
   if (typeof input.experimentalPiWrap === "boolean") {
     next.experimentalPiWrap = input.experimentalPiWrap;
+  }
+  if (typeof input.experimentalExclusiveFrame === "boolean") {
+    next.experimentalExclusiveFrame = input.experimentalExclusiveFrame;
+  }
+  if (!next.experimentalPiWrap || (next.layout !== "left" && next.layout !== "right")) {
+    next.experimentalExclusiveFrame = false;
   }
   return next;
 }

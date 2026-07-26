@@ -361,7 +361,11 @@ describe("OverlaySurface state machine", () => {
     const harness = createHarness();
     const surface = new OverlaySurface(harness.createComponent);
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "right", experimentalPiWrap: true };
+    config.overlay = {
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    };
 
     await surface.open(harness.ctx, request(), config);
     expect(harness.tui.render(100)).toEqual(["pi:50"]);
@@ -381,7 +385,11 @@ describe("OverlaySurface state machine", () => {
     const originalRender = harness.tui.render;
     const surface = new OverlaySurface(harness.createComponent);
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "right", experimentalPiWrap: true };
+    config.overlay = {
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    };
 
     await surface.open(harness.ctx, request(), config);
     harness.tui.requestRender.mockImplementation(() => {
@@ -522,7 +530,11 @@ describe("OverlaySurface state machine", () => {
       throw new Error("pty spawn failed");
     });
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "right", experimentalPiWrap: true };
+    config.overlay = {
+      layout: "right",
+      experimentalPiWrap: true,
+      experimentalExclusiveFrame: false,
+    };
 
     await expect(surface.open(harness.ctx, request(), config)).rejects.toThrow("pty spawn failed");
     expect(surface.getState()).toBe("closed");

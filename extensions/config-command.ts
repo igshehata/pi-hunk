@@ -21,30 +21,56 @@ const LAYOUT_CHOICES: Array<{ value: OverlayLayout; label: string }> = [
 export interface ConfigCommandSelection {
   layout: OverlayLayout;
   experimentalPiWrap: boolean;
+  experimentalExclusiveFrame: boolean;
 }
 
 export function parseConfigCommand(
   input: string,
   currentExperimentalPiWrap: boolean,
+  currentExperimentalExclusiveFrame = false,
 ): ConfigCommandSelection | undefined {
   const tokens = input.trim().split(/\s+/).filter(Boolean);
   if (tokens.length === 0 || !isOverlayLayout(tokens[0])) return undefined;
 
   let experimentalPiWrap = currentExperimentalPiWrap;
-  let requestedExperimentalWrap = false;
+  let experimentalExclusiveFrame = currentExperimentalPiWrap && currentExperimentalExclusiveFrame;
+  let requestedWrapOn = false;
+  let requestedWrapOff = false;
+  let requestedExclusiveOn = false;
+  let requestedExclusiveOff = false;
   for (const token of tokens.slice(1)) {
     if (token === "experimental-wrap" || token === "wrap") {
+      requestedWrapOn = true;
       experimentalPiWrap = true;
-      requestedExperimentalWrap = true;
-    } else if (token === "no-experimental-wrap" || token === "no-wrap") experimentalPiWrap = false;
-    else return undefined;
+    } else if (token === "no-experimental-wrap" || token === "no-wrap") {
+      requestedWrapOff = true;
+      experimentalPiWrap = false;
+      experimentalExclusiveFrame = false;
+    } else if (token === "experimental-exclusive" || token === "exclusive") {
+      requestedExclusiveOn = true;
+      experimentalPiWrap = true;
+      experimentalExclusiveFrame = true;
+    } else if (token === "no-experimental-exclusive" || token === "no-exclusive") {
+      requestedExclusiveOff = true;
+      experimentalExclusiveFrame = false;
+    } else return undefined;
+  }
+
+  if (
+    (requestedWrapOn && requestedWrapOff) ||
+    (requestedExclusiveOn && requestedExclusiveOff) ||
+    (requestedWrapOff && requestedExclusiveOn)
+  ) {
+    return undefined;
   }
 
   if (tokens[0] === "full" || tokens[0] === "float") {
-    if (requestedExperimentalWrap) return undefined;
+    if (requestedWrapOn || requestedExclusiveOn) return undefined;
     experimentalPiWrap = false;
+    experimentalExclusiveFrame = false;
   }
-  return { layout: tokens[0], experimentalPiWrap };
+  if (!experimentalPiWrap) experimentalExclusiveFrame = false;
+  return { layout: tokens[0], experimentalPiWrap, experimentalExclusiveFrame };
 }
 
 function displayLayout(layout: OverlayLayout): string {
@@ -119,9 +145,16 @@ function buildPatch(before: HunkConfig, after: HunkConfig): Record<string, unkno
   if (before.followEdits !== after.followEdits) patch.followEdits = after.followEdits;
 
   const overlay: Record<string, unknown> = {};
-  if (before.overlay.layout !== after.overlay.layout) overlay.layout = after.overlay.layout;
-  if (before.overlay.experimentalPiWrap !== after.overlay.experimentalPiWrap) {
+  const layoutChanged = before.overlay.layout !== after.overlay.layout;
+  const wrapChanged = before.overlay.experimentalPiWrap !== after.overlay.experimentalPiWrap;
+  if (layoutChanged || wrapChanged) {
+    if (layoutChanged) overlay.layout = after.overlay.layout;
     overlay.experimentalPiWrap = after.overlay.experimentalPiWrap;
+    overlay.experimentalExclusiveFrame = after.overlay.experimentalExclusiveFrame;
+  } else if (
+    before.overlay.experimentalExclusiveFrame !== after.overlay.experimentalExclusiveFrame
+  ) {
+    overlay.experimentalExclusiveFrame = after.overlay.experimentalExclusiveFrame;
   }
   if (Object.keys(overlay).length > 0) patch.overlay = overlay;
 
@@ -144,22 +177,23 @@ async function persistProjectChange(
   after: HunkConfig,
   runtimeBindings: HunkConfig["bindings"],
   notifySaved: boolean,
-): Promise<boolean> {
+): Promise<HunkConfig | undefined> {
   const patch = buildPatch(before, after);
-  if (Object.keys(patch).length === 0) return true;
+  if (Object.keys(patch).length === 0) return after;
 
+  let saved: HunkConfig;
   try {
-    await store.persist(ctx, "project", patch);
+    saved = await store.persist(ctx, "project", patch);
   } catch (error) {
     ctx.ui.notify(
       `Could not update project Hunk config: ${error instanceof Error ? error.message : String(error)}`,
       "error",
     );
-    return false;
+    return undefined;
   }
 
   const changedBindings = (["prefix", "toggle", "show"] as const).filter(
-    (binding) => before.bindings[binding] !== after.bindings[binding],
+    (binding) => before.bindings[binding] !== saved.bindings[binding],
   );
   // Pi cannot unregister the old prefix, and a focused overlay has already
   // captured its chord. Keep the whole runtime chord stable until /reload.
@@ -173,24 +207,27 @@ async function persistProjectChange(
   }
 
   const overlayChanged =
-    before.overlay.layout !== after.overlay.layout ||
-    before.overlay.experimentalPiWrap !== after.overlay.experimentalPiWrap;
+    before.overlay.layout !== saved.overlay.layout ||
+    before.overlay.experimentalPiWrap !== saved.overlay.experimentalPiWrap ||
+    before.overlay.experimentalExclusiveFrame !== saved.overlay.experimentalExclusiveFrame;
   const messages: string[] = [];
   if (notifySaved) messages.push("Hunk configuration updated in .pi/hunk.json.");
   if (overlayChanged && coordinator.hasLiveSurface()) {
     messages.push("Close and reopen the current Hunk review to apply the new layout.");
   }
   if (changedBindings.length > 0) {
-    const chord = `${after.bindings.prefix} then ${after.bindings.toggle}/${after.bindings.show}`;
+    const chord = `${saved.bindings.prefix} then ${saved.bindings.toggle}/${saved.bindings.show}`;
     messages.push(`Run /reload to activate the Pi-hunk chord ${chord}.`);
   }
   if (notifySaved && overlayChanged) {
     messages.push(
-      `Layout: ${displayLayout(after.overlay.layout)}${after.overlay.experimentalPiWrap ? ", Pi wrapping experimental" : ""}.`,
+      `Layout: ${displayLayout(saved.overlay.layout)}` +
+        `${saved.overlay.experimentalPiWrap ? ", Pi wrapping experimental" : ""}` +
+        `${saved.overlay.experimentalExclusiveFrame ? ", exclusive Hunk painting experimental" : ""}.`,
     );
   }
   if (messages.length > 0) ctx.ui.notify(messages.join(" "), "info");
-  return true;
+  return saved;
 }
 
 async function configureInteractively(
@@ -200,7 +237,7 @@ async function configureInteractively(
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify(
-      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap]",
+      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap] [experimental-exclusive|no-exclusive]",
       "warning",
     );
     return;
@@ -210,6 +247,7 @@ async function configureInteractively(
   const runtimeBindings = { ...current.bindings };
   while (true) {
     const wrapState = current.overlay.experimentalPiWrap ? "on (experimental)" : "off";
+    const exclusiveState = current.overlay.experimentalExclusiveFrame ? "on (experimental)" : "off";
     const choice = await ctx.ui.select(
       "Pi-hunk configuration — changes auto-save to .pi/hunk.json",
       [
@@ -217,6 +255,7 @@ async function configureInteractively(
         `Follow edits: ${current.followEdits ? "on" : "off"}`,
         `Overlay layout: ${current.overlay.layout}`,
         `Pi word wrap: ${wrapState}`,
+        `Exclusive Hunk painting: ${exclusiveState}`,
         `Hunk prefix: ${current.bindings.prefix}`,
         `Toggle hotkey: ${current.bindings.toggle}`,
         `Show hotkey: ${current.bindings.show}`,
@@ -249,7 +288,9 @@ async function configureInteractively(
         const overlayMessage =
           coordinator.hasLiveSurface() &&
           (current.overlay.layout !== restored.overlay.layout ||
-            current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap)
+            current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap ||
+            current.overlay.experimentalExclusiveFrame !==
+              restored.overlay.experimentalExclusiveFrame)
             ? " Close and reopen the current Hunk review to apply the restored layout."
             : "";
         ctx.ui.notify(
@@ -285,6 +326,7 @@ async function configureInteractively(
       next.overlay.layout = selected.value;
       if (selected.value === "full" || selected.value === "float") {
         next.overlay.experimentalPiWrap = false;
+        next.overlay.experimentalExclusiveFrame = false;
       }
     } else if (choice.startsWith("Pi word wrap:")) {
       if (current.overlay.layout !== "left" && current.overlay.layout !== "right") {
@@ -297,6 +339,21 @@ async function configureInteractively(
       ]);
       if (!wrap) continue;
       next.overlay.experimentalPiWrap = wrap.startsWith("On");
+      if (!next.overlay.experimentalPiWrap) next.overlay.experimentalExclusiveFrame = false;
+    } else if (choice.startsWith("Exclusive Hunk painting:")) {
+      if (
+        (current.overlay.layout !== "left" && current.overlay.layout !== "right") ||
+        !current.overlay.experimentalPiWrap
+      ) {
+        ctx.ui.notify("Exclusive painting requires Pi wrapping in a left or right split.", "info");
+        continue;
+      }
+      const exclusive = await ctx.ui.select("Exclusive Hunk region painting", [
+        "Off — normal Pi compositor",
+        "On — direct Hunk rectangle writes (experimental)",
+      ]);
+      if (!exclusive) continue;
+      next.overlay.experimentalExclusiveFrame = exclusive.startsWith("On");
     } else if (choice.startsWith("Hunk prefix:")) {
       const binding = await captureBinding(ctx, "prefix", current.bindings.prefix, "prefix", [
         current.bindings.toggle,
@@ -325,11 +382,16 @@ async function configureInteractively(
       continue;
     }
 
-    if (
-      await persistProjectChange(ctx, store, coordinator, current, next, runtimeBindings, false)
-    ) {
-      current = next;
-    }
+    const saved = await persistProjectChange(
+      ctx,
+      store,
+      coordinator,
+      current,
+      next,
+      runtimeBindings,
+      false,
+    );
+    if (saved) current = saved;
   }
 }
 
@@ -362,7 +424,8 @@ export async function handleConfigCommand(
       if (shortcutsChanged) store.patchSession({ bindings: current.bindings });
       const overlayChanged =
         current.overlay.layout !== restored.overlay.layout ||
-        current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap;
+        current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap ||
+        current.overlay.experimentalExclusiveFrame !== restored.overlay.experimentalExclusiveFrame;
       ctx.ui.notify(
         `Project Hunk configuration removed; inherited/default settings restored.${shortcutsChanged ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then." : ""}${overlayChanged && coordinator.hasLiveSurface() ? " Close and reopen the current Hunk review to apply the restored layout." : ""}`,
         "info",
@@ -376,17 +439,23 @@ export async function handleConfigCommand(
     return;
   }
 
-  const direct = parseConfigCommand(input, current.overlay.experimentalPiWrap);
+  const direct = parseConfigCommand(
+    input,
+    current.overlay.experimentalPiWrap,
+    current.overlay.experimentalExclusiveFrame,
+  );
   if (!direct) {
     const tokens = input.trim().split(/\s+/);
-    const requestsWrap = tokens
+    const requestsSplitExperiment = tokens
       .slice(1)
-      .some((token) => token === "experimental-wrap" || token === "wrap");
+      .some((token) =>
+        ["experimental-wrap", "wrap", "experimental-exclusive", "exclusive"].includes(token),
+      );
     const nonSplitLayout = tokens[0] === "full" || tokens[0] === "float";
     ctx.ui.notify(
-      requestsWrap && nonSplitLayout
-        ? "Experimental Pi word wrap only applies to left and right layouts."
-        : "Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap]",
+      requestsSplitExperiment && nonSplitLayout
+        ? "Experimental Pi wrapping and exclusive painting only apply to left and right layouts."
+        : "Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap] [experimental-exclusive|no-exclusive]",
       "warning",
     );
     return;
@@ -395,6 +464,7 @@ export async function handleConfigCommand(
   const next = cloneConfig(current);
   next.overlay.layout = direct.layout;
   next.overlay.experimentalPiWrap = direct.experimentalPiWrap;
+  next.overlay.experimentalExclusiveFrame = direct.experimentalExclusiveFrame;
   if (Object.keys(buildPatch(current, next)).length === 0) {
     ctx.ui.notify("Hunk configuration is unchanged.", "info");
     return;

@@ -18,6 +18,11 @@ import {
   installExperimentalPiWrap,
   type ExperimentalPiWrapController,
 } from "./experimental-pi-wrap.ts";
+import {
+  installExclusiveFrame,
+  type ExclusiveFrameController,
+  type ExclusiveFrameStats,
+} from "./exclusive-frame.ts";
 
 /**
  * Native Pi overlay surface with a persistent PTY toggle.
@@ -166,6 +171,7 @@ export class OverlaySurface {
   private currentRepoRoot: string | undefined;
   private currentFileCount: number | undefined;
   private experimentalPiWrap: ExperimentalPiWrapController | undefined;
+  private exclusiveFrame: ExclusiveFrameController | undefined;
   private currentArgsKey: string | undefined;
   private startPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -299,6 +305,10 @@ export class OverlaySurface {
     };
   }
 
+  getExclusiveFrameStats(): ExclusiveFrameStats | null {
+    return this.exclusiveFrame?.getStats() ?? null;
+  }
+
   /** Adopt authoritative metadata from the Hunk session selected by managed PID. */
   adoptManagedSession(metadata: {
     sessionId: string;
@@ -421,6 +431,23 @@ export class OverlaySurface {
                 "warning",
               );
             }
+            try {
+              const exclusiveEligible =
+                overlay.experimentalExclusiveFrame && this.experimentalPiWrap !== undefined;
+              this.exclusiveFrame = installExclusiveFrame(tui, overlay.layout, exclusiveEligible);
+              if (overlay.experimentalExclusiveFrame && !exclusiveEligible) {
+                ctx.ui.notify(
+                  "Exclusive Hunk painting requires experimental Pi wrapping in a left or right split.",
+                  "warning",
+                );
+              }
+            } catch (error) {
+              this.exclusiveFrame = undefined;
+              ctx.ui.notify(
+                `Exclusive Hunk painting is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+                "warning",
+              );
+            }
             const initialRows = resolveOverlayRows(geometry.maxHeight, tui.terminal.rows);
             const component = createComponent({
               command: request.command,
@@ -450,6 +477,7 @@ export class OverlaySurface {
                 return { column, row, width: overlayColumns, height: overlayRows };
               },
               startupFrameDeadlineMs: this.startupFrameDeadlineMs,
+              exclusiveFrame: this.exclusiveFrame,
               // The visible overlay owns keyboard focus, so Pi's shortcut
               // dispatch never sees the dedicated prefix. The component must
               // intercept prefix+h/s and hand control back here.
@@ -498,6 +526,7 @@ export class OverlaySurface {
               },
             });
             this.component = component;
+            this.exclusiveFrame?.setComponent(component);
             const pid = component.pid;
             this.currentPid =
               pid !== undefined && Number.isInteger(pid) && pid > 0 ? pid : undefined;
@@ -522,6 +551,9 @@ export class OverlaySurface {
                 return;
               }
               this.handle = handle;
+              this.exclusiveFrame?.setFocusProbe(
+                () => this.handle === handle && !handle.isHidden() && handle.isFocused(),
+              );
               this.component?.setVisible(true);
               // setHidden(false) auto-focuses when nonCapturing is false.
               if (handle.isHidden()) handle.setHidden(false);
@@ -563,6 +595,7 @@ export class OverlaySurface {
     }
     if (this.state !== "hidden" || !this.handle) return;
     this.experimentalPiWrap?.setVisible(true);
+    this.exclusiveFrame?.setVisible(true);
     this.handle.setHidden(false);
     this.component?.setVisible(true);
     this.transitionState("visible");
@@ -571,6 +604,7 @@ export class OverlaySurface {
 
   async hide(): Promise<void> {
     if (this.state !== "visible" || !this.handle) return;
+    this.exclusiveFrame?.setVisible(false);
     this.component?.setVisible(false);
     this.experimentalPiWrap?.setVisible(false);
     this.handle.setHidden(true);
@@ -618,6 +652,7 @@ export class OverlaySurface {
     const gen = this.generation;
     this.transitionState("closing");
     try {
+      this.exclusiveFrame?.setVisible(false);
       this.component?.setVisible(false);
     } catch {
       // ignore
@@ -800,6 +835,13 @@ export class OverlaySurface {
     this.currentSessionId = undefined;
     this.currentRepoRoot = undefined;
     this.currentFileCount = undefined;
+    const exclusiveFrame = this.exclusiveFrame;
+    this.exclusiveFrame = undefined;
+    try {
+      exclusiveFrame?.dispose();
+    } catch {
+      // Direct-render restoration is best-effort and must not strand close waiters.
+    }
     const experimentalPiWrap = this.experimentalPiWrap;
     this.experimentalPiWrap = undefined;
     try {

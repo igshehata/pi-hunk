@@ -120,7 +120,11 @@ describe("critical surface + embedded Hunk integration", () => {
     const harness = integrationHarness();
     const surface = new OverlaySurface((options) => new EmbeddedHunk(options));
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "float", experimentalPiWrap: false };
+    config.overlay = {
+      layout: "float",
+      experimentalPiWrap: false,
+      experimentalExclusiveFrame: false,
+    };
 
     await surface.open(
       harness.ctx,

@@ -78,7 +78,7 @@ function subcommandValues(
   if (first === "config") {
     if (argumentIndex === 1) return ["restore", "full", "left", "right", "float"];
     if (tokens[1] === "restore") return undefined;
-    return ["experimental-wrap", "no-wrap"];
+    return ["experimental-wrap", "no-wrap", "experimental-exclusive", "no-exclusive"];
   }
   return undefined;
 }

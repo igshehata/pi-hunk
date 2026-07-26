@@ -5,6 +5,7 @@ import type { Component, Focusable, KeyId, TUI } from "@earendil-works/pi-tui";
 import { toPtyInput, translateMouseInput, type MouseViewport } from "./input.ts";
 import { type OverlayPty, type PtySubscription, spawnOverlayPty } from "./pty.ts";
 import { renderGhosttyHtml } from "./render-buffer.ts";
+import type { ExclusiveFrameController, HunkDirectFrame } from "./exclusive-frame.ts";
 
 // Hunk enables mouse reporting inside the child PTY. Mirror it to Pi's real
 // terminal while the overlay is focused/visible and forward the resulting SGR
@@ -122,6 +123,8 @@ export interface EmbeddedOptions {
   showKey?: KeyId;
   /** Called for prefix + showKey while the component is visible. */
   onShowRequest?: () => void;
+  /** Default-off direct-region rendering lease for focused split panes. */
+  exclusiveFrame?: ExclusiveFrameController;
 }
 
 export class EmbeddedHunk implements Component, Focusable {
@@ -138,6 +141,7 @@ export class EmbeddedHunk implements Component, Focusable {
   private readonly onToggleRequest?: () => void;
   private readonly showKey?: KeyId;
   private readonly onShowRequest?: () => void;
+  private readonly exclusiveFrame?: ExclusiveFrameController;
   private readonly startupFrameDeadlineMs: number;
   private prefixPending = false;
   private columns: number;
@@ -172,6 +176,8 @@ export class EmbeddedHunk implements Component, Focusable {
     if (next === this.presentationState) return;
     this.presentationState = next;
     if (!value) this.prefixPending = false;
+    // Revoke direct terminal ownership before focus-driven cursor/mouse writes.
+    this.exclusiveFrame?.setFocused(value);
     this.updateMouseMode();
   }
 
@@ -217,6 +223,7 @@ export class EmbeddedHunk implements Component, Focusable {
     this.onToggleRequest = options.onToggleRequest;
     this.showKey = options.showKey;
     this.onShowRequest = options.onShowRequest;
+    this.exclusiveFrame = options.exclusiveFrame;
     this.startupFrameDeadlineMs = Math.max(
       0,
       options.startupFrameDeadlineMs ?? DEFAULT_STARTUP_FRAME_DEADLINE_MS,
@@ -267,7 +274,7 @@ export class EmbeddedHunk implements Component, Focusable {
         this.terminal.feed(data);
         this.contentGeneration += 1;
         this.renderedLines = undefined;
-        if (this.isVisibleState() && this.startupState === "ready") this.scheduleRender();
+        if (this.isVisibleState() && this.startupState === "ready") this.requestFrame();
       }),
       this.pty.onExit((event) => {
         if (!this.isRunning() || gen !== this.generation) return;
@@ -290,6 +297,8 @@ export class EmbeddedHunk implements Component, Focusable {
     if (next === this.presentationState) return;
     this.presentationState = next;
     if (!visible) this.prefixPending = false;
+    // Revoke direct terminal ownership before visibility-driven terminal writes.
+    this.exclusiveFrame?.setVisible(visible);
     this.updateMouseMode();
     // A queued microtask checks visibility before painting. Showing remains an
     // immediate correctness boundary and flushes all output parsed while hidden.
@@ -304,12 +313,14 @@ export class EmbeddedHunk implements Component, Focusable {
     if (!this.isVisibleState() || !this.isRunning()) return;
     if (!isKeyRelease(data) && this.prefixKey && matchesKey(data, this.prefixKey)) {
       this.prefixPending = true;
+      this.exclusiveFrame?.armPostInputRenderSuppression();
       return;
     }
     if (!isKeyRelease(data) && this.prefixPending) {
       this.prefixPending = false;
       if (this.toggleKey && matchesKey(data, this.toggleKey)) this.onToggleRequest?.();
       else if (this.showKey && matchesKey(data, this.showKey)) this.onShowRequest?.();
+      else this.exclusiveFrame?.armPostInputRenderSuppression();
       // Unknown suffixes cancel the Pi-hunk chord and are not sent to Hunk.
       return;
     }
@@ -324,6 +335,7 @@ export class EmbeddedHunk implements Component, Focusable {
       translated = translateMouseInput(translated, viewport);
     }
     if (translated) this.pty.write(translated);
+    this.exclusiveFrame?.armPostInputRenderSuppression();
   }
 
   render(width: number): string[] {
@@ -332,9 +344,15 @@ export class EmbeddedHunk implements Component, Focusable {
     const cols = Math.max(1, width);
     const rows = Math.max(1, this.resolveRows?.(this.tui.terminal.rows) ?? this.rows);
     this.resize(cols, rows);
+    const lines = this.renderCurrentLines();
+    this.exclusiveFrame?.observeCompositedFrame(this.directFrame(lines));
+    return lines;
+  }
+
+  private renderCurrentLines(): string[] {
     if (this.startupState !== "ready") {
       const message = "Starting Hunk…";
-      return [message, ...Array.from({ length: Math.max(0, rows - 1) }, () => "")];
+      return [message, ...Array.from({ length: Math.max(0, this.rows - 1) }, () => "")];
     }
     if (
       this.renderedLines &&
@@ -353,14 +371,25 @@ export class EmbeddedHunk implements Component, Focusable {
     return this.renderedLines;
   }
 
+  private directFrame(lines = this.renderCurrentLines()): HunkDirectFrame {
+    return {
+      ready: this.startupState === "ready",
+      columns: this.columns,
+      rows: this.rows,
+      lines,
+    };
+  }
+
   /** Update the target row budget from overlay maxHeight resolution. */
   setTargetRows(rows: number): void {
     const next = Math.max(1, rows);
     if (next === this.rows) return;
+    this.exclusiveFrame?.revoke("target-rows-changed");
     this.resize(this.columns, next);
   }
 
   invalidate(): void {
+    this.exclusiveFrame?.revoke("component-invalidated");
     this.renderedLines = undefined;
     this.tui.requestRender();
   }
@@ -369,6 +398,7 @@ export class EmbeddedHunk implements Component, Focusable {
     if (this.isDisposed()) return;
     this.transitionLifecycle("dispose");
     this.transitionStartup("dispose");
+    this.exclusiveFrame?.revoke("component-disposed");
     this.generation += 1;
     this.clearStartupTimers();
     this.setMouseEnabled(false);
@@ -460,6 +490,7 @@ export class EmbeddedHunk implements Component, Focusable {
   private complete(result: HunkExit, options: { disposePty?: boolean } = {}): void {
     if (!this.isRunning()) return;
     this.transitionLifecycle("complete");
+    this.exclusiveFrame?.revoke("child-completed");
     this.renderQueued = false;
     this.clearStartupTimers();
     this.setMouseEnabled(false);
@@ -492,6 +523,11 @@ export class EmbeddedHunk implements Component, Focusable {
    * timer. Pi already enforces its own ~16 ms render interval, so another 16 ms
    * timeout here only doubled scrolling latency.
    */
+  private requestFrame(): void {
+    if (this.exclusiveFrame?.requestDirectPaint(() => this.directFrame())) return;
+    this.scheduleRender();
+  }
+
   private scheduleRender(): void {
     if (this.renderQueued || !this.isVisibleState() || !this.isRunning()) return;
     this.renderQueued = true;

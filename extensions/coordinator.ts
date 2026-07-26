@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { AutoOpenSuppressionReason, HunkConfig } from "./config.ts";
 import { navigateHunkSession, type LiveHunkSession } from "./hunk-session.ts";
 import type { HunkExit } from "./overlay/embedded.ts";
+import type { ExclusiveFrameStats } from "./overlay/exclusive-frame.ts";
 import { OverlaySurface } from "./overlay/surface.ts";
 import type { LaunchSource, OpenRequest, SurfaceSessionInfo } from "./overlay/types.ts";
 
@@ -223,6 +224,10 @@ export class ReviewCoordinator {
 
   getActiveInfo(): SurfaceSessionInfo | null {
     return this.active?.getInfo() ?? null;
+  }
+
+  getExclusiveFrameStats(): ExclusiveFrameStats | null {
+    return this.active?.getExclusiveFrameStats() ?? null;
   }
 
   getEarlyOpenPromise(): Promise<void> | null {
