@@ -489,6 +489,27 @@ describe("asynchronous Hunk comment handoff", () => {
     expect(delivery).toHaveBeenCalledTimes(2);
   });
 
+  it("resets submitted-note deduplication at a Pi session boundary", async () => {
+    let comments: unknown[] = [note("First session")];
+    const { gate, coordinator } = setup(() => comments);
+    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    gate.onLateSubmission(delivery);
+
+    coordinator.transition("visible");
+    coordinator.transition("hidden");
+    await vi.waitFor(() => expect(delivery).toHaveBeenCalledOnce());
+
+    gate.resetSession();
+    comments = [note("Next session")];
+    coordinator.transition("visible");
+    coordinator.transition("hidden");
+
+    await vi.waitFor(() => expect(delivery).toHaveBeenCalledTimes(2));
+    expect(delivery.mock.calls[1]?.[0]).toEqual([
+      expect.objectContaining({ noteId: "user:1", summary: "Next session" }),
+    ]);
+  });
+
   it("treats a comment-free hide as a no-op", async () => {
     const { gate, coordinator } = setup([]);
     const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
@@ -516,6 +537,34 @@ describe("asynchronous Hunk comment handoff", () => {
 
     await expect(gate.submit(ctx)).resolves.toMatchObject({ status: "submitted" });
     expect(delivery).toHaveBeenCalledTimes(2);
+  });
+
+  it("still probes for newer comments while retrying queued delivery", async () => {
+    let comments: unknown[] = [note("First", { noteId: "user:1" })];
+    const { gate, coordinator, ctx, run } = setup(() => comments);
+    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => {
+      if (delivery.mock.calls.length === 1) throw new Error("Pi is busy");
+    });
+    gate.onLateSubmission(delivery);
+
+    coordinator.transition("visible");
+    coordinator.transition("hidden");
+    await vi.waitFor(() => expect(delivery).toHaveBeenCalledOnce());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    comments = [...comments, note("Second", { noteId: "user:2", newRange: [10, 10] })];
+    await expect(gate.submit(ctx)).resolves.toMatchObject({
+      status: "submitted",
+      notes: [
+        expect.objectContaining({ noteId: "user:1" }),
+        expect.objectContaining({ noteId: "user:2" }),
+      ],
+    });
+    expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(2);
+    expect(delivery).toHaveBeenCalledTimes(3);
+    expect(delivery.mock.calls[2]?.[0]).toEqual([
+      expect.objectContaining({ noteId: "user:2", summary: "Second" }),
+    ]);
   });
 
   it("lets /hunk feedback recover after an automatic comment probe fails", async () => {
@@ -942,6 +991,96 @@ describe("asynchronous Hunk comment handoff", () => {
       expect(delivery).toHaveBeenCalledWith([
         expect.objectContaining({ summary: "Review repo A first" }),
       ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("captures newer comments before /hunk next replaces a review after delivery failure", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-async-next-retry-")));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    await Promise.all([mkdir(repoA), mkdir(repoB)]);
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const sessionA = session({ sessionId: "repo-a", cwd: repoA, repoRoot: repoA });
+      const sessionB = session({ sessionId: "repo-b", cwd: repoB, repoRoot: repoB });
+      const waitForSession = vi.fn(async (options: { cwd: string }) => ({
+        status: "reviewable" as const,
+        session: options.cwd === repoB ? sessionB : sessionA,
+      }));
+      let comments: unknown[] = [note("First", { noteId: "user:1" })];
+      const run = runner(() => comments, [sessionA], "repo-a");
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        run,
+        waitForSession,
+      );
+      const delivery = vi.fn(async (_notes: HunkReviewNote[]) => {
+        if (delivery.mock.calls.length === 1) throw new Error("Pi is busy");
+      });
+      gate.onLateSubmission(delivery);
+      gate.addEvidence({
+        mutation: true,
+        targets: [repoA, repoB],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await gate.presentAutomatic(ctx);
+      coordinator.transition("hidden");
+      await vi.waitFor(() => expect(delivery).toHaveBeenCalledOnce());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      comments = [...comments, note("Second", { noteId: "user:2", newRange: [10, 10] })];
+      coordinator.transition("visible");
+      await expect(gate.next(ctx)).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot: repoB,
+      });
+
+      expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(2);
+      expect(delivery).toHaveBeenCalledTimes(3);
+      expect(delivery.mock.calls[1]?.[0]).toEqual([
+        expect.objectContaining({ noteId: "user:1", summary: "First" }),
+      ]);
+      expect(delivery.mock.calls[2]?.[0]).toEqual([
+        expect.objectContaining({ noteId: "user:2", summary: "Second" }),
+      ]);
+      expect(delivery.mock.invocationCallOrder[2]).toBeLessThan(
+        coordinator.ensureOpen.mock.invocationCallOrder[1]!,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves unresolved coverage while opening a known repository", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-mixed-evidence-")));
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const managedSession = session({ cwd: root, repoRoot: root });
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [managedSession]),
+        vi.fn(async () => ({ status: "reviewable" as const, session: managedSession })),
+      );
+      gate.addEvidence({ mutation: true, targets: [root], unresolved: true, revision: 1 });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toEqual({
+        status: "reviewable",
+        repoRoot: root,
+        fileCount: 1,
+        unresolved: true,
+      });
+      await expect(gate.next(ctx)).resolves.toEqual({ status: "target-required" });
+      expect(coordinator.ensureOpen).toHaveBeenCalledOnce();
     } finally {
       await rm(root, { recursive: true, force: true });
     }

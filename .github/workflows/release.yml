@@ -29,6 +29,11 @@ jobs:
           cache: true
           install: true
       - run: npm ci --ignore-scripts
+      # Inspect the immutable commit before changesets/action versions the job
+      # workspace while creating or updating its release pull request.
+      - id: state
+        name: Determine whether this commit contains an unpublished release
+        run: node scripts/release-state.mjs
       - name: Create or update the version pull request
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
         with:
@@ -37,9 +42,6 @@ jobs:
           title: "chore: version package"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - id: state
-        name: Determine whether this commit contains an unpublished release
-        run: node scripts/release-state.mjs
 
   verify:
     name: Verify pi-hunk@${{ needs.version.outputs.version }}
