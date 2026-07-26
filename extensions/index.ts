@@ -60,6 +60,9 @@ interface SettledDiagnostics {
   decision: SettledDecision | null;
 }
 
+const UNRESOLVED_MUTATION_WARNING =
+  "Automatic Hunk review skipped a pathless mutation because its repository could not be inferred safely; open Hunk manually from the target repository.";
+
 /**
  * Collaborators shared by the lifecycle handlers below. The factory builds
  * this once; each `pi.on` registration only wires it into one named handler.
@@ -412,6 +415,7 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     const presented = await reviewGate.presentAutomatic(ctx, source);
     if (presented.status === "reviewable") {
       updateStatus(ctx, store.get(), coordinator);
+      if (presented.unresolved) ctx.ui.notify(UNRESOLVED_MUTATION_WARNING, "warning");
       return;
     }
     if (presented.status === "no-diff") {
@@ -421,10 +425,7 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     }
     if (presented.status === "target-required") {
       diagnostics.decision = { action: "skipped", reason: "target-required" };
-      ctx.ui.notify(
-        "Automatic Hunk review skipped a pathless mutation because its repository could not be inferred safely; open Hunk manually from the target repository.",
-        "warning",
-      );
+      ctx.ui.notify(UNRESOLVED_MUTATION_WARNING, "warning");
       return;
     }
     if (presented.status === "no-evidence") return;

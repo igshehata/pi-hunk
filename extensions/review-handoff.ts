@@ -44,7 +44,13 @@ export type HunkFeedbackResult =
   | { status: "unavailable"; reason: string; message: string; notes: [] };
 
 export type AutomaticReviewResult =
-  | { status: "reviewable"; repoRoot: string; fileCount: number }
+  | {
+      status: "reviewable";
+      repoRoot: string;
+      fileCount: number;
+      /** A pathless mutation still needs a manually selected review target. */
+      unresolved?: true;
+    }
   | { status: "no-diff" }
   | { status: "target-required" }
   | { status: "no-evidence" }
@@ -270,6 +276,7 @@ export class ReviewHandoffGate {
   resetSession(): void {
     this.sessionEpoch += 1;
     this.evidenceRevision = 0;
+    this.submittedNoteKeys.clear();
     this.pendingReviewNotes.clear();
     this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
     this.resetPlan();
@@ -308,6 +315,7 @@ export class ReviewHandoffGate {
           status: "reviewable",
           repoRoot: routed.repository.repoRoot,
           fileCount: routed.repository.fileCount,
+          ...(this.unresolved ? { unresolved: true as const } : {}),
         };
       }
 
@@ -330,7 +338,9 @@ export class ReviewHandoffGate {
     if (ctx.mode !== "tui") {
       return { status: "unavailable", reason: "not-tui" };
     }
-    if (this.pending.length === 0) return { status: "no-evidence" };
+    if (this.pending.length === 0) {
+      return this.unresolved ? { status: "target-required" } : { status: "no-evidence" };
+    }
 
     // Probe even a still-visible review, then wait behind every inspection that
     // was already queued by a hide. Replacing the process earlier could make
@@ -637,21 +647,17 @@ export class ReviewHandoffGate {
     if (this.lateDelivery) await this.lateDelivery;
     if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
 
+    // Retry known notes first, but still perform the promised fresh probe. New
+    // comments may have been added while an earlier delivery remained queued;
+    // returning immediately here would let /hunk next replace their only live
+    // process before they had ever been collected.
     const queuedEntries = [...this.pendingReviewNotes.entries()];
     if (queuedEntries.length > 0) {
       await this.dispatchLateNotes();
       if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
-      const delivered = queuedEntries.every(
-        ([key, entry]) => this.pendingReviewNotes.get(key) !== entry,
-      );
-      return delivered
-        ? this.submittedResult(queuedEntries.map(([, entry]) => entry.note))
-        : this.pendingResult(
-            "Fresh Hunk notes remain queued; run /hunk feedback if automatic delivery keeps failing.",
-          );
     }
 
-    return this.runInspection(async () => {
+    const probed = await this.runInspection(async () => {
       if (actionEpoch !== this.sessionEpoch) {
         return this.unavailable("session-boundary");
       }
@@ -705,6 +711,25 @@ export class ReviewHandoffGate {
         );
       }
     });
+
+    const deliveredQueuedNotes = queuedEntries
+      .filter(([key, entry]) => this.pendingReviewNotes.get(key) !== entry)
+      .map(([, entry]) => entry.note);
+    if (probed.status === "unavailable") {
+      return probed.reason === "no-managed-review" && deliveredQueuedNotes.length > 0
+        ? this.submittedResult(deliveredQueuedNotes)
+        : probed;
+    }
+    if (this.pendingReviewNotes.size > 0) {
+      return this.pendingResult(
+        "Fresh Hunk notes remain queued; run /hunk feedback if automatic delivery keeps failing.",
+      );
+    }
+    if (probed.status === "submitted" && deliveredQueuedNotes.length > 0) {
+      return this.submittedResult([...deliveredQueuedNotes, ...probed.notes]);
+    }
+    if (deliveredQueuedNotes.length > 0) return this.submittedResult(deliveredQueuedNotes);
+    return probed;
   }
 
   private sessionMatchesActiveSurface(session: LiveHunkSession): boolean {

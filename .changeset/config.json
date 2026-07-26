@@ -10,7 +10,7 @@
   "ignore": [],
   "bumpVersionsWithWorkspaceProtocolOnly": false,
   "changedFilePatterns": ["**"],
-  "format": "oxfmt",
+  "prettier": false,
   "privatePackages": {
     "version": true,
     "tag": false

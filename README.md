@@ -44,7 +44,7 @@ Pi changes code  →  Hunk opens  →  You annotate  →  Notes return to Pi  �
 ### Requirements
 
 - [Pi](https://github.com/earendil-works/pi) **0.80+**
-- [Hunk](https://github.com/modem-dev/hunk) **0.17.3+** available on `PATH`
+- [Hunk](https://github.com/modem-dev/hunk) **0.17.6+** available on `PATH`
 - Node.js **22.19+**
 - macOS arm64, or glibc Linux x64/arm64
 

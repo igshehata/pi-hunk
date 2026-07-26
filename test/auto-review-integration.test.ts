@@ -648,6 +648,79 @@ describe("automatic review policies in action", () => {
     expect(runtime.tools.has("hunk_review")).toBe(false);
   });
 
+  it("warns about pathless mutations while still opening known repository evidence", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-mixed-evidence-")));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      detector: new ChangeDetector(),
+      coordinator: runtime.coordinator,
+      reviewRun: reviewableRun(root),
+      reviewWaitForSession: immediateSessionWait(1),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
+
+    const structured = { path: "src/a.ts", content: "changed" };
+    await runtime.events.get("tool_execution_start")?.(
+      {
+        type: "tool_execution_start",
+        toolCallId: "structured",
+        toolName: "write",
+        args: structured,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("tool_execution_end")?.(
+      {
+        type: "tool_execution_end",
+        toolCallId: "structured",
+        toolName: "write",
+        isError: false,
+      },
+      runtime.ctx,
+    );
+
+    const pathless = { command: "touch generated.ts" };
+    await runtime.events.get("tool_execution_start")?.(
+      {
+        type: "tool_execution_start",
+        toolCallId: "pathless",
+        toolName: "bash",
+        args: pathless,
+      },
+      runtime.ctx,
+    );
+    await runtime.events.get("tool_execution_end")?.(
+      {
+        type: "tool_execution_end",
+        toolCallId: "pathless",
+        toolName: "bash",
+        isError: false,
+      },
+      runtime.ctx,
+    );
+
+    await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
+
+    expect(runtime.mounts).toHaveLength(1);
+    expect(runtime.coordinator.getActiveInfo()).toMatchObject({ repoRoot: root });
+    expect(runtime.ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("repository could not be inferred safely"),
+      "warning",
+    );
+
+    await runtime.commands.get("hunk")?.("next", runtime.ctx);
+    expect(runtime.ctx.ui.notify).toHaveBeenLastCalledWith(
+      "The next review target could not be inferred safely.",
+      "warning",
+    );
+  });
+
   it("does not open for conversation or read-only tools", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-chat-"));
     temporaryDirectories.push(root);

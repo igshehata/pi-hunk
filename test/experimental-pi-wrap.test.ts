@@ -49,29 +49,42 @@ async function waitForRender(): Promise<void> {
 
 function fakeTui() {
   const render = vi.fn((width: number) => [`pi:${width}`]);
+  const invalidate = vi.fn();
+  const requestRender = vi.fn();
   const tui = {
     terminal: { columns: 100, rows: 40 },
     previousWidth: 100,
     render,
-    invalidate: vi.fn(),
-    requestRender: vi.fn(),
+    invalidate,
+    requestRender,
   } as unknown as TUI;
-  return { tui, render };
+  return { tui, render, invalidate, requestRender };
 }
 
 describe("experimental Pi split wrapping", () => {
-  it("narrows Pi beside a right split only while visible", () => {
-    const { tui, render } = fakeTui();
+  it("narrows Pi beside a right split without recursively invalidating the TUI", () => {
+    const { tui, render, invalidate, requestRender } = fakeTui();
     const controller = installExperimentalPiWrap(tui, "right", true)!;
 
     expect(tui.render(100)).toEqual(["pi:50"]);
     expect(render).toHaveBeenLastCalledWith(50);
+    expect(requestRender).toHaveBeenCalledTimes(1);
+    expect(invalidate).not.toHaveBeenCalled();
+
+    controller.setVisible(true);
+    expect(requestRender).toHaveBeenCalledTimes(1);
 
     controller.setVisible(false);
     expect(tui.render(100)).toEqual(["pi:100"]);
+    expect(requestRender).toHaveBeenCalledTimes(2);
 
     controller.setVisible(true);
     expect(tui.render(81)).toEqual(["pi:41"]);
+    expect(requestRender).toHaveBeenCalledTimes(3);
+
+    controller.dispose();
+    expect(requestRender).toHaveBeenCalledTimes(4);
+    expect(invalidate).not.toHaveBeenCalled();
   });
 
   it("pads narrowed Pi to the right of a left split", () => {

@@ -53,4 +53,38 @@ describe("renderGhosttyHtml", () => {
     const [line] = renderGhosttyHtml(html, 8, 1);
     expect(line!.replace(ANSI, "")).toBe("<a&b>🙂 ");
   });
+
+  it("restores parent styles after nested and repeated spans", () => {
+    const html =
+      '<div style="font-family: monospace; white-space: pre;">' +
+      '<span style="font-weight: bold;">a' +
+      '<span style="font-style: italic;">b</span>c' +
+      '<span style="font-style: italic;">d</span>e' +
+      "</span></div>";
+    const [line] = renderGhosttyHtml(html, 8, 1);
+
+    expect(line).toContain("\x1b[0m\x1b[1m\x1b[3mb\x1b[0m\x1b[1mc");
+    expect(line).toContain("\x1b[0m\x1b[1m\x1b[3md\x1b[0m\x1b[1me");
+    expect(line!.replace(ANSI, "")).toBe("abcde   ");
+  });
+
+  it("carries active styles across LF, CRLF, and CR line endings", () => {
+    const html =
+      '<div style="font-family: monospace; white-space: pre;">' +
+      '<span style="color: rgb(1, 2, 3);">a\nb\r\nc\rd</span></div>';
+    const lines = renderGhosttyHtml(html, 2, 4);
+
+    expect(lines.map((line) => line.replace(ANSI, ""))).toEqual(["a ", "b ", "c ", "d "]);
+    for (const line of lines) expect(line).toContain("\x1b[38;2;1;2;3m");
+  });
+
+  it("truncates wide styled content to the exact requested width", () => {
+    const html =
+      '<div style="font-family: monospace; white-space: pre;">' +
+      '<span style="color: rgb(12, 34, 56);">界🙂abcdef</span></div>';
+    const [line] = renderGhosttyHtml(html, 7, 1);
+
+    expect(visibleWidth(line!)).toBe(7);
+    expect(line!.replace(ANSI, "")).toBe("界🙂abc");
+  });
 });

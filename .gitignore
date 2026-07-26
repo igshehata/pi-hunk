@@ -1,6 +1,8 @@
 node_modules/
 dist/
 docs/
+bugs/
+tasks/
 coverage/
 .pi/
 .claude/
@@ -11,3 +13,5 @@ mise.local.toml
 *.log
 *.tgz
 .DS_Store
+
+sandbox/

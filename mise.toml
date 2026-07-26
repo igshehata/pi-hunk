@@ -61,4 +61,8 @@ run = "npm exec changeset status"
 
 [tasks."release:version"]
 description = "Consume pending Changesets and update package versions/changelog"
-run = ["npm exec changeset version", "npm install --package-lock-only --ignore-scripts"]
+run = [
+  "npm exec changeset version",
+  "npm exec oxfmt CHANGELOG.md",
+  "npm install --package-lock-only --ignore-scripts",
+]

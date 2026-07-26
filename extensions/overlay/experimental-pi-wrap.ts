@@ -45,11 +45,10 @@ export function installExperimentalPiWrap(
   tui.render = wrappedRender;
 
   const requestReflow = (): void => {
-    // All visibility flags and overlay-handle changes happen synchronously before
-    // Pi's scheduled render. A normal differential render therefore sees one
-    // complete state transition and avoids the full-screen clear that caused
-    // intermittent flicker.
-    tui.invalidate();
+    // Width is already part of every component's render contract, so the next
+    // render naturally refreshes width-keyed caches. Recursively invalidating
+    // the whole TUI here also discards unrelated Pi and Hunk caches on every
+    // show/hide transition without changing the physical terminal dimensions.
     tui.requestRender();
   };
 
