@@ -59,6 +59,11 @@ export type OverlayTransitionScheduler = <T>(operation: () => Promise<T>) => Pro
 type EmbeddedModule = { EmbeddedHunk: new (options: EmbeddedOptions) => OverlayComponent };
 type EmbeddedLoader = () => Promise<EmbeddedModule>;
 
+/** Minimal shape of the lazily-loaded takeover module. */
+type TakeoverModule = {
+  TakeoverHunk: new (options: EmbeddedOptions) => OverlayComponent;
+};
+
 /**
  * Cached dynamic import of the embedded PTY component. A rejected import (broken
  * native build) is not cached, so a later open() can retry; the rejection
@@ -76,6 +81,20 @@ function defaultLoadEmbedded(): Promise<EmbeddedModule> {
     );
   }
   return embeddedModulePromise;
+}
+
+let takeoverModulePromise: Promise<TakeoverModule> | null = null;
+function defaultLoadTakeover(): Promise<TakeoverModule> {
+  if (!takeoverModulePromise) {
+    takeoverModulePromise = import("./takeover.ts").then(
+      (mod) => mod as unknown as TakeoverModule,
+      (error) => {
+        takeoverModulePromise = null;
+        throw error;
+      },
+    );
+  }
+  return takeoverModulePromise;
 }
 
 export interface OverlaySurfaceOptions {
@@ -350,14 +369,25 @@ export class OverlaySurface {
       await this.close();
     }
 
-    // Resolve the embedded factory BEFORE any state mutation. When a factory is
+    // Resolve the component factory BEFORE any state mutation. When a factory is
     // already available (injected in tests, or cached from a prior open) this is
     // fully synchronous, so a caller observing state right after open() still
     // sees "starting". Only the production lazy path awaits the dynamic import;
     // a failed import rejects open() with state still "closed" so the
     // coordinator's fallback chain engages cleanly (#14).
-    let createComponent = this.createComponent;
-    if (!createComponent) {
+    //
+    // Takeover is a separate host path: never reuse a cached embed factory when
+    // experimentalTakeover is on (and vice versa for tests that inject factories).
+    const useTakeover = config.overlay.experimentalTakeover === true;
+    let createComponent: OverlayComponentFactory;
+    if (useTakeover) {
+      // Never reuse a cached embed factory for takeover (and do not cache takeover).
+      // Tests that inject createComponent still win only when takeover is off.
+      const mod = await defaultLoadTakeover();
+      createComponent = (options) => new mod.TakeoverHunk(options);
+    } else if (this.createComponent) {
+      createComponent = this.createComponent;
+    } else {
       const mod = await this.loadEmbedded();
       createComponent = (options) => new mod.EmbeddedHunk(options);
       this.createComponent = createComponent;
@@ -403,7 +433,8 @@ export class OverlaySurface {
 
     try {
       const overlay = config.overlay;
-      const geometry = resolveOverlayLayout(overlay.layout);
+      // Takeover always owns the full terminal; ignore split/float geometry.
+      const geometry = resolveOverlayLayout(useTakeover ? "full" : overlay.layout);
       // Fire-and-forget: we deliberately do not use custom()'s promise as the
       // surface lifetime. After mount, done() is unsafe (global hideOverlay).
       void ctx.ui
@@ -418,18 +449,23 @@ export class OverlaySurface {
               };
             }
 
-            try {
-              this.experimentalPiWrap = installExperimentalPiWrap(
-                tui,
-                overlay.layout,
-                overlay.experimentalPiWrap,
-              );
-            } catch (error) {
+            // Takeover suspends Pi paint itself; never install wrap beside it.
+            if (!useTakeover) {
+              try {
+                this.experimentalPiWrap = installExperimentalPiWrap(
+                  tui,
+                  overlay.layout,
+                  overlay.experimentalPiWrap,
+                );
+              } catch (error) {
+                this.experimentalPiWrap = undefined;
+                ctx.ui.notify(
+                  `Experimental Pi word wrap is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+                  "warning",
+                );
+              }
+            } else {
               this.experimentalPiWrap = undefined;
-              ctx.ui.notify(
-                `Experimental Pi word wrap is unavailable: ${error instanceof Error ? error.message : String(error)}`,
-                "warning",
-              );
             }
             try {
               const exclusiveEligible =

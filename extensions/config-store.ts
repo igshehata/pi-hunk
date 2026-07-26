@@ -136,7 +136,7 @@ function warnInvalidBindings(
 
 function warnInvalidOverlayConfig(raw: unknown, path: string, onWarning?: ConfigWarning): void {
   if (!onWarning || !isRecord(raw) || !isRecord(raw.overlay)) return;
-  const { layout, experimentalPiWrap, experimentalExclusiveFrame } = raw.overlay;
+  const { layout, experimentalPiWrap, experimentalExclusiveFrame, experimentalTakeover } = raw.overlay;
   if (layout !== undefined && !isOverlayLayout(layout)) {
     onWarning(
       `Ignoring invalid overlay.layout ${JSON.stringify(layout)} in ${path}. ` +
@@ -155,6 +155,12 @@ function warnInvalidOverlayConfig(raw: unknown, path: string, onWarning?: Config
         `expected true or false.`,
     );
   }
+  if (experimentalTakeover !== undefined && typeof experimentalTakeover !== "boolean") {
+    onWarning(
+      `Ignoring invalid overlay.experimentalTakeover ${JSON.stringify(experimentalTakeover)} in ${path}; ` +
+        `expected true or false.`,
+    );
+  }
 }
 
 function warnUnknownConfig(raw: unknown, path: string, onWarning?: ConfigWarning): void {
@@ -165,7 +171,7 @@ function warnUnknownConfig(raw: unknown, path: string, onWarning?: ConfigWarning
     .map((key) => key);
   const nested: Array<[string, Set<string>]> = [
     ["hunk", new Set(["command", "args"])],
-    ["overlay", new Set(["layout", "experimentalPiWrap", "experimentalExclusiveFrame"])],
+    ["overlay", new Set(["layout", "experimentalPiWrap", "experimentalExclusiveFrame", "experimentalTakeover"])],
     ["bindings", new Set(["prefix", "toggle", "show"])],
   ];
   for (const [section, keys] of nested) {

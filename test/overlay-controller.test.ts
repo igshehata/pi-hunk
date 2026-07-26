@@ -365,6 +365,7 @@ describe("OverlaySurface state machine", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     };
 
     await surface.open(harness.ctx, request(), config);
@@ -389,6 +390,7 @@ describe("OverlaySurface state machine", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     };
 
     await surface.open(harness.ctx, request(), config);
@@ -534,6 +536,7 @@ describe("OverlaySurface state machine", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     };
 
     await expect(surface.open(harness.ctx, request(), config)).rejects.toThrow("pty spawn failed");

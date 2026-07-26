@@ -68,12 +68,15 @@ describe("hunkArgumentCompletions", () => {
     expect(values("config right e")).toEqual([
       "config right experimental-wrap",
       "config right experimental-exclusive",
+      "config right experimental-takeover",
     ]);
     expect(values("config right ")).toEqual([
       "config right experimental-wrap",
       "config right no-wrap",
       "config right experimental-exclusive",
       "config right no-exclusive",
+      "config right experimental-takeover",
+      "config right no-takeover",
     ]);
   });
 
@@ -89,16 +92,19 @@ describe("/hunk config parsing", () => {
       layout: "right",
       experimentalPiWrap: false,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     });
     expect(parseConfigCommand("left experimental-wrap", false)).toEqual({
       layout: "left",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     });
     expect(parseConfigCommand("right experimental-exclusive", true)).toEqual({
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: true,
+      experimentalTakeover: false,
     });
   });
 
@@ -107,6 +113,19 @@ describe("/hunk config parsing", () => {
       layout: "float",
       experimentalPiWrap: false,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
+    });
+    expect(parseConfigCommand("full experimental-takeover", false)).toEqual({
+      layout: "full",
+      experimentalPiWrap: false,
+      experimentalExclusiveFrame: false,
+      experimentalTakeover: true,
+    });
+    expect(parseConfigCommand("right takeover", false)).toEqual({
+      layout: "full",
+      experimentalPiWrap: false,
+      experimentalExclusiveFrame: false,
+      experimentalTakeover: true,
     });
     expect(parseConfigCommand("full experimental-wrap", false)).toBeUndefined();
     expect(parseConfigCommand("float wrap", false)).toBeUndefined();

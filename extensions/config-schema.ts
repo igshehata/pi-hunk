@@ -22,6 +22,11 @@ export interface OverlayConfig {
   experimentalPiWrap: boolean;
   /** Experimental: freeze Pi and paint focused Hunk split frames directly. */
   experimentalExclusiveFrame: boolean;
+  /**
+   * Experimental: same-tab takeover. Hunk owns the real TTY; Pi paint is suspended.
+   * No libghostty/HTML composite. Layout is forced full; Pi wrap is off.
+   */
+  experimentalTakeover: boolean;
 }
 
 export interface ResolvedOverlayLayout {
@@ -48,6 +53,7 @@ export const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
   layout: "right",
   experimentalPiWrap: true,
   experimentalExclusiveFrame: false,
+  experimentalTakeover: false,
 };
 
 const OVERLAY_LAYOUTS: Record<OverlayLayout, ResolvedOverlayLayout> = {
@@ -185,7 +191,15 @@ function applyOverlayConfig(base: OverlayConfig, input: unknown): OverlayConfig 
   if (typeof input.experimentalExclusiveFrame === "boolean") {
     next.experimentalExclusiveFrame = input.experimentalExclusiveFrame;
   }
-  if (!next.experimentalPiWrap || (next.layout !== "left" && next.layout !== "right")) {
+  if (typeof input.experimentalTakeover === "boolean") {
+    next.experimentalTakeover = input.experimentalTakeover;
+  }
+  // Takeover is full-screen exclusive: wrap, exclusive-frame, and non-full layouts do not apply.
+  if (next.experimentalTakeover) {
+    next.layout = "full";
+    next.experimentalPiWrap = false;
+    next.experimentalExclusiveFrame = false;
+  } else if (!next.experimentalPiWrap || (next.layout !== "left" && next.layout !== "right")) {
     next.experimentalExclusiveFrame = false;
   }
   return next;

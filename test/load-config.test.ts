@@ -47,6 +47,7 @@ describe("config loading", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     });
     expect(config.bindings.prefix).toBe("ctrl+x");
   });
@@ -131,6 +132,7 @@ describe("config loading", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     });
     expect(warnings).toEqual([
       expect.stringContaining("invalid overlay.layout"),

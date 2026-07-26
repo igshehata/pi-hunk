@@ -748,6 +748,7 @@ async function handleStatus(
     `Hunk: review=${config.review}, layout=${config.overlay.layout}, ` +
       `experimental-pi-wrap=${config.overlay.experimentalPiWrap ? "on" : "off"}, ` +
       `experimental-exclusive-frame=${config.overlay.experimentalExclusiveFrame ? "on" : "off"}, ` +
+      `experimental-takeover=${config.overlay.experimentalTakeover ? "on" : "off"}, ` +
       `active=${active}, command=${config.hunk.command}\n` +
       `open-notes=${openNotes}, last-auto-open=${describeSettledDecision(diagnostics.decision)}` +
       (exclusiveStats

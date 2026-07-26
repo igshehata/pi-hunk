@@ -124,6 +124,7 @@ describe("critical surface + embedded Hunk integration", () => {
       layout: "float",
       experimentalPiWrap: false,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     };
 
     await surface.open(

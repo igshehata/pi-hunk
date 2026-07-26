@@ -99,7 +99,12 @@ describe("interactive /hunk config", () => {
     expect(store.get()).toMatchObject({
       review: "live",
       followEdits: false,
-      overlay: { layout: "left", experimentalPiWrap: false },
+      overlay: {
+        layout: "left",
+        experimentalPiWrap: false,
+        experimentalExclusiveFrame: false,
+        experimentalTakeover: false,
+      },
     });
     expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
       review: "live",
@@ -258,6 +263,7 @@ describe("direct /hunk config", () => {
       layout: "left",
       experimentalPiWrap: false,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     });
   });
 
@@ -275,6 +281,7 @@ describe("direct /hunk config", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: true,
+      experimentalTakeover: false,
     });
   });
 

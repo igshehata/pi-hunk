@@ -182,7 +182,8 @@ A typical sparse project configuration:
   "overlay": {
     "layout": "right",
     "experimentalPiWrap": true,
-    "experimentalExclusiveFrame": false
+    "experimentalExclusiveFrame": false,
+    "experimentalTakeover": false
   },
   "bindings": {
     "prefix": "ctrl+space",
@@ -200,7 +201,9 @@ shipped defaults → ~/.pi/agent/hunk.json → trusted .pi/hunk.json → PI_HUNK
 
 By default, Hunk opens in the right half of the terminal and Pi wraps into the left half. Available
 layouts are `full`, `left`, `right`, and `float`; Pi wrapping can be toggled for left and right
-layouts.
+layouts. `overlay.experimentalTakeover: true` is an experiment that suspends Pi painting and lets
+Hunk own the real TTY (same tab, no libghostty composite). Toggle with
+`/hunk config full experimental-takeover` or `/hunk config right no-takeover`.
 
 The default-off exclusive-frame experiment freezes Pi after one composed split frame and paints only
 changed Hunk rows while Hunk remains focused. Enable it with

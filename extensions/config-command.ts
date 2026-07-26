@@ -22,22 +22,27 @@ export interface ConfigCommandSelection {
   layout: OverlayLayout;
   experimentalPiWrap: boolean;
   experimentalExclusiveFrame: boolean;
+  experimentalTakeover: boolean;
 }
 
 export function parseConfigCommand(
   input: string,
   currentExperimentalPiWrap: boolean,
   currentExperimentalExclusiveFrame = false,
+  currentExperimentalTakeover = false,
 ): ConfigCommandSelection | undefined {
   const tokens = input.trim().split(/\s+/).filter(Boolean);
   if (tokens.length === 0 || !isOverlayLayout(tokens[0])) return undefined;
 
   let experimentalPiWrap = currentExperimentalPiWrap;
   let experimentalExclusiveFrame = currentExperimentalPiWrap && currentExperimentalExclusiveFrame;
+  let experimentalTakeover = currentExperimentalTakeover;
   let requestedWrapOn = false;
   let requestedWrapOff = false;
   let requestedExclusiveOn = false;
   let requestedExclusiveOff = false;
+  let requestedTakeoverOn = false;
+  let requestedTakeoverOff = false;
   for (const token of tokens.slice(1)) {
     if (token === "experimental-wrap" || token === "wrap") {
       requestedWrapOn = true;
@@ -53,15 +58,33 @@ export function parseConfigCommand(
     } else if (token === "no-experimental-exclusive" || token === "no-exclusive") {
       requestedExclusiveOff = true;
       experimentalExclusiveFrame = false;
+    } else if (token === "experimental-takeover" || token === "takeover") {
+      requestedTakeoverOn = true;
+      experimentalTakeover = true;
+    } else if (token === "no-experimental-takeover" || token === "no-takeover") {
+      requestedTakeoverOff = true;
+      experimentalTakeover = false;
     } else return undefined;
   }
 
   if (
     (requestedWrapOn && requestedWrapOff) ||
     (requestedExclusiveOn && requestedExclusiveOff) ||
-    (requestedWrapOff && requestedExclusiveOn)
+    (requestedTakeoverOn && requestedTakeoverOff) ||
+    (requestedWrapOff && requestedExclusiveOn) ||
+    (requestedTakeoverOn && (requestedWrapOn || requestedExclusiveOn))
   ) {
     return undefined;
+  }
+
+  // Takeover is full-screen exclusive; wrap/exclusive-frame are meaningless beside it.
+  if (experimentalTakeover) {
+    return {
+      layout: "full",
+      experimentalPiWrap: false,
+      experimentalExclusiveFrame: false,
+      experimentalTakeover: true,
+    };
   }
 
   if (tokens[0] === "full" || tokens[0] === "float") {
@@ -70,7 +93,14 @@ export function parseConfigCommand(
     experimentalExclusiveFrame = false;
   }
   if (!experimentalPiWrap) experimentalExclusiveFrame = false;
-  return { layout: tokens[0], experimentalPiWrap, experimentalExclusiveFrame };
+  // Explicit non-full layout while takeover was on clears takeover unless re-requested.
+  if (tokens[0] !== "full" && !requestedTakeoverOn) experimentalTakeover = false;
+  return {
+    layout: tokens[0],
+    experimentalPiWrap,
+    experimentalExclusiveFrame,
+    experimentalTakeover,
+  };
 }
 
 function displayLayout(layout: OverlayLayout): string {
@@ -147,10 +177,14 @@ function buildPatch(before: HunkConfig, after: HunkConfig): Record<string, unkno
   const overlay: Record<string, unknown> = {};
   const layoutChanged = before.overlay.layout !== after.overlay.layout;
   const wrapChanged = before.overlay.experimentalPiWrap !== after.overlay.experimentalPiWrap;
-  if (layoutChanged || wrapChanged) {
+  const takeoverChanged = before.overlay.experimentalTakeover !== after.overlay.experimentalTakeover;
+  if (layoutChanged || wrapChanged || takeoverChanged) {
     if (layoutChanged) overlay.layout = after.overlay.layout;
     overlay.experimentalPiWrap = after.overlay.experimentalPiWrap;
     overlay.experimentalExclusiveFrame = after.overlay.experimentalExclusiveFrame;
+    if (takeoverChanged || after.overlay.experimentalTakeover) {
+      overlay.experimentalTakeover = after.overlay.experimentalTakeover;
+    }
   } else if (
     before.overlay.experimentalExclusiveFrame !== after.overlay.experimentalExclusiveFrame
   ) {
@@ -209,7 +243,8 @@ async function persistProjectChange(
   const overlayChanged =
     before.overlay.layout !== saved.overlay.layout ||
     before.overlay.experimentalPiWrap !== saved.overlay.experimentalPiWrap ||
-    before.overlay.experimentalExclusiveFrame !== saved.overlay.experimentalExclusiveFrame;
+    before.overlay.experimentalExclusiveFrame !== saved.overlay.experimentalExclusiveFrame ||
+    before.overlay.experimentalTakeover !== saved.overlay.experimentalTakeover;
   const messages: string[] = [];
   if (notifySaved) messages.push("Hunk configuration updated in .pi/hunk.json.");
   if (overlayChanged && coordinator.hasLiveSurface()) {
@@ -220,10 +255,13 @@ async function persistProjectChange(
     messages.push(`Run /reload to activate the Pi-hunk chord ${chord}.`);
   }
   if (notifySaved && overlayChanged) {
+    const extras = [
+      saved.overlay.experimentalTakeover ? "same-tab takeover experimental" : undefined,
+      saved.overlay.experimentalPiWrap ? "Pi wrapping experimental" : undefined,
+      saved.overlay.experimentalExclusiveFrame ? "exclusive Hunk painting experimental" : undefined,
+    ].filter(Boolean);
     messages.push(
-      `Layout: ${displayLayout(saved.overlay.layout)}` +
-        `${saved.overlay.experimentalPiWrap ? ", Pi wrapping experimental" : ""}` +
-        `${saved.overlay.experimentalExclusiveFrame ? ", exclusive Hunk painting experimental" : ""}.`,
+      `Layout: ${displayLayout(saved.overlay.layout)}${extras.length ? `, ${extras.join(", ")}` : ""}.`,
     );
   }
   if (messages.length > 0) ctx.ui.notify(messages.join(" "), "info");
@@ -237,7 +275,7 @@ async function configureInteractively(
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify(
-      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap] [experimental-exclusive|no-exclusive]",
+      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap] [experimental-exclusive|no-exclusive] [experimental-takeover|no-takeover]",
       "warning",
     );
     return;
@@ -248,6 +286,7 @@ async function configureInteractively(
   while (true) {
     const wrapState = current.overlay.experimentalPiWrap ? "on (experimental)" : "off";
     const exclusiveState = current.overlay.experimentalExclusiveFrame ? "on (experimental)" : "off";
+    const takeoverState = current.overlay.experimentalTakeover ? "on (experimental)" : "off";
     const choice = await ctx.ui.select(
       "Pi-hunk configuration — changes auto-save to .pi/hunk.json",
       [
@@ -256,6 +295,7 @@ async function configureInteractively(
         `Overlay layout: ${current.overlay.layout}`,
         `Pi word wrap: ${wrapState}`,
         `Exclusive Hunk painting: ${exclusiveState}`,
+        `Same-tab takeover: ${takeoverState}`,
         `Hunk prefix: ${current.bindings.prefix}`,
         `Toggle hotkey: ${current.bindings.toggle}`,
         `Show hotkey: ${current.bindings.show}`,
@@ -290,7 +330,8 @@ async function configureInteractively(
           (current.overlay.layout !== restored.overlay.layout ||
             current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap ||
             current.overlay.experimentalExclusiveFrame !==
-              restored.overlay.experimentalExclusiveFrame)
+              restored.overlay.experimentalExclusiveFrame ||
+            current.overlay.experimentalTakeover !== restored.overlay.experimentalTakeover)
             ? " Close and reopen the current Hunk review to apply the restored layout."
             : "";
         ctx.ui.notify(
@@ -328,7 +369,13 @@ async function configureInteractively(
         next.overlay.experimentalPiWrap = false;
         next.overlay.experimentalExclusiveFrame = false;
       }
+      // Non-full layouts cannot keep takeover on.
+      if (selected.value !== "full") next.overlay.experimentalTakeover = false;
     } else if (choice.startsWith("Pi word wrap:")) {
+      if (current.overlay.experimentalTakeover) {
+        ctx.ui.notify("Disable same-tab takeover before enabling Pi word wrap.", "info");
+        continue;
+      }
       if (current.overlay.layout !== "left" && current.overlay.layout !== "right") {
         ctx.ui.notify("Experimental Pi word wrap only applies to left and right layouts.", "info");
         continue;
@@ -341,6 +388,10 @@ async function configureInteractively(
       next.overlay.experimentalPiWrap = wrap.startsWith("On");
       if (!next.overlay.experimentalPiWrap) next.overlay.experimentalExclusiveFrame = false;
     } else if (choice.startsWith("Exclusive Hunk painting:")) {
+      if (current.overlay.experimentalTakeover) {
+        ctx.ui.notify("Disable same-tab takeover before enabling exclusive painting.", "info");
+        continue;
+      }
       if (
         (current.overlay.layout !== "left" && current.overlay.layout !== "right") ||
         !current.overlay.experimentalPiWrap
@@ -354,6 +405,18 @@ async function configureInteractively(
       ]);
       if (!exclusive) continue;
       next.overlay.experimentalExclusiveFrame = exclusive.startsWith("On");
+    } else if (choice.startsWith("Same-tab takeover:")) {
+      const takeover = await ctx.ui.select("Same-tab Hunk takeover", [
+        "Off — embed Hunk in Pi overlay (stable)",
+        "On — Hunk owns the TTY; Pi paint suspended (experimental)",
+      ]);
+      if (!takeover) continue;
+      next.overlay.experimentalTakeover = takeover.startsWith("On");
+      if (next.overlay.experimentalTakeover) {
+        next.overlay.layout = "full";
+        next.overlay.experimentalPiWrap = false;
+        next.overlay.experimentalExclusiveFrame = false;
+      }
     } else if (choice.startsWith("Hunk prefix:")) {
       const binding = await captureBinding(ctx, "prefix", current.bindings.prefix, "prefix", [
         current.bindings.toggle,
@@ -425,7 +488,8 @@ export async function handleConfigCommand(
       const overlayChanged =
         current.overlay.layout !== restored.overlay.layout ||
         current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap ||
-        current.overlay.experimentalExclusiveFrame !== restored.overlay.experimentalExclusiveFrame;
+        current.overlay.experimentalExclusiveFrame !== restored.overlay.experimentalExclusiveFrame ||
+        current.overlay.experimentalTakeover !== restored.overlay.experimentalTakeover;
       ctx.ui.notify(
         `Project Hunk configuration removed; inherited/default settings restored.${shortcutsChanged ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then." : ""}${overlayChanged && coordinator.hasLiveSurface() ? " Close and reopen the current Hunk review to apply the restored layout." : ""}`,
         "info",
@@ -443,6 +507,7 @@ export async function handleConfigCommand(
     input,
     current.overlay.experimentalPiWrap,
     current.overlay.experimentalExclusiveFrame,
+    current.overlay.experimentalTakeover,
   );
   if (!direct) {
     const tokens = input.trim().split(/\s+/);
@@ -455,7 +520,7 @@ export async function handleConfigCommand(
     ctx.ui.notify(
       requestsSplitExperiment && nonSplitLayout
         ? "Experimental Pi wrapping and exclusive painting only apply to left and right layouts."
-        : "Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap] [experimental-exclusive|no-exclusive]",
+        : "Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap] [experimental-exclusive|no-exclusive] [experimental-takeover|no-takeover]",
       "warning",
     );
     return;
@@ -465,6 +530,7 @@ export async function handleConfigCommand(
   next.overlay.layout = direct.layout;
   next.overlay.experimentalPiWrap = direct.experimentalPiWrap;
   next.overlay.experimentalExclusiveFrame = direct.experimentalExclusiveFrame;
+  next.overlay.experimentalTakeover = direct.experimentalTakeover;
   if (Object.keys(buildPatch(current, next)).length === 0) {
     ctx.ui.notify("Hunk configuration is unchanged.", "info");
     return;

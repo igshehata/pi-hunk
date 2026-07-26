@@ -21,6 +21,7 @@ describe("overlay config", () => {
           layout: "right",
           experimentalPiWrap: true,
           experimentalExclusiveFrame: false,
+          experimentalTakeover: false,
         },
         bindings: { prefix: "ctrl+space", toggle: "h", show: "s" },
       }),
@@ -50,6 +51,7 @@ describe("overlay config", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     });
     expect(config.bindings).toEqual({ prefix: "ctrl+x", toggle: "t", show: "l" });
   });
@@ -81,6 +83,7 @@ describe("overlay config", () => {
       layout: "right",
       experimentalPiWrap: true,
       experimentalExclusiveFrame: false,
+      experimentalTakeover: false,
     });
   });
 
@@ -96,6 +99,21 @@ describe("overlay config", () => {
     expect(
       applyConfig(enabled, { overlay: { layout: "float" } }).overlay.experimentalExclusiveFrame,
     ).toBe(false);
+  });
+
+  it("enables experimentalTakeover only as full exclusive host", () => {
+    const on = applyConfig(cloneConfig(DEFAULT_CONFIG), {
+      overlay: { experimentalTakeover: true },
+    });
+    expect(on.overlay).toEqual({
+      layout: "full",
+      experimentalPiWrap: false,
+      experimentalExclusiveFrame: false,
+      experimentalTakeover: true,
+    });
+    const off = applyConfig(on, { overlay: { experimentalTakeover: false, layout: "right" } });
+    expect(off.overlay.experimentalTakeover).toBe(false);
+    expect(off.overlay.layout).toBe("right");
   });
 
   it("resolves the four named layouts", () => {
