@@ -13,3 +13,5 @@ mise.local.toml
 *.log
 *.tgz
 .DS_Store
+
+sandbox/
