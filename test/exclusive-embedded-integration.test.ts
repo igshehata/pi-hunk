@@ -88,13 +88,13 @@ describe("exclusive EmbeddedHunk integration", () => {
     await waitForRender();
 
     const onData = (pty.onData.mock.calls as unknown as Array<[(data: string) => void]>)[0][0];
-    onData("\x1b[?2026h\x1b[1;1HAAAAA\x1b[2;1HBBBBB\x1b[3;1HCCCCC");
+    onData("\x1b[?2026h\x1b[1;1HAAAAA\x1b[2;1HBBBBB\x1b[3;1HCCCCC\x1b[?2026l");
     await waitForRender();
     expect(exclusive.getStats().state).toBe("exclusive");
 
     const baseRenders = base.renders;
     terminal.writes = [];
-    onData("\x1b[2;1H22222");
+    onData("\x1b[?2026h\x1b[2;1H22222\x1b[?2026l");
     await Promise.resolve();
     expect(base.renders).toBe(baseRenders);
     expect(exclusive.getStats()).toMatchObject({

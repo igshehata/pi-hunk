@@ -17,6 +17,8 @@ import { EmbeddedHunk } from "../extensions/overlay/embedded.ts";
 
 const ENABLE_MOUSE = "\x1b[?1003h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+const SYNCHRONIZED_FRAME_START = "\x1b[?2026h";
+const SYNCHRONIZED_FRAME_END = "\x1b[?2026l";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -218,8 +220,8 @@ describe("EmbeddedHunk presentation state", () => {
     // slower CI runners executing the suite in parallel.
     const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 100));
 
-    // Visible: the first synchronized Hunk frame opens the startup paint gate.
-    onData("\x1b[?2026hhello");
+    // Visible: the first complete synchronized Hunk frame opens the startup paint gate.
+    onData(`${SYNCHRONIZED_FRAME_START}hello${SYNCHRONIZED_FRAME_END}`);
     await flush();
     expect(requestRender).toHaveBeenCalled();
 
@@ -267,10 +269,14 @@ describe("EmbeddedHunk presentation state", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(component.render(100)[0]).toContain("Starting Hunk");
 
-    // Ensure detection survives the synchronized-frame marker being split
-    // across native PTY chunks.
+    // Ensure both boundaries survive being split across native PTY chunks, and
+    // keep the placeholder visible until the frame is complete.
     onData("\x1b[?20");
     onData("26hfirst-frame");
+    await Promise.resolve();
+    expect(component.render(100)[0]).toContain("Starting Hunk");
+    onData("\x1b[?20");
+    onData("26l");
     await Promise.resolve();
     expect(component.render(100).join("\n")).toContain("first-frame");
     component.dispose();
@@ -298,6 +304,44 @@ describe("EmbeddedHunk presentation state", () => {
       expect(component.render(100)[0]).toContain("Starting Hunk");
       await vi.advanceTimersByTimeAsync(1);
       expect(component.render(100).join("\n")).toContain("future-renderer-without-sync-marker");
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails an unterminated synchronized startup frame at the configured deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const done = vi.fn();
+      const tui = {
+        terminal: { columns: 100, rows: 40, write: vi.fn() },
+        requestRender: vi.fn(),
+      } as unknown as TUI;
+      const component = new EmbeddedHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done,
+        initialRows: 10,
+        startupFrameDeadlineMs: 250,
+      });
+      const onDataCalls = pty.onData.mock.calls as unknown as Array<[(data: string) => void]>;
+
+      // Capability output first arms the no-sync fallback. A real sync begin must
+      // cancel that fallback, restore the hard deadline, and remain hidden until
+      // its matching end marker arrives.
+      onDataCalls[0][0]("capability-prelude");
+      onDataCalls[0][0](`${SYNCHRONIZED_FRAME_START}partial-frame`);
+
+      await vi.advanceTimersByTimeAsync(249);
+      expect(done).not.toHaveBeenCalled();
+      expect(component.render(100)[0]).toContain("Starting Hunk");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(done).toHaveBeenCalledOnce();
+      expect(done).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 124 }));
+      expect(pty.dispose).toHaveBeenCalledOnce();
       component.dispose();
     } finally {
       vi.useRealTimers();
@@ -364,7 +408,9 @@ describe("EmbeddedHunk presentation state", () => {
       [(event: { exitCode: number; signal?: number }) => void]
     >;
 
-    onDataCalls[0][0]("\x1b[?2026hfatal: boom\r\nretry with --repo\r\n");
+    onDataCalls[0][0](
+      `${SYNCHRONIZED_FRAME_START}fatal: boom\r\nretry with --repo\r\n${SYNCHRONIZED_FRAME_END}`,
+    );
     onExitCalls[0][0]({ exitCode: 2, signal: 0 });
 
     expect(done).toHaveBeenCalledWith(
@@ -443,7 +489,7 @@ describe("EmbeddedHunk presentation state", () => {
     const onData = onDataCalls[0][0];
 
     // Open the one-time startup paint gate before measuring normal frame coalescing.
-    onData("\x1b[?2026hboot\r\n");
+    onData(`${SYNCHRONIZED_FRAME_START}boot\r\n${SYNCHRONIZED_FRAME_END}`);
     await Promise.resolve();
     requestRender.mockClear();
 
@@ -463,6 +509,46 @@ describe("EmbeddedHunk presentation state", () => {
     expect(requestRender).not.toHaveBeenCalled();
     component.setVisible(true);
     expect(requestRender).toHaveBeenCalledTimes(1);
+    component.dispose();
+  });
+
+  it("keeps the previous complete frame while a synchronized update is split across PTY reads", async () => {
+    const requestRender = vi.fn();
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender,
+    } as unknown as TUI;
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff", "--watch"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+      initialRows: 10,
+    });
+    const onDataCalls = pty.onData.mock.calls as unknown as Array<
+      [(data: string | Uint8Array) => void]
+    >;
+    const onData = onDataCalls[0][0];
+
+    onData(`${SYNCHRONIZED_FRAME_START}frame-one${SYNCHRONIZED_FRAME_END}`);
+    await Promise.resolve();
+    const firstFrame = component.render(100);
+    expect(firstFrame.join("\n")).toContain("frame-one");
+
+    requestRender.mockClear();
+    onData(`${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Hframe-two-partial`);
+    await Promise.resolve();
+
+    // Pi itself may render after the wheel input. That render must remain cheap
+    // and must not expose the partially applied child frame.
+    expect(requestRender).not.toHaveBeenCalled();
+    expect(component.render(100)).toEqual(firstFrame);
+
+    onData(new TextEncoder().encode(`-complete${SYNCHRONIZED_FRAME_END}`));
+    await Promise.resolve();
+    expect(requestRender).toHaveBeenCalledTimes(1);
+    expect(component.render(100).join("\n")).toContain("frame-two-partial-complete");
     component.dispose();
   });
 

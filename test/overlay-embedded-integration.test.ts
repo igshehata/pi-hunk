@@ -157,7 +157,7 @@ describe("critical surface + embedded Hunk integration", () => {
     onData("\x1b[?2031h\x1b]10;?\x07\x1b]11;?\x07\x1b[?2026$p\x1b[6n");
     expect(harness.mounted!.render(100)[0]).toContain("Starting Hunk");
 
-    onData("\x1b[?2026h\x1b[1;1Hready");
+    onData("\x1b[?2026h\x1b[1;1Hready\x1b[?2026l");
     await Promise.resolve();
     expect(harness.mounted!.render(100).join("\n")).toContain("ready");
     await surface.close();
