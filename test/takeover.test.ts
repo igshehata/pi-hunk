@@ -671,6 +671,52 @@ describe("TakeoverHunk", () => {
     expect(tuiStart).toHaveBeenCalledOnce();
   });
 
+  it("suspends startup timeouts while hidden and grants a fresh deadline on resume", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui } = makeTui();
+      const done = vi.fn();
+      const raw = makeRawInputSource();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done,
+        rawInputSource: raw.source,
+        startupFrameDeadlineMs: 25,
+      });
+
+      const onData = (
+        pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+      )[0]![0];
+      expect(raw.active()).toBe(true);
+      onData("pre-hide-partial-output");
+      vi.advanceTimersByTime(10);
+      component.setVisible(false);
+      expect(raw.active()).toBe(false);
+
+      vi.advanceTimersByTime(1_000);
+      expect(done).not.toHaveBeenCalled();
+      expect(pty.dispose).not.toHaveBeenCalled();
+
+      component.setVisible(true);
+      expect(raw.source.acquire).toHaveBeenCalledTimes(2);
+      expect(raw.active()).toBe(true);
+      vi.advanceTimersByTime(24);
+      expect(done).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+
+      expect(done).toHaveBeenCalledOnce();
+      expect(done).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 124 }));
+      expect(raw.active()).toBe(false);
+      expect(pty.dispose).toHaveBeenCalledOnce();
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("leaves, redraws, completes, and disposes exactly once on startup timeout", () => {
     vi.useFakeTimers();
     try {

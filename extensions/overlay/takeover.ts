@@ -229,6 +229,9 @@ export class TakeoverHunk implements Component, Focusable {
       // Re-entry clears the alternate screen. Force an actual resize transition
       // when geometry is unchanged so Hunk redraws without waiting for input.
       this.syncPtyGeometry(true);
+      // Startup has a fresh bounded negotiation lease on every presentation.
+      // Arm after resize because a synchronous redraw can make the gate ready.
+      this.armStartupDeadline();
       return;
     }
     if (!visible && this.presentation === "active") {
@@ -238,7 +241,9 @@ export class TakeoverHunk implements Component, Focusable {
       this.resetPtyDecoder();
       if (!this.startupGate.ready) {
         this.startupGate.reset();
-        this.clearStartupFallback();
+        // Hidden output is discarded, so neither the quiet fallback nor the
+        // hard deadline may consume startup time outside this presentation.
+        this.clearStartupTimers();
       }
       this.leaveTakeover({ restorePi: true });
     }
@@ -611,7 +616,13 @@ export class TakeoverHunk implements Component, Focusable {
     this.clearStartupDeadline();
     this.startupDeadlineTimer = setTimeout(() => {
       this.startupDeadlineTimer = undefined;
-      if (this.lifecycle !== "running" || this.startupGate.ready) return;
+      if (
+        this.lifecycle !== "running" ||
+        this.presentation !== "active" ||
+        this.startupGate.ready
+      ) {
+        return;
+      }
       this.complete(
         {
           exitCode: STARTUP_TIMEOUT_EXIT_CODE,

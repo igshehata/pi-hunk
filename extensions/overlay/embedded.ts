@@ -4,7 +4,8 @@ import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import type { Component, Focusable, KeyId, TUI } from "@earendil-works/pi-tui";
 import { MouseInputTranslator, toPtyInput, type MouseViewport } from "./input.ts";
 import { type OverlayPty, type PtySubscription, spawnOverlayPty } from "./pty.ts";
-import { renderGhosttyHtml, resizeRenderedLines } from "./render-buffer.ts";
+import { paintTerminalCursor, renderGhosttyHtml, resizeRenderedLines } from "./render-buffer.ts";
+import type { TerminalCursor } from "./render-buffer.ts";
 import type { ExclusiveFrameController, HunkDirectFrame } from "./exclusive-frame.ts";
 
 // Hunk enables mouse reporting inside the child PTY. Mirror it to Pi's real
@@ -182,7 +183,10 @@ export class EmbeddedHunk implements Component, Focusable {
   private renderedGeneration = -1;
   private renderedColumns = 0;
   private renderedRows = 0;
+  /** Cursor-free complete snapshot; focus-time cursor paint is derived from this cache. */
   private renderedLines: string[] | undefined;
+  /** Cursor state captured with renderedLines, never from an open partial frame. */
+  private renderedCursor: TerminalCursor | undefined;
 
   get pid(): number | undefined {
     return this.pty.pid;
@@ -201,6 +205,17 @@ export class EmbeddedHunk implements Component, Focusable {
     // Revoke direct terminal ownership before focus-driven cursor/mouse writes.
     this.exclusiveFrame?.setFocused(value);
     this.updateMouseMode();
+    // Float/embed cursor composition is focus-dependent. Repaint directly from
+    // the last complete snapshot; renderCurrentLines deliberately refuses to
+    // recapture native state while a synchronized child frame is open.
+    if (
+      !this.exclusiveFrame &&
+      this.isVisibleState() &&
+      this.isRunning() &&
+      this.startupState === "ready"
+    ) {
+      this.tui.requestRender();
+    }
   }
 
   private isRunning(): boolean {
@@ -393,7 +408,7 @@ export class EmbeddedHunk implements Component, Focusable {
         this.renderedColumns === this.columns &&
         this.renderedRows === this.rows
       ) {
-        return this.renderedLines;
+        return this.composeRenderedLines();
       }
       // Startup is a one-way gate. If an unusual renderer opens a synchronized
       // frame immediately after fallback readiness but before its first Pi paint,
@@ -406,14 +421,14 @@ export class EmbeddedHunk implements Component, Focusable {
       this.renderedColumns === this.columns &&
       this.renderedRows === this.rows
     ) {
-      return this.renderedLines;
+      return this.composeRenderedLines();
     }
 
     this.renderedLines = this.captureRenderedLines();
     this.renderedGeneration = this.contentGeneration;
     this.renderedColumns = this.columns;
     this.renderedRows = this.rows;
-    return this.renderedLines;
+    return this.composeRenderedLines();
   }
 
   private directFrame(lines = this.renderCurrentLines()): HunkDirectFrame {
@@ -575,15 +590,35 @@ export class EmbeddedHunk implements Component, Focusable {
     // Exclusive split rendering retains its existing direct-frame behavior; the
     // synthetic cursor is only part of float/embed composition.
     if (this.exclusiveFrame) {
+      this.renderedCursor = undefined;
       return renderGhosttyHtml(this.formatTerminalHtml(), this.columns, this.rows);
     }
     const snapshot = this.terminal.snapshot();
     const html = this.formatTerminalHtml();
-    return renderGhosttyHtml(html, this.columns, this.rows, {
+    this.renderedCursor = {
       visible: this.childCursorVisible,
       row: snapshot.cursorRow,
       column: snapshot.cursorCol,
-    });
+    };
+    return renderGhosttyHtml(html, this.columns, this.rows);
+  }
+
+  /** Apply focus-only cursor styling without mutating the complete-frame cache. */
+  private composeRenderedLines(): string[] {
+    const lines = this.renderedLines ?? [];
+    const cursor = this.renderedCursor;
+    if (
+      this.exclusiveFrame ||
+      !this.isFocused() ||
+      !cursor?.visible ||
+      cursor.row < 0 ||
+      cursor.row >= lines.length
+    ) {
+      return lines;
+    }
+    const composed = lines.slice();
+    composed[cursor.row] = paintTerminalCursor(composed[cursor.row]!, cursor.column);
+    return composed;
   }
 
   private publishCompletedFrame(): number {

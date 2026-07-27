@@ -513,7 +513,7 @@ describe("EmbeddedHunk presentation state", () => {
     component.dispose();
   });
 
-  it("paints the libghostty cursor into a styled addressed cell in float composition", async () => {
+  it("repaints the synthetic cursor on focus and blur in float composition", async () => {
     const tui = {
       terminal: { columns: 8, rows: 3, write: vi.fn() },
       requestRender: vi.fn(),
@@ -534,15 +534,25 @@ describe("EmbeddedHunk presentation state", () => {
         `\x1b[38;2;12;34;56mabc\x1b[0m\x1b[1;2H${SYNCHRONIZED_FRAME_END}`,
     );
     await Promise.resolve();
-    const [line] = component.render(8);
+    const [unfocused] = component.render(8);
+    expect(unfocused).not.toContain("\x1b[7m");
 
-    expect(line).toContain("a\x1b[7mb\x1b[27mc");
-    expect(line!.replace(ANSI, "")).toBe("abc     ");
-    expect(visibleWidth(line!)).toBe(8);
+    (tui.requestRender as ReturnType<typeof vi.fn>).mockClear();
+    component.focused = true;
+    expect(tui.requestRender).toHaveBeenCalledOnce();
+    const [focused] = component.render(8);
+    expect(focused).toContain("a\x1b[7mb\x1b[27mc");
+    expect(focused!.replace(ANSI, "")).toBe("abc     ");
+    expect(visibleWidth(focused!)).toBe(8);
+
+    (tui.requestRender as ReturnType<typeof vi.fn>).mockClear();
+    component.focused = false;
+    expect(tui.requestRender).toHaveBeenCalledOnce();
+    expect(component.render(8)[0]).not.toContain("\x1b[7m");
     component.dispose();
   });
 
-  it("honors split DECTCEM changes and retains complete-frame cursor metadata", async () => {
+  it("honors split DECTCEM and keeps complete cursor metadata across mid-frame focus", async () => {
     const tui = {
       terminal: { columns: 8, rows: 3, write: vi.fn() },
       requestRender: vi.fn(),
@@ -556,6 +566,7 @@ describe("EmbeddedHunk presentation state", () => {
       initialRows: 3,
     });
     component.render(8);
+    component.focused = true;
     const onData = (pty.onData.mock.calls as unknown as Array<[(data: string) => void]>)[0][0];
 
     onData(`${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Habc\x1b[1;2H\x1b[?2`);
@@ -573,6 +584,20 @@ describe("EmbeddedHunk presentation state", () => {
     expect(published).toContain("a\x1b[7mb\x1b[27m");
     expect(published).not.toContain("partial");
     expect(visibleWidth(published)).toBe(8);
+
+    (tui.requestRender as ReturnType<typeof vi.fn>).mockClear();
+    component.focused = false;
+    expect(tui.requestRender).toHaveBeenCalledOnce();
+    const blurredDuringPartial = component.render(8)[0]!;
+    expect(blurredDuringPartial).not.toContain("\x1b[7m");
+    expect(blurredDuringPartial).toContain("abc");
+    expect(blurredDuringPartial).not.toContain("partial");
+
+    component.focused = true;
+    expect(tui.requestRender).toHaveBeenCalledTimes(2);
+    const refocusedDuringPartial = component.render(8)[0]!;
+    expect(refocusedDuringPartial).toContain("a\x1b[7mb\x1b[27m");
+    expect(refocusedDuringPartial).not.toContain("partial");
 
     const resized = component.render(6)[0]!;
     expect(resized).toContain("a\x1b[7mb\x1b[27m");
