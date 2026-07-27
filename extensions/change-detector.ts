@@ -334,6 +334,11 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
         i += 1;
         continue;
       }
+      // GNU env treats a lone "-" as -i (ignore environment).
+      if (word === "-") {
+        i += 1;
+        continue;
+      }
       if (word.startsWith("--")) {
         const equalsIndex = word.indexOf("=");
         const flag = equalsIndex === -1 ? word : word.slice(0, equalsIndex);

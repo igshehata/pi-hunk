@@ -75,7 +75,7 @@ describe("zigpty overlay adapter", () => {
       );
       expect(probe).toHaveBeenCalledTimes(2);
       expect(pause).toHaveBeenCalledOnce();
-      expect(pause).toHaveBeenCalledWith(2);
+      expect(pause).toHaveBeenCalledWith(5);
     });
 
     it("bounds retries while the owned child remains in its inherited group", () => {
@@ -85,21 +85,38 @@ describe("zigpty overlay adapter", () => {
       expect(
         __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause),
       ).toBeUndefined();
-      expect(probe).toHaveBeenCalledTimes(3);
-      expect(pause).toHaveBeenCalledTimes(2);
-      expect(pause).toHaveBeenNthCalledWith(1, 2);
-      expect(pause).toHaveBeenNthCalledWith(2, 2);
+      expect(probe).toHaveBeenCalledTimes(8);
+      expect(pause).toHaveBeenCalledTimes(7);
+      expect(pause).toHaveBeenNthCalledWith(1, 5);
+      expect(pause).toHaveBeenNthCalledWith(7, 5);
+    });
+
+    it("retries transient probe failures while the owned child is still alive", () => {
+      const observations = [undefined, { parentProcessId, processGroupId: pid }];
+      const probe = vi.fn(() => observations.shift());
+      const pause = vi.fn();
+      const isAlive = vi.fn(() => true);
+
+      expect(
+        __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause, isAlive),
+      ).toBe(pid);
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(isAlive).toHaveBeenCalledWith(pid);
+      expect(pause).toHaveBeenCalledOnce();
+      expect(pause).toHaveBeenCalledWith(5);
     });
 
     it("stops without authorization when the owned child disappears during retry", () => {
       const observations = [{ parentProcessId, processGroupId: inheritedGroup }, undefined];
       const probe = vi.fn(() => observations.shift());
       const pause = vi.fn();
+      const isAlive = vi.fn(() => false);
 
       expect(
-        __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause),
+        __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause, isAlive),
       ).toBeUndefined();
       expect(probe).toHaveBeenCalledTimes(2);
+      expect(isAlive).toHaveBeenCalledWith(pid);
       expect(pause).toHaveBeenCalledOnce();
     });
 

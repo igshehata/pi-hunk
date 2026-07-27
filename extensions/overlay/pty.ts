@@ -51,9 +51,11 @@ interface ZigPtyBackend {
 
 const backend: ZigPtyBackend = { hasNative, spawn };
 const DEFAULT_SHUTDOWN_GRACE_MS = 500;
-const PROCESS_GROUP_CAPTURE_ATTEMPTS = 3;
-const PROCESS_GROUP_CAPTURE_RETRY_MS = 2;
-const PROCESS_GROUP_PROBE_TIMEOUT_MS = 50;
+// forkpty children briefly inherit the parent's group before setsid/login_tty.
+// Keep the window short, but wide enough for loaded CI hosts and slow `ps`.
+const PROCESS_GROUP_CAPTURE_ATTEMPTS = 8;
+const PROCESS_GROUP_CAPTURE_RETRY_MS = 5;
+const PROCESS_GROUP_PROBE_TIMEOUT_MS = 100;
 
 interface PosixProcessObservation {
   parentProcessId: number;
@@ -234,22 +236,44 @@ function pauseForProcessGroupRetry(durationMs: number): void {
   }
 }
 
+function posixProcessAppearsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: unknown }).code === "EPERM"
+    );
+  }
+}
+
 /** @internal Exported only for deterministic ownership-probe regression tests. */
 export function __captureOwnedPosixProcessGroupFromProbe(
   pid: number,
   expectedParentProcessId: number,
   probe: () => PosixProcessObservation | undefined,
   pause: (durationMs: number) => void,
+  isAlive: (pid: number) => boolean = posixProcessAppearsAlive,
 ): number | undefined {
   for (let attempt = 0; attempt < PROCESS_GROUP_CAPTURE_ATTEMPTS; attempt += 1) {
     const observation = probe();
-    // A missing child or changed parent may mean the pid exited and was reused.
-    // Never continue probing, let alone authorize negative-pid signalling.
-    if (!observation || observation.parentProcessId !== expectedParentProcessId) return undefined;
-    if (observation.processGroupId === pid) return pid;
+    if (observation) {
+      // A changed parent may mean the pid exited and was reused. Never continue
+      // probing, let alone authorize negative-pid signalling.
+      if (observation.parentProcessId !== expectedParentProcessId) return undefined;
+      if (observation.processGroupId === pid) return pid;
+      // Still our child, but still in the inherited group: retry.
+    } else if (!isAlive(pid)) {
+      // Probe failure with a dead pid: stop. A live pid with a failed probe is
+      // treated as retryable (loaded hosts can time out `ps` transiently).
+      return undefined;
+    }
 
-    // The only retryable state is our still-owned forkpty child before it has
-    // made itself the terminal process-group leader.
+    // Retry while the forkpty child is still ours and either has not become
+    // the terminal process-group leader yet or the ownership probe failed.
     if (attempt + 1 < PROCESS_GROUP_CAPTURE_ATTEMPTS) pause(PROCESS_GROUP_CAPTURE_RETRY_MS);
   }
   return undefined;
@@ -333,8 +357,8 @@ export function spawnOverlayPty(
   // Only the installed native zigpty backend carries the forkpty ownership
   // invariant. Injectable/fake backends may expose arbitrary pids and must
   // never authorize process-group signalling.
-  const ownedProcessGroup =
-    implementation === backend ? captureOwnedPosixProcessGroup(pid) : undefined;
+  const canOwnProcessGroup = implementation === backend;
+  let ownedProcessGroup = canOwnProcessGroup ? captureOwnedPosixProcessGroup(pid) : undefined;
   const shutdownGraceMs = Math.max(0, options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS);
   const exitListeners = new Set<{
     active: boolean;
@@ -346,6 +370,13 @@ export function spawnOverlayPty(
   let escalationTimer: ReturnType<typeof setTimeout> | undefined;
 
   const backendHasExited = () => exited || (pty.exitCode !== undefined && pty.exitCode !== null);
+  // Dispose often runs long after the forkpty setsid race. If spawn-time capture
+  // failed, re-probe once before signalling so descendants still get group kills.
+  const resolveOwnedProcessGroup = (): number | undefined => {
+    if (ownedProcessGroup !== undefined || !canOwnProcessGroup) return ownedProcessGroup;
+    ownedProcessGroup = captureOwnedPosixProcessGroup(pid);
+    return ownedProcessGroup;
+  };
   const clearEscalation = () => {
     if (!escalationTimer) return;
     clearTimeout(escalationTimer);
@@ -386,8 +417,9 @@ export function spawnOverlayPty(
   } catch (error) {
     // spawn() already transferred ownership to us. If listener setup fails,
     // no adapter is returned to dispose it later, so cleanup must be immediate.
-    if (ownedProcessGroup !== undefined) {
-      signalOwnedPosixProcessGroup(ownedProcessGroup, "SIGKILL");
+    const group = resolveOwnedProcessGroup();
+    if (group !== undefined) {
+      signalOwnedPosixProcessGroup(group, "SIGKILL");
     } else {
       try {
         pty.kill("SIGKILL");
@@ -405,13 +437,14 @@ export function spawnOverlayPty(
 
   const forceClose = () => {
     escalationTimer = undefined;
-    const groupAlive = ownedPosixProcessGroupIsAlive(ownedProcessGroup);
+    const group = resolveOwnedProcessGroup();
+    const groupAlive = ownedPosixProcessGroupIsAlive(group);
     if (!groupAlive && backendHasExited()) return;
-    if (groupAlive && ownedProcessGroup !== undefined) {
+    if (groupAlive && group !== undefined) {
       // A process-group ID cannot be reused while any member of that group
       // remains, so the captured leader-owned group still identifies only this
       // PTY tree even when the leader itself exited during the TERM window.
-      signalOwnedPosixProcessGroup(ownedProcessGroup, "SIGKILL");
+      signalOwnedPosixProcessGroup(group, "SIGKILL");
     } else {
       try {
         pty.kill("SIGKILL");
@@ -467,7 +500,8 @@ export function spawnOverlayPty(
     dispose: () => {
       if (disposed) return;
       disposed = true;
-      const groupAlive = ownedPosixProcessGroupIsAlive(ownedProcessGroup);
+      const group = resolveOwnedProcessGroup();
+      const groupAlive = ownedPosixProcessGroupIsAlive(group);
       if (backendHasExited() && !groupAlive) return;
       // Preserve Windows' previous default-kill behavior. A verified native
       // POSIX PTY group gets the bounded TERM→KILL sequence as one owned unit;
@@ -476,8 +510,8 @@ export function spawnOverlayPty(
         pty.kill();
         return;
       }
-      if (groupAlive && ownedProcessGroup !== undefined) {
-        signalOwnedPosixProcessGroup(ownedProcessGroup, "SIGTERM");
+      if (groupAlive && group !== undefined) {
+        signalOwnedPosixProcessGroup(group, "SIGTERM");
       } else {
         try {
           pty.kill("SIGTERM");
@@ -485,7 +519,7 @@ export function spawnOverlayPty(
           if (backendHasExited()) return;
         }
       }
-      if (ownedPosixProcessGroupIsAlive(ownedProcessGroup) || !backendHasExited()) armEscalation();
+      if (ownedPosixProcessGroupIsAlive(group) || !backendHasExited()) armEscalation();
     },
   };
 }

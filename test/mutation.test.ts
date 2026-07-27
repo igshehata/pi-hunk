@@ -46,6 +46,8 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: "dash -c 'rm -rf build'" })).toBe(true);
     expect(isMutation("bash", { command: "env FOO=1 bash -lc 'touch generated.ts'" })).toBe(true);
     expect(isMutation("bash", { command: "env -i PATH=/usr/bin bash -c 'mkdir out'" })).toBe(true);
+    // GNU env: a mere "-" implies -i and must not stop option peeling.
+    expect(isMutation("bash", { command: "env - bash -c 'touch generated.ts'" })).toBe(true);
     expect(isMutation("bash", { command: "env -iu FOO bash -c 'touch generated.ts'" })).toBe(true);
     expect(isMutation("bash", { command: "FOO=1 bash -c 'touch generated.ts'" })).toBe(true);
     expect(isMutation("bash", { command: "env FOO=1 touch generated.ts" })).toBe(true);
