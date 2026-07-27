@@ -2,5 +2,5 @@
 "pi-hunk": patch
 ---
 
-Reduce embedded Hunk frame-conversion and split-reflow overhead, and require Hunk 0.17.6 or newer to
-avoid known startup regressions.
+Make floating and side-by-side reviews smoother and require Hunk 0.17.6 or newer for reliable
+startup.
