@@ -2,9 +2,9 @@ import { createTerminal } from "@coder/libghostty-vt-node";
 import type { GhosttyVtTerminal } from "@coder/libghostty-vt-node";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import type { Component, Focusable, KeyId, TUI } from "@earendil-works/pi-tui";
-import { toPtyInput, translateMouseInput, type MouseViewport } from "./input.ts";
+import { MouseInputTranslator, toPtyInput, type MouseViewport } from "./input.ts";
 import { type OverlayPty, type PtySubscription, spawnOverlayPty } from "./pty.ts";
-import { renderGhosttyHtml } from "./render-buffer.ts";
+import { renderGhosttyHtml, resizeRenderedLines } from "./render-buffer.ts";
 import type { ExclusiveFrameController, HunkDirectFrame } from "./exclusive-frame.ts";
 
 // Hunk enables mouse reporting inside the child PTY. Mirror it to Pi's real
@@ -101,6 +101,8 @@ export interface EmbeddedOptions {
   cwd: string;
   tui: TUI;
   done: (result: HunkExit) => void;
+  /** Initial allocated column count (overlay width). Defaults to terminal columns. */
+  initialColumns?: number;
   /** Initial allocated row count (overlay max height). Defaults to terminal rows. */
   initialRows?: number;
   /** Resolve allocated rows again when the physical terminal is resized. */
@@ -147,6 +149,7 @@ export class EmbeddedHunk implements Component, Focusable {
   private readonly onShowRequest?: () => void;
   private readonly exclusiveFrame?: ExclusiveFrameController;
   private readonly startupFrameDeadlineMs: number;
+  private readonly mouseInput = new MouseInputTranslator();
   private prefixPending = false;
   private columns: number;
   private rows: number;
@@ -158,12 +161,24 @@ export class EmbeddedHunk implements Component, Focusable {
   private synchronizedFrameMarkerLength = 0;
   /** True between matching 2026h and 2026l; previous complete frame stays published. */
   private synchronizedFrameOpen = false;
+  /**
+   * The installed wrapper snapshot exposes cursor coordinates but not DECTCEM.
+   * Track mode 25 from the same fed byte ranges until the binding exposes it.
+   */
+  private childCursorVisible = true;
+  private cursorControlState: "ground" | "escape" | "csi" = "ground";
+  private cursorCsiParameters = "";
+  private cursorCsiValid = true;
   private startupTimer: ReturnType<typeof setTimeout> | undefined;
   private startupDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private mouseState: "enabled" | "disabled" = "disabled";
   private generation = 0;
   private renderQueued = false;
+  /** Completed-frame revision which may render even if a newer synchronized frame is open. */
+  private renderQueuedFrameRevision: number | undefined;
   private contentGeneration = 0;
+  /** Monotonic publication event for synchronously captured complete DEC 2026 frames. */
+  private publishedFrameRevision = 0;
   private renderedGeneration = -1;
   private renderedColumns = 0;
   private renderedRows = 0;
@@ -235,7 +250,7 @@ export class EmbeddedHunk implements Component, Focusable {
       0,
       options.startupFrameDeadlineMs ?? DEFAULT_STARTUP_FRAME_DEADLINE_MS,
     );
-    this.columns = Math.max(1, options.tui.terminal.columns);
+    this.columns = Math.max(1, options.initialColumns ?? options.tui.terminal.columns);
     this.rows = Math.max(1, options.initialRows ?? options.tui.terminal.rows);
     this.terminal = createTerminal({
       cols: this.columns,
@@ -272,19 +287,22 @@ export class EmbeddedHunk implements Component, Focusable {
     this.subscriptions.push(
       this.pty.onData((data) => {
         if (!this.isRunning() || gen !== this.generation) return;
-        const synchronizedFrame = this.observeSynchronizedFrameOutput(data);
+        // Feed through each completed boundary separately. A chunk may end frame
+        // N and begin frame N+1; frame N must be captured before N+1 mutates the
+        // native terminal buffer.
+        const synchronizedFrame = this.processSynchronizedFrameOutput(data);
         // Avoid exposing OpenTUI's capability-probe prelude between the startup
         // placeholder and its first complete synchronized frame.
         if (this.startupState !== "ready") this.observeStartupOutput(synchronizedFrame);
-        // libghostty parses synchronously. Keep the native terminal current while
-        // hidden, but do not repaint until the overlay is shown again. While a
-        // DEC 2026 frame is open, retain the previously published snapshot: a real
-        // terminal would also keep displaying the previous complete frame.
-        this.terminal.feed(data);
-        this.contentGeneration += 1;
-        if (!this.synchronizedFrameOpen) this.renderedLines = undefined;
-        if (this.isVisibleState() && this.startupState === "ready" && !this.synchronizedFrameOpen) {
-          this.requestFrame();
+        // Keep the native terminal current while hidden, but only notify a visible
+        // consumer of complete frames. A completion is a publication event even
+        // when the final state of this PTY chunk is another open frame.
+        if (this.isVisibleState() && this.startupState === "ready") {
+          if (synchronizedFrame.publishedRevision !== undefined) {
+            this.requestFrame(synchronizedFrame.publishedRevision);
+          } else if (!this.synchronizedFrameOpen) {
+            this.requestFrame();
+          }
         }
       }),
       this.pty.onExit((event) => {
@@ -303,6 +321,7 @@ export class EmbeddedHunk implements Component, Focusable {
    * Call before/after OverlayHandle.setHidden so mouse state stays in lockstep.
    */
   setVisible(visible: boolean): void {
+    if (!visible) this.mouseInput.reset();
     const event: PresentationEvent = visible ? "show" : "hide";
     const next = PRESENTATION_TRANSITIONS[this.presentationState][event];
     if (next === this.presentationState) return;
@@ -343,7 +362,7 @@ export class EmbeddedHunk implements Component, Focusable {
         this.columns,
         this.rows,
       );
-      translated = translateMouseInput(translated, viewport);
+      translated = this.mouseInput.translate(translated, viewport);
     }
     if (translated) this.pty.write(translated);
     this.exclusiveFrame?.armPostInputRenderSuppression();
@@ -376,8 +395,10 @@ export class EmbeddedHunk implements Component, Focusable {
       ) {
         return this.renderedLines;
       }
-      const message = "Starting Hunk…";
-      return [message, ...Array.from({ length: Math.max(0, this.rows - 1) }, () => "")];
+      // Startup is a one-way gate. If an unusual renderer opens a synchronized
+      // frame immediately after fallback readiness but before its first Pi paint,
+      // never repurpose the startup placeholder as ordinary ready-state content.
+      return resizeRenderedLines([], this.columns, this.rows);
     }
     if (
       this.renderedLines &&
@@ -388,8 +409,7 @@ export class EmbeddedHunk implements Component, Focusable {
       return this.renderedLines;
     }
 
-    const html = this.formatTerminalHtml();
-    this.renderedLines = renderGhosttyHtml(html, this.columns, this.rows);
+    this.renderedLines = this.captureRenderedLines();
     this.renderedGeneration = this.contentGeneration;
     this.renderedColumns = this.columns;
     this.renderedRows = this.rows;
@@ -415,7 +435,9 @@ export class EmbeddedHunk implements Component, Focusable {
 
   invalidate(): void {
     this.exclusiveFrame?.revoke("component-invalidated");
-    if (!this.synchronizedFrameOpen) this.renderedLines = undefined;
+    // Force a refresh when it is safe, but retain the last complete snapshot in
+    // case a synchronized update opens before Pi performs that refresh.
+    this.renderedGeneration = -1;
     this.tui.requestRender();
   }
 
@@ -424,6 +446,7 @@ export class EmbeddedHunk implements Component, Focusable {
     this.transitionLifecycle("dispose");
     this.transitionStartup("dispose");
     this.exclusiveFrame?.revoke("component-disposed");
+    this.mouseInput.reset();
     this.generation += 1;
     this.clearStartupTimers();
     this.setMouseEnabled(false);
@@ -436,25 +459,31 @@ export class EmbeddedHunk implements Component, Focusable {
       }
     }
     this.renderQueued = false;
+    this.renderQueuedFrameRevision = undefined;
     for (const subscription of this.subscriptions) subscription.dispose();
     this.subscriptions.length = 0;
     this.terminal.dispose();
   }
 
   /**
-   * Track DEC synchronized-update boundaries without decoding/copying PTY chunks.
+   * Track DEC synchronized-update boundaries while feeding the native parser.
    * The prefix matcher is carried across reads because zigpty may split either
    * boundary at any byte. Capability query `ESC[?2026$p` never ends with h/l so
    * it does not open or close a frame.
+   *
+   * Each matching end is fed and snapshotted before any later bytes are fed. This
+   * makes completion an explicit publication revision rather than an inference
+   * from the final open/closed state of the whole PTY chunk.
    */
-  private observeSynchronizedFrameOutput(data: string | Uint8Array): {
+  private processSynchronizedFrameOutput(data: string | Uint8Array): {
     started: boolean;
-    ended: boolean;
+    publishedRevision: number | undefined;
   } {
     let markerLength = this.synchronizedFrameMarkerLength;
     let frameOpen = this.synchronizedFrameOpen;
     let frameStarted = false;
-    let frameEnded = false;
+    let publishedRevision: number | undefined;
+    let feedStart = 0;
 
     for (let index = 0; index < data.length; index++) {
       const byte = typeof data === "string" ? data.charCodeAt(index) : data[index]!;
@@ -472,19 +501,105 @@ export class EmbeddedHunk implements Component, Focusable {
         frameOpen = true;
         frameStarted = true;
       } else if (byte === SYNCHRONIZED_FRAME_END_FINAL) {
-        if (frameOpen) frameEnded = true;
+        if (frameOpen) {
+          this.feedTerminalRange(data, feedStart, index + 1);
+          feedStart = index + 1;
+          publishedRevision = this.publishCompletedFrame();
+        }
         frameOpen = false;
       }
       markerLength = byte === SYNCHRONIZED_FRAME_ESCAPE ? 1 : 0;
     }
 
+    this.feedTerminalRange(data, feedStart, data.length);
     this.synchronizedFrameMarkerLength = markerLength;
     this.synchronizedFrameOpen = frameOpen;
-    return { started: frameStarted, ended: frameEnded };
+    return { started: frameStarted, publishedRevision };
   }
 
-  private observeStartupOutput(frame: { started: boolean; ended: boolean }): void {
-    if (frame.ended) {
+  private feedTerminalRange(data: string | Uint8Array, start: number, end: number): void {
+    if (start >= end) return;
+    const range = typeof data === "string" ? data.slice(start, end) : data.subarray(start, end);
+    this.terminal.feed(range);
+    this.observeCursorVisibility(range);
+    this.contentGeneration += 1;
+  }
+
+  /** Track DEC private mode 25 across arbitrary PTY chunk/frame boundaries. */
+  private observeCursorVisibility(data: string | Uint8Array): void {
+    for (let index = 0; index < data.length; index++) {
+      const byte = typeof data === "string" ? data.charCodeAt(index) : data[index]!;
+      if (this.cursorControlState === "ground") {
+        if (byte === 0x1b) this.cursorControlState = "escape";
+        else if (byte === 0x9b) this.beginCursorCsi();
+        continue;
+      }
+      if (this.cursorControlState === "escape") {
+        if (byte === 0x5b || byte === 0x9b) this.beginCursorCsi();
+        else this.cursorControlState = byte === 0x1b ? "escape" : "ground";
+        continue;
+      }
+
+      if (byte >= 0x30 && byte <= 0x3f) {
+        if (this.cursorCsiParameters.length < 128) {
+          this.cursorCsiParameters += String.fromCharCode(byte);
+        } else {
+          this.cursorCsiValid = false;
+        }
+      } else if (byte >= 0x20 && byte <= 0x2f) {
+        this.cursorCsiValid = false;
+      } else if (byte >= 0x40 && byte <= 0x7e) {
+        if (
+          this.cursorCsiValid &&
+          (byte === SYNCHRONIZED_FRAME_START_FINAL || byte === SYNCHRONIZED_FRAME_END_FINAL) &&
+          this.cursorCsiParameters.startsWith("?") &&
+          this.cursorCsiParameters.slice(1).split(";").includes("25")
+        ) {
+          this.childCursorVisible = byte === SYNCHRONIZED_FRAME_START_FINAL;
+        }
+        this.cursorControlState = "ground";
+      } else if (byte === 0x1b) {
+        this.cursorControlState = "escape";
+      }
+    }
+  }
+
+  private beginCursorCsi(): void {
+    this.cursorControlState = "csi";
+    this.cursorCsiParameters = "";
+    this.cursorCsiValid = true;
+  }
+
+  /** Capture content and cursor from one synchronously stable libghostty state. */
+  private captureRenderedLines(): string[] {
+    // Exclusive split rendering retains its existing direct-frame behavior; the
+    // synthetic cursor is only part of float/embed composition.
+    if (this.exclusiveFrame) {
+      return renderGhosttyHtml(this.formatTerminalHtml(), this.columns, this.rows);
+    }
+    const snapshot = this.terminal.snapshot();
+    const html = this.formatTerminalHtml();
+    return renderGhosttyHtml(html, this.columns, this.rows, {
+      visible: this.childCursorVisible,
+      row: snapshot.cursorRow,
+      column: snapshot.cursorCol,
+    });
+  }
+
+  private publishCompletedFrame(): number {
+    this.renderedLines = this.captureRenderedLines();
+    this.renderedGeneration = this.contentGeneration;
+    this.renderedColumns = this.columns;
+    this.renderedRows = this.rows;
+    this.publishedFrameRevision += 1;
+    return this.publishedFrameRevision;
+  }
+
+  private observeStartupOutput(frame: {
+    started: boolean;
+    publishedRevision: number | undefined;
+  }): void {
+    if (frame.publishedRevision !== undefined) {
       this.markStartupReady();
       return;
     }
@@ -548,6 +663,14 @@ export class EmbeddedHunk implements Component, Focusable {
     if (this.startupState !== "waiting" && this.startupState !== "fallback") return;
     this.transitionStartup("ready");
     this.clearStartupTimers();
+    // Synchronized completion already publishes atomically. The no-sync
+    // fallback needs the same complete cache before any later frame can open.
+    if (!this.renderedLines && !this.synchronizedFrameOpen) {
+      this.renderedLines = this.captureRenderedLines();
+      this.renderedGeneration = this.contentGeneration;
+      this.renderedColumns = this.columns;
+      this.renderedRows = this.rows;
+    }
   }
 
   private failStartupFrameDeadline(): void {
@@ -572,7 +695,9 @@ export class EmbeddedHunk implements Component, Focusable {
     if (!this.isRunning()) return;
     this.transitionLifecycle("complete");
     this.exclusiveFrame?.revoke("child-completed");
+    this.mouseInput.reset();
     this.renderQueued = false;
+    this.renderQueuedFrameRevision = undefined;
     this.clearStartupTimers();
     this.setMouseEnabled(false);
     try {
@@ -604,26 +729,39 @@ export class EmbeddedHunk implements Component, Focusable {
    * timer. Pi already enforces its own ~16 ms render interval, so another 16 ms
    * timeout here only doubled scrolling latency.
    */
-  private requestFrame(): void {
-    // Never publish while a synchronized child frame is open (exclusive or Pi).
-    if (this.synchronizedFrameOpen) return;
+  private requestFrame(publishedRevision?: number): void {
+    // Ordinary output cannot publish while a synchronized child frame is open.
+    // A captured completion can: renderCurrentLines will use its safe snapshot
+    // even if a following frame has opened before this paint runs.
+    if (this.synchronizedFrameOpen && publishedRevision === undefined) return;
     if (this.exclusiveFrame?.requestDirectPaint(() => this.directFrame())) return;
-    this.scheduleRender();
+    this.scheduleRender(publishedRevision);
   }
 
-  private scheduleRender(): void {
-    if (
-      this.renderQueued ||
-      this.synchronizedFrameOpen ||
-      !this.isVisibleState() ||
-      !this.isRunning()
-    ) {
-      return;
+  private scheduleRender(publishedRevision?: number): void {
+    if (!this.isVisibleState() || !this.isRunning()) return;
+    if (this.synchronizedFrameOpen && publishedRevision === undefined) return;
+    if (publishedRevision !== undefined) {
+      this.renderQueuedFrameRevision = Math.max(
+        this.renderQueuedFrameRevision ?? 0,
+        publishedRevision,
+      );
     }
+    if (this.renderQueued) return;
     this.renderQueued = true;
     queueMicrotask(() => {
+      const queuedFrameRevision = this.renderQueuedFrameRevision;
       this.renderQueued = false;
-      if (!this.synchronizedFrameOpen && this.isVisibleState() && this.isRunning()) {
+      this.renderQueuedFrameRevision = undefined;
+      const hasQueuedSnapshot =
+        queuedFrameRevision !== undefined &&
+        this.publishedFrameRevision >= queuedFrameRevision &&
+        this.renderedLines !== undefined;
+      if (
+        (!this.synchronizedFrameOpen || hasQueuedSnapshot) &&
+        this.isVisibleState() &&
+        this.isRunning()
+      ) {
         this.tui.requestRender();
       }
     });
@@ -653,7 +791,14 @@ export class EmbeddedHunk implements Component, Focusable {
     this.rows = rows;
     this.terminal.resize(columns, rows);
     this.contentGeneration += 1;
-    this.renderedLines = undefined;
+    // Resize the published rows without consulting the native terminal, which
+    // may currently contain a partial synchronized update. Their stale content
+    // generation forces a fresh snapshot once the buffer is safe again.
+    if (this.renderedLines) {
+      this.renderedLines = resizeRenderedLines(this.renderedLines, columns, rows);
+      this.renderedColumns = columns;
+      this.renderedRows = rows;
+    }
     this.pty.resize(columns, rows);
   }
 }

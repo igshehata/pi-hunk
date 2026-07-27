@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -54,6 +54,8 @@ function runner(
   });
   return vi.fn(hunk.run);
 }
+const acceptedDelivery = async (_notes: HunkReviewNote[]) => ({ status: "accepted" as const });
+
 const note = (body = "Fix this\nBecause it breaks", overrides: Record<string, unknown> = {}) => ({
   noteId: "user:1",
   source: "user",
@@ -73,11 +75,16 @@ class FakeCoordinator {
   state: FakeState = "closed";
   pid: number | undefined;
   launchCwd = "/repo";
+  command = "hunk";
+  args: string[] = ["diff", "--watch"];
+  source: "auto" | "live" | "manual" | "shortcut" | "recover" | "handoff" = "handoff";
   repoRoot: string | undefined;
   sessionId: string | undefined;
   stateListeners = new Set<() => void>();
   ensureOpen = vi.fn(async (...args: unknown[]) => {
     this.launchCwd = (args[4] as string | undefined) ?? this.launchCwd;
+    this.args = (args[2] as string[] | undefined) ?? this.args;
+    this.source = (args[3] as typeof this.source | undefined) ?? this.source;
     this.state = "visible";
     this.emit();
   });
@@ -89,9 +96,9 @@ class FakeCoordinator {
       ? null
       : {
           state: this.state,
-          argsKey: JSON.stringify([this.launchCwd, "hunk", "diff"]),
+          argsKey: JSON.stringify([this.launchCwd, this.command, ...this.args]),
           launchCwd: this.launchCwd,
-          source: "handoff" as const,
+          source: this.source,
           pid: this.pid,
           repoRoot: this.repoRoot,
           sessionId: this.sessionId,
@@ -114,11 +121,11 @@ class FakeCoordinator {
   isEarlySurfaceOwnedForRun() {
     return false;
   }
-  async releaseSurfaceForRouting() {
+  releaseSurfaceForRouting = vi.fn(async () => {
     this.state = "closed";
     this.emit();
     return true;
-  }
+  });
   onStateChange(fn: () => void) {
     this.stateListeners.add(fn);
     return () => this.stateListeners.delete(fn);
@@ -188,7 +195,7 @@ describe("fresh Hunk review parsing", () => {
     expect(run).toHaveBeenCalledTimes(3);
   });
 
-  it("declares no-diff only after the bounded empty-frame window", async () => {
+  it("keeps an empty managed registration reviewable after the bounded retry window", async () => {
     const run = runner([], [session({ fileCount: 0, files: [] })]);
     await expect(
       waitForManagedHunkSession({
@@ -197,8 +204,39 @@ describe("fresh Hunk review parsing", () => {
         run,
         retryDelaysMs: [0, 0, 0],
       }),
-    ).resolves.toMatchObject({ status: "no-diff", session: { fileCount: 0 } });
+    ).resolves.toMatchObject({ status: "reviewable", session: { fileCount: 0 } });
     expect(run).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not treat empty frames as terminal no-diff when a later observation has files", async () => {
+    let lookup = 0;
+    // Seven empty registrations exhaust the default retry window; an eighth
+    // non-empty registration must still be reachable because empty is unconfirmed.
+    const empty = session({ fileCount: 0, files: [] });
+    const filled = session({ fileCount: 1, files: [{ path: "src/a.ts" }] });
+    const frames = Array.from({ length: 7 }, () => [empty]).concat([[filled]]);
+    const run = runner([], () => frames[Math.min(lookup++, frames.length - 1)]!);
+
+    await expect(
+      waitForManagedHunkSession({
+        cwd: "/repo",
+        managedPid: 101,
+        run,
+        retryDelaysMs: [0, 0, 0, 0, 0, 0, 0],
+      }),
+    ).resolves.toMatchObject({ status: "reviewable", session: { fileCount: 0 } });
+    expect(run).toHaveBeenCalledTimes(7);
+
+    // A subsequent observation (outside the first bounded window) becomes reviewable.
+    await expect(
+      waitForManagedHunkSession({
+        cwd: "/repo",
+        managedPid: 101,
+        run,
+        retryDelaysMs: [0],
+      }),
+    ).resolves.toMatchObject({ status: "reviewable", session: { fileCount: 1 } });
+    expect(run).toHaveBeenCalledTimes(8);
   });
 
   it("does not report a stale no-diff frame after the managed session disappears", async () => {
@@ -451,16 +489,17 @@ describe("asynchronous Hunk comment handoff", () => {
 
   it("submits unseen comments when any managed surface is hidden", async () => {
     const { gate, coordinator } = setup([note("Found on hide")]);
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    const delivery = vi.fn(acceptedDelivery);
     gate.onLateSubmission(delivery);
 
     coordinator.transition("visible");
     coordinator.transition("hidden");
 
     await vi.waitFor(() => expect(delivery).toHaveBeenCalledOnce());
-    expect(delivery).toHaveBeenCalledWith([
-      expect.objectContaining({ noteId: "user:1", summary: "Found on hide" }),
-    ]);
+    expect(delivery).toHaveBeenCalledWith(
+      [expect.objectContaining({ noteId: "user:1", summary: "Found on hide" })],
+      expect.objectContaining({ epoch: 0, signal: expect.any(AbortSignal) }),
+    );
     expect(coordinator.sessionId).toBe("s1");
     expect(coordinator.repoRoot).toBe("/repo");
   });
@@ -468,7 +507,7 @@ describe("asynchronous Hunk comment handoff", () => {
   it("delivers each note once across repeated hide and restore cycles", async () => {
     let comments: unknown[] = [note("First", { noteId: "user:1" })];
     const { gate, coordinator } = setup(() => comments);
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    const delivery = vi.fn(acceptedDelivery);
     gate.onLateSubmission(delivery);
 
     coordinator.transition("visible");
@@ -492,7 +531,7 @@ describe("asynchronous Hunk comment handoff", () => {
   it("resets submitted-note deduplication at a Pi session boundary", async () => {
     let comments: unknown[] = [note("First session")];
     const { gate, coordinator } = setup(() => comments);
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    const delivery = vi.fn(acceptedDelivery);
     gate.onLateSubmission(delivery);
 
     coordinator.transition("visible");
@@ -510,9 +549,65 @@ describe("asynchronous Hunk comment handoff", () => {
     ]);
   });
 
+  it.each(["success", "failure"] as const)(
+    "quarantines and drains an in-flight old-epoch %s across reset",
+    async (outcome) => {
+      let comments: unknown[] = [note("Old session")];
+      const { gate, coordinator } = setup(() => comments);
+      let resolveOld!: (result: { status: "accepted" }) => void;
+      let rejectOld!: (error: Error) => void;
+      let oldSignal: AbortSignal | undefined;
+      const oldDelivery = vi.fn(
+        (_notes: HunkReviewNote[], context: { epoch: number; signal: AbortSignal }) => {
+          oldSignal = context.signal;
+          return new Promise<{ status: "accepted" }>((resolve, reject) => {
+            resolveOld = resolve;
+            rejectOld = reject;
+          });
+        },
+      );
+      gate.onLateSubmission(oldDelivery);
+
+      coordinator.transition("visible");
+      coordinator.transition("hidden");
+      await vi.waitFor(() => expect(oldDelivery).toHaveBeenCalledOnce());
+
+      const drained = gate.resetSession();
+      expect(drained).toMatchObject({ epoch: 0, abortedInFlight: true });
+      expect(drained.notes).toEqual([
+        expect.objectContaining({ noteId: "user:1", summary: "Old session" }),
+      ]);
+      expect(oldSignal?.aborted).toBe(true);
+
+      if (outcome === "success") resolveOld({ status: "accepted" });
+      else rejectOld(new Error("old context closed"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      // The same Hunk note identity in the new epoch must remain unseen. An old
+      // success must not add to new dedupe, and an old failure must not enqueue
+      // itself for delivery through the replacement handler/context.
+      comments = [note("New session")];
+      const newDelivery = vi.fn(acceptedDelivery);
+      gate.onLateSubmission(newDelivery);
+      coordinator.transition("visible");
+      coordinator.transition("hidden");
+      await vi.waitFor(() => expect(newDelivery).toHaveBeenCalledOnce());
+      expect(newDelivery).toHaveBeenCalledWith(
+        [expect.objectContaining({ noteId: "user:1", summary: "New session" })],
+        expect.objectContaining({ epoch: 1, signal: expect.any(AbortSignal) }),
+      );
+      expect(oldDelivery).toHaveBeenCalledOnce();
+
+      coordinator.transition("visible");
+      coordinator.transition("hidden");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(newDelivery).toHaveBeenCalledOnce();
+    },
+  );
+
   it("treats a comment-free hide as a no-op", async () => {
     const { gate, coordinator } = setup([]);
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    const delivery = vi.fn(acceptedDelivery);
     gate.onLateSubmission(delivery);
 
     coordinator.transition("visible");
@@ -527,6 +622,7 @@ describe("asynchronous Hunk comment handoff", () => {
     const { gate, coordinator, ctx } = setup([note("Retry me")]);
     const delivery = vi.fn(async (_notes: HunkReviewNote[]) => {
       if (delivery.mock.calls.length === 1) throw new Error("Pi is busy");
+      return { status: "accepted" as const };
     });
     gate.onLateSubmission(delivery);
 
@@ -544,6 +640,7 @@ describe("asynchronous Hunk comment handoff", () => {
     const { gate, coordinator, ctx, run } = setup(() => comments);
     const delivery = vi.fn(async (_notes: HunkReviewNote[]) => {
       if (delivery.mock.calls.length === 1) throw new Error("Pi is busy");
+      return { status: "accepted" as const };
     });
     gate.onLateSubmission(delivery);
 
@@ -567,32 +664,74 @@ describe("asynchronous Hunk comment handoff", () => {
     ]);
   });
 
-  it("lets /hunk feedback recover after an automatic comment probe fails", async () => {
-    const { gate, coordinator, ctx, run } = setup([note("Recovered note")]);
-    const implementation = run.getMockImplementation()!;
-    let failedOnce = false;
-    run.mockImplementation(async (argv) => {
-      if (argv.includes("comment") && !failedOnce) {
-        failedOnce = true;
-        throw new Error("temporary Hunk failure");
-      }
-      return implementation(argv);
-    });
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+  it("keeps unconfirmed notes recoverable without an immediate resend loop", async () => {
+    const { gate, coordinator, ctx } = setup([note("Awaiting acceptance")]);
+    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => ({
+      status: "unconfirmed" as const,
+    }));
     gate.onLateSubmission(delivery);
 
     coordinator.transition("visible");
     coordinator.transition("hidden");
-    await vi.waitFor(() => expect(failedOnce).toBe(true));
+    await vi.waitFor(() => expect(delivery).toHaveBeenCalledOnce());
     await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(delivery).toHaveBeenCalledOnce();
+
+    await expect(gate.submit(ctx)).resolves.toMatchObject({ status: "pending" });
+    expect(delivery).toHaveBeenCalledTimes(2);
+    expect(delivery.mock.calls[1]?.[0]).toEqual([
+      expect.objectContaining({ noteId: "user:1", summary: "Awaiting acceptance" }),
+    ]);
+  });
+
+  it("warns once per failed hide lifecycle and lets /hunk feedback recover exactly once", async () => {
+    const comments = [
+      note("Recovered first", { noteId: "user:1" }),
+      note("Recovered second", { noteId: "user:2", newRange: [10, 10] }),
+    ];
+    const { gate, coordinator, ctx, run } = setup(comments);
+    const implementation = run.getMockImplementation()!;
+    let failProbe = true;
+    run.mockImplementation(async (argv) => {
+      if (argv.includes("comment") && failProbe) {
+        throw new Error("temporary Hunk failure");
+      }
+      return implementation(argv);
+    });
+    const delivery = vi.fn(acceptedDelivery);
+    const warnings = vi.fn();
+    gate.onLateProbeWarning(warnings);
+    gate.onLateSubmission(delivery);
+
+    coordinator.transition("visible");
+    coordinator.transition("hidden", true);
+    await vi.waitFor(() => expect(warnings).toHaveBeenCalledOnce());
+    expect(warnings).toHaveBeenCalledWith(expect.stringContaining("comments were not inspected"));
+    expect(warnings).toHaveBeenCalledWith(expect.stringContaining("/hunk feedback"));
     expect(delivery).not.toHaveBeenCalled();
 
+    failProbe = false;
     await expect(gate.submit(ctx)).resolves.toMatchObject({
       status: "submitted",
-      notes: [expect.objectContaining({ summary: "Recovered note" })],
+      notes: [
+        expect.objectContaining({ noteId: "user:1", summary: "Recovered first" }),
+        expect.objectContaining({ noteId: "user:2", summary: "Recovered second" }),
+      ],
     });
     expect(delivery).toHaveBeenCalledOnce();
-    expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(2);
+    expect(delivery.mock.calls[0]?.[0]).toHaveLength(2);
+
+    // A fresh explicit inspection sees the same open comments, but accepted
+    // note identities are not delivered a second time.
+    await expect(gate.submit(ctx)).resolves.toMatchObject({ status: "pending" });
+    expect(delivery).toHaveBeenCalledOnce();
+
+    // A genuinely later visible→hidden review lifecycle gets its own diagnosis.
+    failProbe = true;
+    coordinator.transition("visible");
+    coordinator.transition("hidden", true);
+    await vi.waitFor(() => expect(warnings).toHaveBeenCalledTimes(2));
+    expect(delivery).toHaveBeenCalledOnce();
   });
 
   it("routes successful mutation evidence without a blocking review tool", async () => {
@@ -622,9 +761,309 @@ describe("asynchronous Hunk comment handoff", () => {
         status: "reviewable",
         repoRoot: root,
         fileCount: 1,
+        routing: "opened",
       });
       expect(coordinator.state).toBe("visible");
       expect(coordinator.repoRoot).toBe(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("consumes a repo-root-missing head, releases its route surface, and presents the next repository", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-terminal-route-")));
+    const invalidRoot = join(root, "not-a-repo");
+    const validRoot = join(root, "repo");
+    try {
+      await Promise.all([mkdir(invalidRoot), mkdir(validRoot)]);
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const missingRoot = session({
+        sessionId: "missing-root",
+        cwd: invalidRoot,
+        repoRoot: undefined,
+      });
+      const validSession = session({ sessionId: "valid", cwd: validRoot, repoRoot: validRoot });
+      const waitForSession = vi.fn(async (options: { cwd: string }) =>
+        options.cwd === invalidRoot
+          ? ({ status: "reviewable", session: missingRoot } as const)
+          : ({ status: "reviewable", session: validSession } as const),
+      );
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [validSession], "valid"),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [invalidRoot, validRoot],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toEqual({
+        status: "reviewable",
+        repoRoot: validRoot,
+        fileCount: 1,
+        routing: "opened",
+      });
+      expect(waitForSession).toHaveBeenCalledTimes(2);
+      expect(coordinator.ensureOpen).toHaveBeenCalledTimes(2);
+      expect(coordinator.releaseSurfaceForRouting).toHaveBeenCalledOnce();
+      expect(coordinator.repoRoot).toBe(validRoot);
+      expect(coordinator.state).toBe("visible");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds registration retries without letting an unregistered head pin later work", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-registration-route-")));
+    const unavailableRoot = join(root, "unavailable");
+    const validRoot = join(root, "repo");
+    try {
+      await Promise.all([mkdir(unavailableRoot), mkdir(validRoot)]);
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const validSession = session({ sessionId: "valid", cwd: validRoot, repoRoot: validRoot });
+      const waitForSession = vi.fn(async (options: { cwd: string; sessionId?: string }) => {
+        if (options.sessionId === "valid") {
+          return { status: "reviewable", session: validSession } as const;
+        }
+        return options.cwd === unavailableRoot
+          ? ({ status: "not-found" } as const)
+          : ({ status: "reviewable", session: validSession } as const);
+      });
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [validSession], "valid"),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [unavailableRoot, validRoot],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot: validRoot,
+      });
+      expect(coordinator.releaseSurfaceForRouting).toHaveBeenCalledOnce();
+
+      await expect(gate.next(ctx)).resolves.toMatchObject({
+        status: "unavailable",
+        reason: "session-not-registered",
+      });
+      await expect(gate.next(ctx)).resolves.toEqual({ status: "no-evidence" });
+      expect(coordinator.ensureOpen).toHaveBeenCalledTimes(3);
+      expect(coordinator.releaseSurfaceForRouting).toHaveBeenCalledTimes(2);
+      expect(coordinator.state).toBe("closed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not release a reused manual surface when its candidate is terminal", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-manual-terminal-route-")));
+    const manualRoot = join(root, "manual");
+    const validRoot = join(root, "repo");
+    try {
+      await Promise.all([mkdir(manualRoot), mkdir(validRoot)]);
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      coordinator.launchCwd = manualRoot;
+      coordinator.source = "manual";
+      coordinator.state = "hidden";
+      coordinator.sessionId = "manual";
+      coordinator.repoRoot = manualRoot;
+      const missingRoot = session({
+        sessionId: "manual",
+        cwd: manualRoot,
+        repoRoot: undefined,
+      });
+      const manualSession = session({ sessionId: "manual", cwd: manualRoot, repoRoot: manualRoot });
+      const validSession = session({ sessionId: "valid", cwd: validRoot, repoRoot: validRoot });
+      const waitForSession = vi.fn(async (options: { cwd: string; sessionId?: string }) => {
+        if (options.sessionId === "manual") {
+          return { status: "reviewable", session: manualSession } as const;
+        }
+        return options.cwd === manualRoot
+          ? ({ status: "reviewable", session: missingRoot } as const)
+          : ({ status: "reviewable", session: validSession } as const);
+      });
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [manualSession], "manual"),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [manualRoot, validRoot],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot: validRoot,
+      });
+      // The valid route deliberately replaces the inspected manual surface;
+      // terminal cleanup itself must never release that user-owned surface.
+      expect(coordinator.releaseSurfaceForRouting).not.toHaveBeenCalled();
+      expect(coordinator.ensureOpen).toHaveBeenCalledOnce();
+      expect(coordinator.repoRoot).toBe(validRoot);
+      expect(coordinator.state).toBe("visible");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retargets a cross-repo existing-file symlink seed to its canonical repository", async () => {
+    // repo-a/link.ts → repo-b/src/file.ts. Lexical launch starts in repo A;
+    // Hunk reports repo A; the real target lives in repo B and must stay queued.
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-seed-symlink-")));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    const realFile = join(repoB, "src", "file.ts");
+    const repoAFile = join(repoA, "other.ts");
+    const linkPath = join(repoA, "link.ts");
+    try {
+      await Promise.all([
+        mkdir(join(repoA), { recursive: true }),
+        mkdir(join(repoB, "src"), { recursive: true }),
+      ]);
+      await Promise.all([
+        writeFile(realFile, "export const value = 1;\n"),
+        writeFile(repoAFile, "export const other = 1;\n"),
+      ]);
+      await symlink(realFile, linkPath);
+
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const sessionA = session({
+        sessionId: "repo-a",
+        cwd: repoA,
+        repoRoot: repoA,
+        files: [{ path: "link.ts" }],
+      });
+      const sessionB = session({
+        sessionId: "repo-b",
+        cwd: join(repoB, "src"),
+        repoRoot: repoB,
+        files: [{ path: "src/file.ts" }],
+      });
+      const waitForSession = vi.fn(async (options: { cwd: string }) => {
+        // First launch is near the symlink parent (repo A). After retargeting,
+        // resolveLaunchDirectory walks from the real file into repo B.
+        const inRepoB =
+          options.cwd === repoB ||
+          options.cwd.startsWith(`${repoB}/`) ||
+          options.cwd.startsWith(`${repoB}\\`);
+        return {
+          status: "reviewable" as const,
+          session: inRepoB ? sessionB : sessionA,
+        };
+      });
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [sessionA, sessionB], "repo-b"),
+        waitForSession,
+      );
+      // Evidence names the symlink path the agent wrote through, not the real file.
+      gate.addEvidence({
+        mutation: true,
+        targets: [linkPath, repoAFile],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: repoA, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toEqual({
+        status: "reviewable",
+        repoRoot: repoB,
+        fileCount: 1,
+        routing: "opened",
+      });
+
+      // Two launches: mismatched repo A (closed), then the covering repo B.
+      expect(coordinator.ensureOpen).toHaveBeenCalledTimes(2);
+      expect(coordinator.ensureOpen.mock.calls[0]?.[4]).toBe(repoA);
+      expect(coordinator.ensureOpen.mock.calls[1]?.[4]).toBe(join(repoB, "src"));
+      expect(coordinator.repoRoot).toBe(repoB);
+      expect(coordinator.state).toBe("visible");
+
+      // Validating the mismatched seed must not consume a separate repo-A
+      // candidate before any repo-A surface has actually been presented.
+      await expect(gate.next(ctx)).resolves.toEqual({
+        status: "reviewable",
+        repoRoot: repoA,
+        fileCount: 1,
+        routing: "rerouted",
+      });
+      expect(coordinator.ensureOpen).toHaveBeenCalledTimes(3);
+      expect(coordinator.ensureOpen.mock.calls[2]?.[4]).toBe(repoA);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a canonical seed retryable when Hunk reports a non-covering root", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-seed-mismatch-")));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    const realFile = join(repoB, "src", "file.ts");
+    try {
+      await mkdir(join(repoB, "src"), { recursive: true });
+      await writeFile(realFile, "export const value = 1;\n");
+
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      // Hunk claims repo A even though the seed is the real path inside repo B.
+      const mismatched = session({
+        sessionId: "repo-a",
+        cwd: repoA,
+        repoRoot: repoA,
+      });
+      const waitForSession = vi.fn(
+        async () => ({ status: "reviewable", session: mismatched }) as const,
+      );
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [mismatched]),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [realFile],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: repoB, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "unavailable",
+        reason: "repo-root-mismatch",
+      });
+      // Candidate remains queued for a later retry, while the route-owned
+      // non-covering surface is closed instead of misleading the user.
+      expect(coordinator.ensureOpen).toHaveBeenCalledOnce();
+      expect(coordinator.state).toBe("closed");
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "unavailable",
+        reason: "repo-root-mismatch",
+      });
+      expect(coordinator.ensureOpen).toHaveBeenCalledTimes(2);
+      expect(coordinator.state).toBe("closed");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -645,7 +1084,7 @@ describe("asynchronous Hunk comment handoff", () => {
         runner([], [managedSession]),
         waitForSession,
       );
-      gate.onLateSubmission(async () => undefined);
+      gate.onLateSubmission(acceptedDelivery);
       gate.addEvidence({ mutation: true, targets: [root], unresolved: false, revision: 1 });
       const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
 
@@ -661,6 +1100,220 @@ describe("asynchronous Hunk comment handoff", () => {
       expect(coordinator.ensureOpen).toHaveBeenCalledTimes(opens);
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reuse a same-directory manual show surface for automatic review", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-manual-show-reuse-")));
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 202;
+      coordinator.launchCwd = root;
+      coordinator.args = ["show", "HEAD~1"];
+      coordinator.source = "manual";
+      coordinator.state = "hidden";
+      coordinator.sessionId = "manual-show";
+      coordinator.repoRoot = root;
+
+      const automaticSession = session({
+        sessionId: "auto-watch",
+        pid: 101,
+        cwd: root,
+        repoRoot: root,
+      });
+      const manualSession = session({
+        sessionId: "manual-show",
+        pid: 202,
+        cwd: root,
+        repoRoot: root,
+      });
+      const waitForSession = vi.fn(async (options: { managedPid?: number }) => {
+        if (options.managedPid === 202) {
+          return { status: "reviewable", session: manualSession } as const;
+        }
+        if (options.managedPid === 101) {
+          return { status: "reviewable", session: automaticSession } as const;
+        }
+        throw new Error(`Unexpected managed pid: ${options.managedPid}`);
+      });
+      const run = runner(
+        [note("Manual note on historical commit")],
+        [manualSession, automaticSession],
+        "manual-show",
+      );
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        run,
+        waitForSession,
+      );
+      const delivery = vi.fn(acceptedDelivery);
+      gate.onLateSubmission(delivery);
+      gate.addEvidence({ mutation: true, targets: [root], unresolved: false, revision: 1 });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      // Simulate ensureOpen replacing the mismatched show surface with the
+      // configured automatic watcher before the subsequent session lookup.
+      coordinator.ensureOpen.mockImplementation(async (...args: unknown[]) => {
+        coordinator.launchCwd = (args[4] as string | undefined) ?? coordinator.launchCwd;
+        coordinator.args = (args[2] as string[] | undefined) ?? coordinator.args;
+        coordinator.source = (args[3] as typeof coordinator.source | undefined) ?? "auto";
+        coordinator.pid = 101;
+        coordinator.sessionId = "auto-watch";
+        coordinator.repoRoot = root;
+        coordinator.state = "visible";
+        coordinator.emit();
+      });
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot: root,
+      });
+
+      expect(coordinator.ensureOpen).toHaveBeenCalledWith(
+        ctx,
+        DEFAULT_CONFIG,
+        DEFAULT_CONFIG.hunk.args,
+        "auto",
+        root,
+      );
+      expect(coordinator.args).toEqual(DEFAULT_CONFIG.hunk.args);
+      expect(coordinator.pid).toBe(101);
+      expect(coordinator.showManagedSurface).not.toHaveBeenCalled();
+      // Outgoing comments on the mismatched manual surface must be collected
+      // before the process is replaced.
+      expect(delivery).toHaveBeenCalledWith(
+        [expect.objectContaining({ summary: "Manual note on historical commit" })],
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(delivery.mock.invocationCallOrder[0]).toBeLessThan(
+        coordinator.ensureOpen.mock.invocationCallOrder[0]!,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not replace a live manual surface that cannot be pinned for comment collection", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-manual-unpinned-")));
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.launchCwd = root;
+      coordinator.args = ["show", "HEAD~1"];
+      coordinator.source = "manual";
+      coordinator.state = "hidden";
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+      );
+      gate.addEvidence({ mutation: true, targets: [root], unresolved: false, revision: 1 });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "unavailable",
+        reason: "outgoing-review-unavailable",
+      });
+      expect(coordinator.ensureOpen).not.toHaveBeenCalled();
+      expect(coordinator.state).toBe("hidden");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not replace a mismatched manual surface when its comment probe fails", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-manual-probe-failure-")));
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 202;
+      coordinator.launchCwd = root;
+      coordinator.args = ["show", "HEAD~1"];
+      coordinator.source = "manual";
+      coordinator.state = "hidden";
+      coordinator.sessionId = "manual-show";
+      coordinator.repoRoot = root;
+
+      const manualSession = session({
+        sessionId: "manual-show",
+        pid: 202,
+        cwd: root,
+        repoRoot: root,
+      });
+      const waitForSession = vi.fn(
+        async () => ({ status: "reviewable", session: manualSession }) as const,
+      );
+      const failedRun = vi.fn(async () => {
+        throw new Error("manual comment probe failed");
+      });
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        failedRun,
+        waitForSession,
+      );
+      gate.addEvidence({ mutation: true, targets: [root], unresolved: false, revision: 1 });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "unavailable",
+        reason: "comment-probe-failed",
+        detail: expect.stringContaining("manual comment probe failed"),
+      });
+
+      expect(coordinator.ensureOpen).not.toHaveBeenCalled();
+      expect(coordinator.pid).toBe(202);
+      expect(coordinator.state).toBe("hidden");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses a matching manual surface opened through an equivalent symlink cwd", async () => {
+    const temporaryRoot = await realpath(
+      await mkdtemp(join(tmpdir(), "pi-hunk-manual-match-reuse-")),
+    );
+    const root = join(temporaryRoot, "repo");
+    const linkedRoot = join(temporaryRoot, "repo-link");
+    try {
+      await mkdir(root);
+      await symlink(root, linkedRoot, "dir");
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      coordinator.launchCwd = linkedRoot;
+      coordinator.args = [...DEFAULT_CONFIG.hunk.args];
+      coordinator.source = "manual";
+      coordinator.state = "hidden";
+      coordinator.sessionId = "manual-match";
+      coordinator.repoRoot = root;
+
+      const managedSession = session({
+        sessionId: "manual-match",
+        pid: 101,
+        cwd: linkedRoot,
+        repoRoot: root,
+      });
+      const waitForSession = vi.fn(
+        async () => ({ status: "reviewable", session: managedSession }) as const,
+      );
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [managedSession], "manual-match"),
+        waitForSession,
+      );
+      gate.onLateSubmission(acceptedDelivery);
+      gate.addEvidence({ mutation: true, targets: [root], unresolved: false, revision: 1 });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot: root,
+      });
+
+      expect(coordinator.ensureOpen).not.toHaveBeenCalled();
+      expect(coordinator.showManagedSurface).toHaveBeenCalledWith(101, "manual-match");
+      expect(coordinator.args).toEqual(DEFAULT_CONFIG.hunk.args);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
     }
   });
 
@@ -709,7 +1362,7 @@ describe("asynchronous Hunk comment handoff", () => {
           runner([note("Manual note")], [manualSession], "manual"),
           waitForSession,
         );
-        const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+        const delivery = vi.fn(acceptedDelivery);
         gate.onLateSubmission(delivery);
         gate.addEvidence({ mutation: true, targets: [root], unresolved: false, revision: 1 });
         const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
@@ -737,9 +1390,10 @@ describe("asynchronous Hunk comment handoff", () => {
             sessionId: activeSessionId,
           }),
         );
-        expect(delivery).toHaveBeenCalledWith([
-          expect.objectContaining({ summary: "Manual note" }),
-        ]);
+        expect(delivery).toHaveBeenCalledWith(
+          [expect.objectContaining({ summary: "Manual note" })],
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -767,7 +1421,7 @@ describe("asynchronous Hunk comment handoff", () => {
       run,
       waitForSession,
     );
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    const delivery = vi.fn(acceptedDelivery);
     gate.onLateSubmission(delivery);
     const ctx = { cwd: "/repo", mode: "tui" } as ExtensionContext;
 
@@ -807,7 +1461,7 @@ describe("asynchronous Hunk comment handoff", () => {
       run,
       waitForSession,
     );
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    const delivery = vi.fn(acceptedDelivery);
     gate.onLateSubmission(delivery);
     const ctx = { cwd: "/repo", mode: "tui" } as ExtensionContext;
 
@@ -861,7 +1515,7 @@ describe("asynchronous Hunk comment handoff", () => {
       run,
       waitForSession,
     );
-    const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+    const delivery = vi.fn(acceptedDelivery);
     gate.onLateSubmission(delivery);
     const ctx = { cwd: "/old-repo", mode: "tui" } as ExtensionContext;
 
@@ -965,7 +1619,7 @@ describe("asynchronous Hunk comment handoff", () => {
         run,
         waitForSession,
       );
-      const delivery = vi.fn(async (_notes: HunkReviewNote[]) => undefined);
+      const delivery = vi.fn(acceptedDelivery);
       gate.onLateSubmission(delivery);
       gate.addEvidence({
         mutation: true,
@@ -988,9 +1642,10 @@ describe("asynchronous Hunk comment handoff", () => {
       });
       expect(opensWhileProbePending).toBe(1);
       expect(run).toHaveBeenCalled();
-      expect(delivery).toHaveBeenCalledWith([
-        expect.objectContaining({ summary: "Review repo A first" }),
-      ]);
+      expect(delivery).toHaveBeenCalledWith(
+        [expect.objectContaining({ summary: "Review repo A first" })],
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1020,6 +1675,7 @@ describe("asynchronous Hunk comment handoff", () => {
       );
       const delivery = vi.fn(async (_notes: HunkReviewNote[]) => {
         if (delivery.mock.calls.length === 1) throw new Error("Pi is busy");
+        return { status: "accepted" as const };
       });
       gate.onLateSubmission(delivery);
       gate.addEvidence({
@@ -1077,6 +1733,7 @@ describe("asynchronous Hunk comment handoff", () => {
         status: "reviewable",
         repoRoot: root,
         fileCount: 1,
+        routing: "opened",
         unresolved: true,
       });
       await expect(gate.next(ctx)).resolves.toEqual({ status: "target-required" });
@@ -1121,6 +1778,67 @@ describe("asynchronous Hunk comment handoff", () => {
       const opens = coordinator.ensureOpen.mock.calls.length;
       await expect(gate.presentAutomatic(ctx)).resolves.toEqual({ status: "no-diff" });
       expect(coordinator.ensureOpen).toHaveBeenCalledTimes(opens);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a live empty watch open instead of caching terminal no-diff", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-stale-empty-watch-")));
+    try {
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const emptySession = session({
+        cwd: root,
+        repoRoot: root,
+        fileCount: 0,
+        files: [],
+      });
+      const filledSession = session({
+        cwd: root,
+        repoRoot: root,
+        fileCount: 1,
+        files: [{ path: "src/a.ts" }],
+      });
+      // Match the bug through the production waiter: the managed registration
+      // stays empty for the entire first window, then reloads before the next check.
+      let lookup = 0;
+      const frames = Array.from({ length: 7 }, () => [emptySession]).concat([[filledSession]]);
+      const run = runner([], () => frames[Math.min(lookup++, frames.length - 1)]!);
+      const waitForSession = vi.fn((options: Parameters<typeof waitForManagedHunkSession>[0]) =>
+        waitForManagedHunkSession({
+          ...options,
+          retryDelaysMs: [0, 0, 0, 0, 0, 0, 0],
+        }),
+      );
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        run,
+        waitForSession,
+      );
+      gate.addEvidence({ mutation: true, targets: [root], unresolved: false, revision: 1 });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      await expect(gate.presentAutomatic(ctx)).resolves.toEqual({
+        status: "reviewable",
+        repoRoot: root,
+        fileCount: 0,
+        routing: "opened",
+      });
+      expect(coordinator.state).toBe("visible");
+      expect(coordinator.markReviewCompleteForRun).not.toHaveBeenCalled();
+
+      // A later observation must still be able to publish the delayed reload.
+      await expect(gate.presentAutomatic(ctx)).resolves.toEqual({
+        status: "reviewable",
+        repoRoot: root,
+        fileCount: 1,
+        routing: "reused",
+      });
+      expect(waitForSession).toHaveBeenCalledTimes(2);
+      expect(run).toHaveBeenCalledTimes(8);
+      expect(coordinator.markReviewCompleteForRun).not.toHaveBeenCalled();
     } finally {
       await rm(root, { recursive: true, force: true });
     }

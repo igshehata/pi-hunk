@@ -65,7 +65,13 @@ function componentConstructor(
  * - OverlayHandle.hide() removes THIS entry by identity
  * - optional microtask-delayed mount (autoHandle=false)
  */
-function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean } = {}) {
+function createHarness(
+  options: {
+    autoHandle?: boolean;
+    delayedMount?: boolean;
+    componentPid?: number | "missing";
+  } = {},
+) {
   const autoHandle = options.autoHandle !== false;
   const delayedMount = Boolean(options.delayedMount);
   const events: string[] = [];
@@ -74,6 +80,7 @@ function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean }
   const stack: FakeHandle[] = [];
   const overlayOptions: Array<Record<string, unknown> | undefined> = [];
   const pendingMounts: Array<() => void> = [];
+  const pendingCustomRejects: Array<(error: unknown) => void> = [];
   let nextId = 1;
   const tui = {
     terminal: {
@@ -112,7 +119,9 @@ function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean }
     const component: FakeComponent = {
       id,
       options: opts,
-      pid: 9000 + id,
+      ...(options.componentPid === "missing"
+        ? {}
+        : { pid: typeof options.componentPid === "number" ? options.componentPid : 9000 + id }),
       visible: true,
       disposed: false,
       render: () => ["hunk"],
@@ -178,6 +187,11 @@ function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean }
         }
 
         components.push(component as FakeComponent);
+        pendingCustomRejects.push((error) => {
+          if (settled) return;
+          settled = true;
+          reject(error);
+        });
 
         const publishHandle = () => {
           // Pi's .then: if already closed, return without disposing / without showOverlay.
@@ -245,6 +259,7 @@ function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean }
     tui,
     createComponent,
     releaseHandle: () => pendingMounts.shift()?.(),
+    rejectCustom: (error: unknown) => pendingCustomRejects.shift()?.(error),
     /** Push a second overlay above Hunk (simulates a dialog). */
     pushForeignOverlay(): FakeHandle {
       const id = nextId++;
@@ -275,6 +290,42 @@ function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean }
 }
 
 describe("OverlaySurface state machine", () => {
+  it("adopts metadata only for an exact live mounted PID", async () => {
+    const metadata = { sessionId: "managed", pid: 9001, fileCount: 1 };
+
+    const neverOpened = new OverlaySurface(createHarness().createComponent);
+    expect(neverOpened.adoptManagedSession(metadata)).toBe(false);
+
+    const delayed = createHarness({ autoHandle: false });
+    const surface = new OverlaySurface(delayed.createComponent);
+    const config = cloneConfig(DEFAULT_CONFIG);
+    const opening = surface.open(delayed.ctx, request(), config);
+    expect(surface.getState()).toBe("starting");
+    expect(surface.adoptManagedSession(metadata)).toBe(false);
+    delayed.releaseHandle();
+    await opening;
+
+    expect(surface.adoptManagedSession({ ...metadata, pid: 9999 })).toBe(false);
+    expect(surface.adoptManagedSession(metadata)).toBe(true);
+    expect(surface.getInfo()).toMatchObject({ pid: 9001, sessionId: "managed" });
+
+    await surface.close();
+    expect(surface.adoptManagedSession(metadata)).toBe(false);
+  });
+
+  it("rejects adoption when a mounted component exposes no valid PID", async () => {
+    const harness = createHarness({ componentPid: "missing" });
+    const surface = new OverlaySurface(harness.createComponent);
+    const config = cloneConfig(DEFAULT_CONFIG);
+    await surface.open(harness.ctx, request(), config);
+
+    expect(surface.adoptManagedSession({ sessionId: "managed", pid: 9001, fileCount: 0 })).toBe(
+      false,
+    );
+    expect(surface.getInfo()?.pid).toBeUndefined();
+    await surface.close();
+  });
+
   it("wires the prefix so the focused component can hide the surface", async () => {
     const harness = createHarness();
     const surface = new OverlaySurface(harness.createComponent);
@@ -758,6 +809,25 @@ describe("OverlaySurface state machine", () => {
     expect(notify.mock.calls[0]?.[0]).not.toContain("signal 0");
   });
 
+  it("preserves actionable startup diagnostics in live code-1 notifications", async () => {
+    const harness = createHarness();
+    const surface = new OverlaySurface(harness.createComponent);
+    const config = cloneConfig(DEFAULT_CONFIG);
+    await surface.open(harness.ctx, request(), config);
+
+    harness.components[0]!.options.done({
+      exitCode: 1,
+      signal: 0,
+      detail: 'Hunk startup failed: command "hunk" was not found on child PATH.',
+    });
+    await Promise.resolve();
+
+    expect(harness.ctx.ui.notify).toHaveBeenCalledWith(
+      'Hunk startup failed: command "hunk" was not found on child PATH. (code 1).',
+      "error",
+    );
+  });
+
   it("child done before onHandle follows pre-mount cancel so a late handle cannot resurrect", async () => {
     const harness = createHarness({ delayedMount: true });
     const onChildExit = vi.fn();
@@ -843,6 +913,46 @@ describe("OverlaySurface state machine", () => {
     expect(harness.components).toHaveLength(0);
     expect(surface.getState()).toBe("closed");
     expect(surface.isLive()).toBe(false);
+  });
+
+  it("hides a delayed handle after custom() rejects and reopens with one owned entry", async () => {
+    const harness = createHarness({ autoHandle: false });
+    const surface = new OverlaySurface(harness.createComponent);
+    const config = cloneConfig(DEFAULT_CONFIG);
+
+    const failedOpen = surface.open(harness.ctx, request(), config);
+    const settled = failedOpen.then(
+      () => "resolved" as const,
+      (error: unknown) => error,
+    );
+    expect(surface.getState()).toBe("starting");
+    expect(harness.components).toHaveLength(1);
+
+    // Reproduce Pi rejecting custom() after factory creation but before its
+    // separately delayed onHandle callback arrives.
+    harness.rejectCustom(new Error("overlay mount rejected"));
+    const result = await settled;
+    expect(result).toBeInstanceOf(Error);
+    expect(String(result)).toContain("overlay mount rejected");
+    expect(surface.getState()).toBe("closed");
+    expect(harness.components[0]?.disposed).toBe(true);
+    expect(harness.events.filter((event) => event === "component:dispose:1")).toHaveLength(1);
+
+    expect(() => harness.releaseHandle()).not.toThrow();
+    expect(surface.getState()).toBe("closed");
+    expect(harness.handles[0]?.removed).toBe(true);
+    expect(harness.stack).toHaveLength(0);
+
+    const reopened = surface.open(harness.ctx, request(["show"]), config);
+    harness.releaseHandle();
+    await reopened;
+    expect(surface.getState()).toBe("visible");
+    expect(harness.stack).toHaveLength(1);
+    expect(harness.stack[0]?.id).toBe(harness.components[1]?.id);
+    expect(harness.events.filter((event) => event === "component:dispose:1")).toHaveLength(1);
+
+    await surface.close();
+    expect(harness.stack).toHaveLength(0);
   });
 
   it("fails open() when the overlay handle never arrives (start timeout)", async () => {

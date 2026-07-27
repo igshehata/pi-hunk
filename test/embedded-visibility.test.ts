@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { TUI } from "@earendil-works/pi-tui";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 
 const pty = vi.hoisted(() => ({
   write: vi.fn(),
@@ -19,6 +19,7 @@ const ENABLE_MOUSE = "\x1b[?1003h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const SYNCHRONIZED_FRAME_START = "\x1b[?2026h";
 const SYNCHRONIZED_FRAME_END = "\x1b[?2026l";
+const ANSI = new RegExp(String.raw`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`, "g");
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -512,6 +513,133 @@ describe("EmbeddedHunk presentation state", () => {
     component.dispose();
   });
 
+  it("paints the libghostty cursor into a styled addressed cell in float composition", async () => {
+    const tui = {
+      terminal: { columns: 8, rows: 3, write: vi.fn() },
+      requestRender: vi.fn(),
+    } as unknown as TUI;
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff", "--watch"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+      initialRows: 3,
+    });
+    component.render(8);
+    const onData = (pty.onData.mock.calls as unknown as Array<[(data: string) => void]>)[0][0];
+
+    onData(
+      `${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[H` +
+        `\x1b[38;2;12;34;56mabc\x1b[0m\x1b[1;2H${SYNCHRONIZED_FRAME_END}`,
+    );
+    await Promise.resolve();
+    const [line] = component.render(8);
+
+    expect(line).toContain("a\x1b[7mb\x1b[27mc");
+    expect(line!.replace(ANSI, "")).toBe("abc     ");
+    expect(visibleWidth(line!)).toBe(8);
+    component.dispose();
+  });
+
+  it("honors split DECTCEM changes and retains complete-frame cursor metadata", async () => {
+    const tui = {
+      terminal: { columns: 8, rows: 3, write: vi.fn() },
+      requestRender: vi.fn(),
+    } as unknown as TUI;
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff", "--watch"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+      initialRows: 3,
+    });
+    component.render(8);
+    const onData = (pty.onData.mock.calls as unknown as Array<[(data: string) => void]>)[0][0];
+
+    onData(`${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Habc\x1b[1;2H\x1b[?2`);
+    onData(`5l${SYNCHRONIZED_FRAME_END}`);
+    await Promise.resolve();
+    expect(component.render(8)[0]).not.toContain("\x1b[7m");
+
+    onData(
+      `\x1b[?25h${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Habc\x1b[1;2H` +
+        `${SYNCHRONIZED_FRAME_END}${SYNCHRONIZED_FRAME_START}` +
+        `\x1b[2J\x1b[Hpartial\x1b[1;7H`,
+    );
+    await Promise.resolve();
+    const published = component.render(8)[0]!;
+    expect(published).toContain("a\x1b[7mb\x1b[27m");
+    expect(published).not.toContain("partial");
+    expect(visibleWidth(published)).toBe(8);
+
+    const resized = component.render(6)[0]!;
+    expect(resized).toContain("a\x1b[7mb\x1b[27m");
+    expect(resized).not.toContain("partial");
+    expect(resized).not.toContain("Starting Hunk");
+    expect(visibleWidth(resized)).toBe(6);
+    component.dispose();
+  });
+
+  it("publishes a complete frame before a later frame starts in the same PTY chunk", async () => {
+    const requestRender = vi.fn();
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender,
+    } as unknown as TUI;
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff", "--watch"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+      initialRows: 10,
+    });
+    const onData = (pty.onData.mock.calls as unknown as Array<[(data: string) => void]>)[0][0];
+
+    onData(
+      `${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Hframe-one${SYNCHRONIZED_FRAME_END}` +
+        `${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Hframe-two-partial`,
+    );
+    await Promise.resolve();
+
+    expect(requestRender).toHaveBeenCalledTimes(1);
+    const published = component.render(100).join("\n");
+    expect(published).toContain("frame-one");
+    expect(published).not.toContain("frame-two-partial");
+    expect(published).not.toContain("Starting Hunk");
+    component.dispose();
+  });
+
+  it("publishes an ended frame when the next chunk starts before its paint microtask", async () => {
+    const requestRender = vi.fn();
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender,
+    } as unknown as TUI;
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff", "--watch"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+      initialRows: 10,
+    });
+    const onData = (pty.onData.mock.calls as unknown as Array<[(data: string) => void]>)[0][0];
+
+    onData(`${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Hframe-one${SYNCHRONIZED_FRAME_END}`);
+    onData(`${SYNCHRONIZED_FRAME_START}\x1b[2J\x1b[Hframe-two-partial`);
+    await Promise.resolve();
+
+    expect(requestRender).toHaveBeenCalledTimes(1);
+    const published = component.render(100).join("\n");
+    expect(published).toContain("frame-one");
+    expect(published).not.toContain("frame-two-partial");
+    expect(published).not.toContain("Starting Hunk");
+    component.dispose();
+  });
+
   it("keeps the previous complete frame while a synchronized update is split across PTY reads", async () => {
     const requestRender = vi.fn();
     const tui = {
@@ -544,6 +672,13 @@ describe("EmbeddedHunk presentation state", () => {
     // and must not expose the partially applied child frame.
     expect(requestRender).not.toHaveBeenCalled();
     expect(component.render(100)).toEqual(firstFrame);
+
+    // A resize must reshape the cache rather than consult the partial native
+    // buffer or fall back to the startup placeholder.
+    const resizedPublished = component.render(80).join("\n");
+    expect(resizedPublished).toContain("frame-one");
+    expect(resizedPublished).not.toContain("frame-two-partial");
+    expect(resizedPublished).not.toContain("Starting Hunk");
 
     onData(new TextEncoder().encode(`-complete${SYNCHRONIZED_FRAME_END}`));
     await Promise.resolve();

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ChangeDetector } from "../extensions/change-detector.ts";
 import { DEFAULT_CONFIG, cloneConfig } from "../extensions/config.ts";
 import { ReviewCoordinator } from "../extensions/coordinator.ts";
+import { OverlaySurface } from "../extensions/overlay/surface.ts";
 
 describe("ChangeDetector", () => {
   it("resets mutation evidence and orphaned tool args after settlement", () => {
@@ -58,7 +59,7 @@ describe("ReviewCoordinator shutdown", () => {
       ),
     ).rejects.toThrow(/shut down/);
 
-    coordinator.revive();
+    await coordinator.revive();
     // After revive, ensureOpen may still fail on missing UI/PTY, but not shut-down.
     await expect(
       coordinator.ensureOpen(
@@ -86,13 +87,21 @@ describe("ReviewCoordinator shutdown", () => {
   });
 
   it("activateSession cleans leftover live surfaces before reviving", async () => {
-    const coordinator = new ReviewCoordinator();
+    const coordinator = new ReviewCoordinator({
+      overlay: new OverlaySurface(() => ({
+        pid: 4242,
+        render: () => [],
+        invalidate: () => undefined,
+        setVisible: () => undefined,
+        dispose: () => undefined,
+      })),
+    });
     const config = cloneConfig(DEFAULT_CONFIG);
 
     let disposed = 0;
     let handleHidden = false;
     const ctx = {
-      cwd: "/repo",
+      cwd: process.cwd(),
       mode: "tui",
       ui: {
         custom: <T>(
@@ -169,7 +178,15 @@ describe("ReviewCoordinator shutdown", () => {
   });
 
   it("serializes concurrent ensureOpen and toggleOverlay so only one live surface is tracked", async () => {
-    const coordinator = new ReviewCoordinator();
+    const coordinator = new ReviewCoordinator({
+      overlay: new OverlaySurface(() => ({
+        pid: 4242,
+        render: () => [],
+        invalidate: () => undefined,
+        setVisible: () => undefined,
+        dispose: () => undefined,
+      })),
+    });
     const config = cloneConfig(DEFAULT_CONFIG);
 
     let openCount = 0;
@@ -178,7 +195,7 @@ describe("ReviewCoordinator shutdown", () => {
 
     const makeCtx = () =>
       ({
-        cwd: "/repo",
+        cwd: process.cwd(),
         mode: "tui",
         ui: {
           custom: <T>(

@@ -11,7 +11,9 @@ import {
   type ManagedHunkSessionWaitOptions,
   type ManagedHunkSessionWaitResult,
 } from "./hunk-session.ts";
+import { resolve } from "node:path";
 import { canonicalizePotentialPath, pathIsInside, resolveLaunchDirectory } from "./path-routing.ts";
+import { argsKey } from "./overlay/types.ts";
 
 /** The deliberately small, read-only note shape exposed to the agent. */
 export interface HunkReviewNote {
@@ -43,11 +45,15 @@ export type HunkFeedbackResult =
   | { status: "no-diff"; message: string; notes: [] }
   | { status: "unavailable"; reason: string; message: string; notes: [] };
 
+export type AutomaticReviewRouting = "opened" | "recovered" | "reused" | "rerouted" | "replaced";
+
 export type AutomaticReviewResult =
   | {
       status: "reviewable";
       repoRoot: string;
       fileCount: number;
+      /** Final surface outcome after presentation, never a provisional policy decision. */
+      routing: AutomaticReviewRouting;
       /** A pathless mutation still needs a manually selected review target. */
       unresolved?: true;
     }
@@ -189,12 +195,42 @@ async function readHunkReviewForSession(
   };
 }
 
+interface RouteSurfaceIdentity {
+  argsKey: string;
+  launchCwd: string;
+  pid?: number;
+  source: string;
+}
+
 interface ReviewCandidate {
+  /** Launch seed; may be retargeted to its canonical path after a root mismatch. */
   target: string;
+  /** Durable identity of the original evidence path used for queue de-duplication. */
   key: string;
   /** Preserve current-run surface ownership across transient routing failures. */
   closeWhenEmpty: boolean;
+  /** Exact surface that this route may release; ownership never transfers by proximity. */
+  ownedSurface?: RouteSurfaceIdentity;
+  /** Candidate-local races are retried, but may not pin the queue forever. */
+  transientFailures: number;
 }
+
+type RouteFailurePolicy = "global" | "retryable" | "bounded" | "terminal";
+
+type RouteNextResult =
+  | {
+      status: "reviewable";
+      repository: CurrentRepository;
+      routing: AutomaticReviewRouting;
+    }
+  | { status: "no-diff"; candidate: ReviewCandidate }
+  | {
+      status: "unavailable";
+      reason: string;
+      detail?: string;
+      candidate?: ReviewCandidate;
+      policy: RouteFailurePolicy;
+    };
 
 interface CurrentRepository {
   candidate: ReviewCandidate;
@@ -220,6 +256,8 @@ interface ManagedReviewTarget {
 
 interface PendingReviewNote {
   note: HunkReviewNote;
+  /** Delivery was attempted without confirmed host acceptance. */
+  attempted: boolean;
 }
 
 type ManagedReviewInspection =
@@ -228,7 +266,43 @@ type ManagedReviewInspection =
   | { status: "no-diff"; session: LiveHunkSession }
   | { status: "reviewable"; session: LiveHunkSession; notes: HunkReviewNote[] };
 
-export type LateReviewSubmissionHandler = (notes: HunkReviewNote[]) => Promise<void> | void;
+/** Acceptance is for the host turn only; it never implies model completion. */
+export type LateReviewSubmissionResult = { status: "accepted" } | { status: "unconfirmed" };
+
+export interface LateReviewDeliveryContext {
+  /** Pi-session epoch that discovered and owns this batch. */
+  epoch: number;
+  /** Aborted synchronously when that session is reset or shut down. */
+  signal: AbortSignal;
+}
+
+export type LateReviewSubmissionHandler = (
+  notes: HunkReviewNote[],
+  context: LateReviewDeliveryContext,
+) => Promise<LateReviewSubmissionResult> | LateReviewSubmissionResult;
+
+export type LateReviewProbeWarningHandler = (message: string) => void;
+
+interface LateProbeFailureState {
+  epoch: number;
+  surfaceKey: string;
+  lifecycle: number;
+  detail: string;
+  warned: boolean;
+}
+
+/** Pending notes deliberately handed back to the lifecycle owner at a boundary. */
+export interface ReviewSessionDrain {
+  epoch: number;
+  notes: HunkReviewNote[];
+  abortedInFlight: boolean;
+}
+
+interface LateDelivery {
+  epoch: number;
+  controller: AbortController;
+  promise: Promise<void>;
+}
 
 /** One asynchronous comment handoff and repository queue per Pi session. */
 export class ReviewHandoffGate {
@@ -241,11 +315,15 @@ export class ReviewHandoffGate {
   private terminalNoDiffRevision: number | null = null;
   private sessionEpoch = 0;
   private inspectionQueue: Promise<void> = Promise.resolve();
-  private readonly pendingReviewNotes = new Map<string, PendingReviewNote>();
+  private pendingReviewNotes = new Map<string, PendingReviewNote>();
   private lateSubmissionHandler: LateReviewSubmissionHandler | null = null;
+  private lateProbeWarningHandler: LateReviewProbeWarningHandler | null = null;
   private lateStateUnsubscribe: (() => void) | null = null;
   private lateSurfaceSnapshot: { key: string; state: string } | null = null;
-  private lateDelivery: Promise<void> | null = null;
+  private lateSurfaceLifecycle = 0;
+  /** Recoverable automatic inspection failure, retained until a successful retry/reset. */
+  private lateProbeFailure: LateProbeFailureState | null = null;
+  private lateDelivery: LateDelivery | null = null;
 
   constructor(
     private readonly coordinator: ReviewCoordinator,
@@ -253,6 +331,15 @@ export class ReviewHandoffGate {
     private readonly run?: HunkRunner,
     private readonly waitForSession: ReviewSessionWaiter = waitForManagedHunkSession,
   ) {}
+
+  /** Report a failed hide probe once, with `/hunk feedback` as its recovery action. */
+  onLateProbeWarning(handler: LateReviewProbeWarningHandler): () => void {
+    this.lateProbeWarningHandler = handler;
+    this.emitLateProbeWarning();
+    return () => {
+      if (this.lateProbeWarningHandler === handler) this.lateProbeWarningHandler = null;
+    };
+  }
 
   /** Deliver unseen comments whenever a managed Hunk surface is hidden. */
   onLateSubmission(handler: LateReviewSubmissionHandler): () => void {
@@ -273,13 +360,33 @@ export class ReviewHandoffGate {
     };
   }
 
-  resetSession(): void {
+  resetSession(): ReviewSessionDrain {
+    const epoch = this.sessionEpoch;
+    const retiringNotes = [...this.pendingReviewNotes.values()].map((entry) => entry.note);
+    const delivery = this.lateDelivery;
+
+    // Advance first: every asynchronous inspection/delivery completion checks
+    // this identity before it can mutate dedupe state. Abort is advisory for
+    // handlers that can cancel; the detached epoch guard remains authoritative.
     this.sessionEpoch += 1;
+    if (delivery?.epoch === epoch) delivery.controller.abort();
+    this.lateDelivery = null;
+
+    // Replace, rather than clear, the map captured by an old delivery. The
+    // returned snapshot is the explicit lifecycle handoff for failed,
+    // unconfirmed, or aborted notes and can never join the new epoch's queue.
+    this.pendingReviewNotes = new Map();
     this.evidenceRevision = 0;
     this.submittedNoteKeys.clear();
-    this.pendingReviewNotes.clear();
     this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
+    this.lateSurfaceLifecycle = 0;
+    this.lateProbeFailure = null;
     this.resetPlan();
+    return {
+      epoch,
+      notes: retiringNotes,
+      abortedInFlight: delivery?.epoch === epoch,
+    };
   }
 
   /** Merge one successful tool-completion delta into the deterministic queue. */
@@ -306,21 +413,48 @@ export class ReviewHandoffGate {
       return this.unresolved ? { status: "target-required" } : { status: "no-evidence" };
     }
 
+    const attemptedTransientCandidates = new Set<string>();
     for (;;) {
       const routed = await this.routeNext(ctx, source);
-      if (routed.status === "unavailable") return routed;
+      if (routed.status === "unavailable") {
+        const candidate = routed.candidate;
+        if (!candidate || routed.policy === "global") return this.publicRouteFailure(routed);
+
+        if (routed.policy === "bounded") candidate.transientFailures += 1;
+        const terminal =
+          routed.policy === "terminal" ||
+          (routed.policy === "bounded" && candidate.transientFailures >= 2);
+        if (terminal) {
+          this.discardCandidate(candidate);
+          await this.releaseCandidateSurface(candidate);
+          if (this.pending.length > 0) continue;
+          return this.publicRouteFailure(routed);
+        }
+
+        // A retryable head may yield to candidates not yet attempted by this
+        // operation. Release only its exact route-owned surface before moving on.
+        attemptedTransientCandidates.add(candidate.key);
+        const canProgress = this.pending.some(
+          (entry) => entry.key !== candidate.key && !attemptedTransientCandidates.has(entry.key),
+        );
+        if (!canProgress) return this.publicRouteFailure(routed);
+        this.deferCandidate(candidate);
+        await this.releaseCandidateSurface(candidate);
+        continue;
+      }
       if (routed.status === "reviewable") {
         this.coordinator.adoptEarlySurfaceForRun();
         return {
           status: "reviewable",
           repoRoot: routed.repository.repoRoot,
           fileCount: routed.repository.fileCount,
+          routing: routed.routing,
           ...(this.unresolved ? { unresolved: true as const } : {}),
         };
       }
 
       this.current = null;
-      if (routed.closeSurface) await this.coordinator.releaseSurfaceForRouting();
+      await this.releaseCandidateSurface(routed.candidate);
       if (this.pending.length > 0) continue;
       if (this.unresolved) return { status: "target-required" };
       this.completeNoDiff();
@@ -346,7 +480,15 @@ export class ReviewHandoffGate {
     // was already queued by a hide. Replacing the process earlier could make
     // its inline comments permanently unreachable.
     const actionEpoch = this.sessionEpoch;
-    const probe = this.activeReviewTarget() ? await this.runReviewAction(ctx) : null;
+    const routeOwnsUnregisteredSurface = Boolean(
+      !this.current &&
+      this.pending[0]?.ownedSurface &&
+      this.surfaceMatches(this.pending[0].ownedSurface),
+    );
+    const probe =
+      this.activeReviewTarget() && !routeOwnsUnregisteredSurface
+        ? await this.runReviewAction(ctx)
+        : null;
     await this.runInspection(async () => undefined);
     if (actionEpoch !== this.sessionEpoch) {
       return { status: "unavailable", reason: "session-boundary" };
@@ -359,11 +501,21 @@ export class ReviewHandoffGate {
     return this.presentAutomatic(ctx, "auto");
   }
 
+  private publicRouteFailure(
+    failure: Extract<RouteNextResult, { status: "unavailable" }>,
+  ): Extract<AutomaticReviewResult, { status: "unavailable" }> {
+    return {
+      status: "unavailable",
+      reason: failure.reason,
+      ...(failure.detail === undefined ? {} : { detail: failure.detail }),
+    };
+  }
+
   private addCandidate(target: string): void {
     const key = target;
     if (this.current?.candidate.key === key || this.pendingKeys.has(key)) return;
     this.pendingKeys.add(key);
-    this.pending.push({ target, key, closeWhenEmpty: false });
+    this.pending.push({ target, key, closeWhenEmpty: false, transientFailures: 0 });
   }
 
   private removeCandidate(candidate: ReviewCandidate): void {
@@ -373,29 +525,58 @@ export class ReviewHandoffGate {
     this.pendingKeys.delete(candidate.key);
   }
 
+  private discardCandidate(candidate: ReviewCandidate): void {
+    if (this.current?.candidate === candidate) this.current = null;
+    this.removeCandidate(candidate);
+  }
+
+  private deferCandidate(candidate: ReviewCandidate): void {
+    if (this.current?.candidate === candidate) this.current = null;
+    this.removeCandidate(candidate);
+    this.pendingKeys.add(candidate.key);
+    this.pending.push(candidate);
+  }
+
+  private surfaceMatches(identity: RouteSurfaceIdentity): boolean {
+    const info = this.coordinator.getActiveInfo();
+    return Boolean(
+      info &&
+      info.argsKey === identity.argsKey &&
+      info.launchCwd === identity.launchCwd &&
+      info.pid === identity.pid &&
+      info.source === identity.source,
+    );
+  }
+
+  private async releaseCandidateSurface(candidate: ReviewCandidate): Promise<void> {
+    if (!candidate.closeWhenEmpty || !candidate.ownedSurface) return;
+    if (this.surfaceMatches(candidate.ownedSurface)) {
+      await this.coordinator.releaseSurfaceForRouting();
+    }
+    candidate.closeWhenEmpty = false;
+    candidate.ownedSurface = undefined;
+  }
+
   private async routeNext(
     ctx: ExtensionContext,
     source: "auto" | "live" | "recover",
-  ): Promise<
-    | { status: "reviewable"; repository: CurrentRepository }
-    | { status: "no-diff"; closeSurface: boolean }
-    | { status: "unavailable"; reason: string; detail?: string }
-  > {
+  ): Promise<RouteNextResult> {
     const routeEpoch = this.sessionEpoch;
     const staleRoute = () =>
       ({
         status: "unavailable",
         reason: "session-boundary",
         detail: "The Pi session changed while Hunk routing was in progress.",
+        policy: "global",
       }) as const;
     const isCurrentRoute = () => routeEpoch === this.sessionEpoch;
 
     const existing = this.current;
-    // Peek rather than consume: launch/session-registration failures must leave
-    // the target available for a later routing retry.
+    // Peek rather than consume: the caller commits terminal removal or
+    // deterministic retry/defer only after the failure has been classified.
     const candidate = existing?.candidate ?? this.pending[0];
     if (!candidate) {
-      return { status: "unavailable", reason: "no-review-target" };
+      return { status: "unavailable", reason: "no-review-target", policy: "global" };
     }
 
     let launchCwd: string;
@@ -406,33 +587,94 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "invalid-target",
         detail: error instanceof Error ? error.message : String(error),
+        candidate,
+        policy: "terminal",
       };
     }
     if (!isCurrentRoute()) return staleRoute();
 
     const before = this.coordinator.getActiveInfo();
     const beforeLaunchCwd = before ? await canonicalizePotentialPath(before.launchCwd) : undefined;
+    const beforeRepoRoot = before?.repoRoot
+      ? await canonicalizePotentialPath(before.repoRoot)
+      : undefined;
     if (!isCurrentRoute()) return staleRoute();
     const config = this.getConfig();
+    // Manual/shortcut surfaces may only stand in for automatic review when their
+    // full launch identity already matches the configured automatic request.
+    // Matching launchCwd alone is not enough: `/hunk show HEAD~1` must not be
+    // treated as the working-copy watcher after a same-directory mutation.
+    // Build the desired key with the surface's own normalized cwd spelling.
+    // launchCwd is realpathed, while an existing surface may have been opened
+    // through an equivalent symlink; the canonical cwd comparison below owns
+    // path equivalence and argsKey owns command/argv identity.
+    const desiredArgsKey = before
+      ? argsKey(config.hunk.command, config.hunk.args, before.launchCwd)
+      : undefined;
     const reuseManualSurface =
       (before?.source === "manual" || before?.source === "shortcut") &&
-      beforeLaunchCwd === launchCwd;
+      beforeLaunchCwd === launchCwd &&
+      before.argsKey === desiredArgsKey;
     const restoreManualSurface = reuseManualSurface && before?.state === "hidden";
     if (!reuseManualSurface) {
+      // Replacing a live manual/shortcut surface can permanently drop its inline
+      // comments unless we probe first (same guarantee as `/hunk next`).
+      if (
+        before &&
+        (before.source === "manual" || before.source === "shortcut") &&
+        (before.state === "visible" || before.state === "hidden")
+      ) {
+        if (!this.activeReviewTarget()) {
+          return {
+            status: "unavailable",
+            reason: "outgoing-review-unavailable",
+            detail: "The existing manual Hunk surface could not be inspected before replacement.",
+            policy: "global",
+          };
+        }
+        const probe = await this.runReviewAction(ctx);
+        await this.runInspection(async () => undefined);
+        if (!isCurrentRoute()) return staleRoute();
+        if (probe.status === "unavailable") {
+          return {
+            status: "unavailable",
+            reason: probe.reason,
+            detail: probe.message,
+            policy: "global",
+          };
+        }
+      }
       await this.coordinator.ensureOpen(ctx, config, config.hunk.args, source, launchCwd);
     }
     if (!isCurrentRoute()) return staleRoute();
     const info = this.coordinator.getActiveInfo();
     if (!info || (info.state !== "visible" && info.state !== "hidden")) {
-      return { status: "unavailable", reason: "surface-not-live" };
+      return {
+        status: "unavailable",
+        reason: "surface-not-live",
+        candidate,
+        policy: "bounded",
+      };
     }
-    candidate.closeWhenEmpty =
-      candidate.closeWhenEmpty ||
-      existing?.closeWhenEmpty === true ||
+    // Record ownership before session lookup so transient registration failures
+    // cannot make a route-opened surface look user-owned on the next attempt.
+    const ownsActiveSurface =
+      (candidate.closeWhenEmpty &&
+        candidate.ownedSurface !== undefined &&
+        this.surfaceMatches(candidate.ownedSurface)) ||
       !before ||
       before.argsKey !== info.argsKey ||
       (before.pid !== undefined && info.pid !== undefined && before.pid !== info.pid) ||
       this.coordinator.isEarlySurfaceOwnedForRun();
+    if (ownsActiveSurface) {
+      candidate.closeWhenEmpty = true;
+      candidate.ownedSurface = {
+        argsKey: info.argsKey,
+        launchCwd: info.launchCwd,
+        pid: info.pid,
+        source: info.source,
+      };
+    }
 
     const managedPid = info.pid;
     if (managedPid === undefined || !Number.isInteger(managedPid) || managedPid <= 0) {
@@ -440,6 +682,8 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "managed-pid-missing",
         detail: "The Pi-owned Hunk process did not expose a valid PID.",
+        candidate,
+        policy: "terminal",
       };
     }
 
@@ -455,6 +699,8 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "session-not-registered",
         detail: "Hunk did not register the managed process within the bounded retry window.",
+        candidate,
+        policy: "bounded",
       };
     }
 
@@ -464,6 +710,8 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "managed-session-mismatch",
         detail: `Hunk reported pid ${session.pid} for managed pid ${managedPid}.`,
+        candidate,
+        policy: "terminal",
       };
     }
     if (!session.repoRoot) {
@@ -471,6 +719,8 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "repo-root-missing",
         detail: `Managed Hunk session ${session.sessionId} did not report a repository root.`,
+        candidate,
+        policy: "terminal",
       };
     }
     const repoRoot = await canonicalizePotentialPath(session.repoRoot);
@@ -481,6 +731,8 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "surface-changed",
         detail: "The managed Hunk surface changed while its session metadata was loading.",
+        candidate,
+        policy: "bounded",
       };
     }
 
@@ -494,9 +746,49 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "surface-changed",
         detail: "The managed Hunk surface changed while its session metadata was loading.",
+        candidate,
+        policy: "bounded",
       };
     }
 
+    // Validate the seed before removing any covered pending targets. A route
+    // launched from a cross-repository symlink may report repo A while the seed
+    // belongs to repo B; consuming other repo-A candidates here would mark a
+    // surface as covered even though this mismatched route is never presented.
+    const seedCanonical = await canonicalizePotentialPath(candidate.target);
+    if (!isCurrentRoute()) return staleRoute();
+    if (!pathIsInside(seedCanonical, repoRoot)) {
+      // Already aimed at the real path and Hunk still reported a non-covering
+      // root: leave the candidate retryable and surface an explicit mismatch.
+      if (resolve(candidate.target) === seedCanonical) {
+        // Do not leave a route-owned surface showing an unrelated repository.
+        // A matching pre-existing manual surface remains intact and retryable.
+        if (candidate.closeWhenEmpty) {
+          await this.releaseCandidateSurface(candidate);
+          if (!isCurrentRoute()) return staleRoute();
+        }
+        return {
+          status: "unavailable",
+          reason: "repo-root-mismatch",
+          detail: `Hunk reported ${repoRoot}, which does not contain ${seedCanonical}.`,
+          candidate,
+          policy: "retryable",
+        };
+      }
+      // Retarget so the next attempt launches near the real file (repo B),
+      // then close the mismatched surface and continue the routing loop.
+      candidate.target = seedCanonical;
+      if (existing) {
+        this.current = null;
+        if (!this.pendingKeys.has(candidate.key)) {
+          this.pendingKeys.add(candidate.key);
+          this.pending.unshift(candidate);
+        }
+      }
+      return { status: "no-diff", candidate };
+    }
+
+    candidate.transientFailures = 0;
     if (!(await this.coverPendingTargets(repoRoot, routeEpoch))) return staleRoute();
     if (!existing) this.removeCandidate(candidate);
     const repository: CurrentRepository = {
@@ -511,7 +803,7 @@ export class ReviewHandoffGate {
     this.current = repository;
 
     if (lookup.status === "no-diff") {
-      return { status: "no-diff", closeSurface: repository.closeWhenEmpty };
+      return { status: "no-diff", candidate };
     }
     if (
       restoreManualSurface &&
@@ -521,10 +813,30 @@ export class ReviewHandoffGate {
         status: "unavailable",
         reason: "surface-changed",
         detail: "The reused Hunk surface changed before it could be restored.",
+        candidate,
+        policy: "bounded",
       };
     }
     if (!isCurrentRoute()) return staleRoute();
-    return { status: "reviewable", repository };
+
+    const sameSurface = Boolean(
+      before &&
+      before.pid === after.pid &&
+      before.argsKey === after.argsKey &&
+      beforeLaunchCwd === (await canonicalizePotentialPath(after.launchCwd)),
+    );
+    if (!isCurrentRoute()) return staleRoute();
+    const routing: AutomaticReviewRouting = sameSurface
+      ? "reused"
+      : !before
+        ? source === "recover"
+          ? "recovered"
+          : "opened"
+        : (beforeRepoRoot !== undefined && beforeRepoRoot !== repoRoot) ||
+            (beforeLaunchCwd !== undefined && !pathIsInside(beforeLaunchCwd, repoRoot))
+          ? "rerouted"
+          : "replaced";
+    return { status: "reviewable", repository, routing };
   }
 
   private async coverPendingTargets(repoRoot: string, routeEpoch: number): Promise<boolean> {
@@ -634,7 +946,7 @@ export class ReviewHandoffGate {
     for (const note of notes) {
       const key = this.noteKey(sessionId, note);
       if (!this.submittedNoteKeys.has(key) && !this.pendingReviewNotes.has(key)) {
-        this.pendingReviewNotes.set(key, { note });
+        this.pendingReviewNotes.set(key, { note, attempted: false });
       }
     }
     void this.dispatchLateNotes();
@@ -644,7 +956,7 @@ export class ReviewHandoffGate {
   private async runReviewAction(ctx: ExtensionContext): Promise<HunkFeedbackResult> {
     if (ctx.mode !== "tui") return this.unavailable("not-tui");
     const actionEpoch = this.sessionEpoch;
-    if (this.lateDelivery) await this.lateDelivery;
+    if (this.lateDelivery) await this.lateDelivery.promise;
     if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
 
     // Retry known notes first, but still perform the promised fresh probe. New
@@ -653,7 +965,9 @@ export class ReviewHandoffGate {
     // process before they had ever been collected.
     const queuedEntries = [...this.pendingReviewNotes.entries()];
     if (queuedEntries.length > 0) {
-      await this.dispatchLateNotes();
+      // An explicit action is the recovery path for every retained note,
+      // including notes whose earlier host acceptance was unconfirmed.
+      await this.dispatchLateNotes(true);
       if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
     }
 
@@ -681,11 +995,14 @@ export class ReviewHandoffGate {
         if (!this.adoptInspectedSession(target, inspected.session)) {
           return this.unavailable("surface-changed");
         }
+        // A fresh explicit probe is the recovery boundary for a failed hide
+        // inspection. Delivery remains independently queued/unconfirmed below.
+        this.lateProbeFailure = null;
         if (inspected.status === "no-diff") {
           if (this.current === target) {
             const current = this.current;
             this.current = null;
-            if (current.closeWhenEmpty) await this.coordinator.releaseSurfaceForRouting();
+            await this.releaseCandidateSurface(current.candidate);
             if (this.pending.length === 0 && !this.unresolved) this.completeNoDiff();
           }
           return this.noDiffResult();
@@ -698,7 +1015,7 @@ export class ReviewHandoffGate {
         }
 
         const result = this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
-        if (this.lateDelivery) await this.lateDelivery;
+        if (this.lateDelivery) await this.lateDelivery.promise;
         return unseen.some((note) => this.pendingReviewNotes.has(this.noteKey(sessionId, note)))
           ? this.pendingResult(
               "Fresh Hunk notes remain queued; run /hunk feedback if automatic delivery keeps failing.",
@@ -819,46 +1136,157 @@ export class ReviewHandoffGate {
     const target = this.activeReviewTarget();
     if (!target) return;
     const epoch = this.sessionEpoch;
-    void this.runInspection(() => this.probeLateTarget(target, epoch));
+    const lifecycle = ++this.lateSurfaceLifecycle;
+    void this.runInspection(() => this.probeLateTarget(target, epoch, current.key, lifecycle));
   }
 
-  private async probeLateTarget(target: ManagedReviewTarget, epoch: number): Promise<void> {
+  private async probeLateTarget(
+    target: ManagedReviewTarget,
+    epoch: number,
+    surfaceKey: string,
+    lifecycle: number,
+  ): Promise<void> {
     try {
       const inspected = await this.inspectTarget(target);
-      if (epoch !== this.sessionEpoch || inspected.status !== "reviewable") return;
-      if (!this.adoptInspectedSession(target, inspected.session)) return;
+      if (epoch !== this.sessionEpoch) return;
+      if (inspected.status === "not-found") {
+        this.recordLateProbeFailure(
+          epoch,
+          surfaceKey,
+          lifecycle,
+          "the managed Hunk session was not found",
+        );
+        return;
+      }
+      if (inspected.status === "surface-changed") {
+        this.recordLateProbeFailure(
+          epoch,
+          surfaceKey,
+          lifecycle,
+          "the managed Hunk surface changed",
+        );
+        return;
+      }
+      if (!this.adoptInspectedSession(target, inspected.session)) {
+        this.recordLateProbeFailure(
+          epoch,
+          surfaceKey,
+          lifecycle,
+          "the managed Hunk surface changed",
+        );
+        return;
+      }
+      this.lateProbeFailure = null;
+      if (inspected.status === "no-diff") return;
       const sessionId = inspected.session.sessionId;
       const unseen = this.unseenNotes(sessionId, inspected.notes);
       if (unseen.length > 0) {
         this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
       }
-    } catch {
-      // /hunk feedback remains the explicit recovery path after a failed late probe.
+    } catch (error) {
+      if (epoch !== this.sessionEpoch) return;
+      this.recordLateProbeFailure(
+        epoch,
+        surfaceKey,
+        lifecycle,
+        error instanceof Error ? error.message : String(error),
+      );
     }
   }
 
-  private async dispatchLateNotes(): Promise<void> {
+  private recordLateProbeFailure(
+    epoch: number,
+    surfaceKey: string,
+    lifecycle: number,
+    detail: string,
+  ): void {
+    const existing = this.lateProbeFailure;
+    if (
+      existing?.epoch === epoch &&
+      existing.surfaceKey === surfaceKey &&
+      existing.lifecycle === lifecycle
+    ) {
+      return;
+    }
+    this.lateProbeFailure = { epoch, surfaceKey, lifecycle, detail, warned: false };
+    this.emitLateProbeWarning();
+  }
+
+  private emitLateProbeWarning(): void {
+    const failure = this.lateProbeFailure;
+    const handler = this.lateProbeWarningHandler;
+    if (!failure || failure.warned || !handler) return;
+    failure.warned = true;
+    try {
+      handler(
+        `Hunk comments were not inspected when the review was hidden (${failure.detail}); ` +
+          "run /hunk feedback to retry before closing or replacing Hunk.",
+      );
+    } catch {
+      // Notification failure must not affect probe recovery or create a retry loop.
+    }
+  }
+
+  private async dispatchLateNotes(retryUnconfirmed = false): Promise<void> {
     const handler = this.lateSubmissionHandler;
     if (!handler || this.lateDelivery || this.pendingReviewNotes.size === 0) return;
-    const batch = [...this.pendingReviewNotes.entries()];
-    let delivered = false;
-    const delivery = (async () => {
+    const epoch = this.sessionEpoch;
+    const pending = this.pendingReviewNotes;
+    const batch = [...pending.entries()].filter(
+      ([, entry]) => retryUnconfirmed || !entry.attempted,
+    );
+    if (batch.length === 0) return;
+
+    // Mark before calling the fire-and-forget host boundary. A rejection or an
+    // unconfirmed return must remain recoverable without immediately resending
+    // the same batch in a tight loop. `/hunk feedback` opts into a retry.
+    for (const [key, entry] of batch) {
+      if (pending.get(key) === entry) entry.attempted = true;
+    }
+
+    const controller = new AbortController();
+    const promise = (async () => {
       try {
-        await handler(batch.map(([, entry]) => entry.note));
-        delivered = true;
+        const result = await handler(
+          batch.map(([, entry]) => entry.note),
+          {
+            epoch,
+            signal: controller.signal,
+          },
+        );
+        // A retired completion may resolve successfully, but ownership of its
+        // queue and dedupe records ended at the boundary.
+        if (
+          result.status !== "accepted" ||
+          controller.signal.aborted ||
+          epoch !== this.sessionEpoch ||
+          pending !== this.pendingReviewNotes
+        ) {
+          return;
+        }
         for (const [key, entry] of batch) {
-          if (this.pendingReviewNotes.get(key) !== entry) continue;
-          this.pendingReviewNotes.delete(key);
+          if (pending.get(key) !== entry) continue;
+          pending.delete(key);
           this.submittedNoteKeys.add(key);
         }
       } catch {
-        // Keep the notes queued so /hunk feedback can recover them.
+        // Keep notes queued so /hunk feedback or session drain can recover them.
       }
     })();
+    const delivery: LateDelivery = { epoch, controller, promise };
     this.lateDelivery = delivery;
-    await delivery;
+    await promise;
     if (this.lateDelivery === delivery) this.lateDelivery = null;
-    if (delivered && this.pendingReviewNotes.size > 0) void this.dispatchLateNotes();
+
+    // Notes can be discovered while a delivery is in flight. Dispatch only
+    // current-epoch entries never attempted; retired maps are never revisited.
+    if (
+      epoch === this.sessionEpoch &&
+      pending === this.pendingReviewNotes &&
+      [...pending.values()].some((entry) => !entry.attempted)
+    ) {
+      void this.dispatchLateNotes();
+    }
   }
 
   private completeNoDiff(): void {

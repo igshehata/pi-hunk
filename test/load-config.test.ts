@@ -205,11 +205,52 @@ describe("config loading", () => {
     }
   });
 
-  it("rejects invalid JSON", async () => {
-    const root = await temporaryDirectory("hunk-invalid-");
+  it("keeps valid global config, repairs malformed project JSON, and restores cleanly", async () => {
+    const root = await temporaryDirectory("hunk-malformed-project-");
     const globalPath = join(root, "global.json");
+    const projectPath = join(root, ".pi", "hunk.json");
     process.env.PI_HUNK_CONFIG = globalPath;
-    await writeFile(globalPath, "{ not json");
-    await expect(loadConfig(context(root))).rejects.toThrow("Invalid Hunk config");
+    await writeFile(globalPath, JSON.stringify({ review: "live", followEdits: false }));
+    await mkdir(join(root, ".pi"));
+    await writeFile(projectPath, "{ not json");
+    const warnings: string[] = [];
+    const store = new ConfigStore();
+
+    await store.reload(context(root), (warning) => warnings.push(warning));
+
+    expect(store.get()).toMatchObject({ review: "live", followEdits: false });
+    expect(warnings).toEqual([
+      expect.stringContaining(`Ignoring malformed Hunk config at ${projectPath}`),
+    ]);
+
+    // Trusted ordinary writes repair malformed targets from a sparse empty base.
+    await store.persist(context(root), "project", { overlay: { layout: "float" } });
+    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
+      overlay: { layout: "float" },
+    });
+    expect(store.getLoaded()).toMatchObject({
+      review: "live",
+      followEdits: false,
+      overlay: { layout: "float" },
+    });
+
+    await store.resetProject(context(root));
+    await expect(readFile(projectPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(store.getLoaded()).toMatchObject({
+      review: "live",
+      followEdits: false,
+      overlay: DEFAULT_CONFIG.overlay,
+    });
+  });
+
+  it("does not classify genuine config read failures as missing or malformed", async () => {
+    const root = await temporaryDirectory("hunk-config-io-");
+    process.env.PI_HUNK_CONFIG = root;
+    const warnings: string[] = [];
+
+    await expect(loadConfig(context(root), (warning) => warnings.push(warning))).rejects.toThrow(
+      "Could not read Hunk config",
+    );
+    expect(warnings).toEqual([]);
   });
 });

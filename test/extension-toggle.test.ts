@@ -12,6 +12,10 @@ import { OverlaySurface, type OverlayComponent } from "../extensions/overlay/sur
 const temporaryDirectories: string[] = [];
 type PrefixAction = "h" | "s";
 type PrefixActionSource = PrefixAction | (() => PrefixAction);
+interface ConfigInteraction {
+  selections: string[];
+  keySequences: string[][];
+}
 
 afterEach(async () => {
   delete process.env.PI_HUNK_CONFIG;
@@ -25,6 +29,7 @@ async function setup(
   trusted = false,
   prefixAction: PrefixActionSource = "h",
   rawBindings: Record<string, string> = { prefix },
+  configInteraction?: ConfigInteraction,
 ) {
   const root = await mkdtemp(join(tmpdir(), "pi-hunk-extension-"));
   temporaryDirectories.push(root);
@@ -76,22 +81,24 @@ async function setup(
     registerTool: () => undefined,
   } as unknown as ExtensionAPI;
 
+  const store = new ConfigStore();
   hunkExtension(pi, {
-    store: new ConfigStore(),
+    store,
     coordinator,
     reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
     reviewWaitForSession: async () => ({ status: "not-found" }),
   });
 
-  const ctx = createContext(root, trusted, prefixAction);
+  const ctx = createContext(root, trusted, prefixAction, configInteraction);
   await events.get("session_start")?.({ type: "session_start" }, ctx);
-  return { ctx, coordinator, mounts, shortcuts, commands };
+  return { ctx, coordinator, events, mounts, shortcuts, commands, store };
 }
 
 function createContext(
   cwd: string,
   trusted: boolean,
   prefixAction: PrefixActionSource,
+  configInteraction?: ConfigInteraction,
 ): ExtensionCommandContext {
   return {
     cwd,
@@ -101,6 +108,7 @@ function createContext(
     ui: {
       notify: vi.fn(),
       setStatus: vi.fn(),
+      select: vi.fn(async () => configInteraction?.selections.shift()),
       theme: { fg: (_color: string, text: string) => text },
       custom<T>(
         factory: (
@@ -128,9 +136,11 @@ function createContext(
           },
         ) as { handleInput?: (data: string) => void };
         if (!options?.onHandle) {
-          component.handleInput?.(
+          const configuredSequence = configInteraction?.keySequences.shift();
+          const sequence = configuredSequence ?? [
             typeof prefixAction === "function" ? prefixAction() : prefixAction,
-          );
+          ];
+          for (const data of sequence) component.handleInput?.(data);
           return Promise.resolve(result as T);
         }
         options.onHandle({
@@ -305,5 +315,42 @@ describe("extension overlay integration", () => {
       review: "live",
     });
     expect(ctx.ui.notify).toHaveBeenCalledWith("Hunk review set to live in .pi/hunk.json.", "info");
+  });
+
+  it("keeps the entire pending chord inactive across file reloads and /hunk review until session start", async () => {
+    const originalBindings = { prefix: "ctrl+space", toggle: "h", show: "s" } as const;
+    const pendingBindings = { prefix: "ctrl+x", toggle: "j", show: "k" } as const;
+    const { ctx, commands, events, shortcuts, store } = await setup(
+      originalBindings.prefix,
+      true,
+      "h",
+      originalBindings,
+      {
+        selections: ["Hunk prefix:", "Toggle hotkey:", "Show hotkey:", "Done"],
+        keySequences: [["\x18"], ["j"], ["k"]],
+      },
+    );
+
+    await commands.get("hunk")?.("config", ctx);
+
+    expect(store.get().bindings).toEqual(originalBindings);
+    expect(store.getLoaded().bindings).toEqual(pendingBindings);
+    await store.reload(ctx);
+    expect(store.get().bindings).toEqual(originalBindings);
+
+    await commands.get("hunk")?.("review live", ctx);
+
+    expect(store.get()).toMatchObject({ review: "live", bindings: originalBindings });
+    expect(store.getLoaded()).toMatchObject({ review: "live", bindings: pendingBindings });
+    expect(JSON.parse(await readFile(join(ctx.cwd, ".pi", "hunk.json"), "utf8"))).toEqual({
+      bindings: pendingBindings,
+      review: "live",
+    });
+    expect([...shortcuts.keys()]).toEqual([originalBindings.prefix]);
+
+    await events.get("session_start")?.({ type: "session_start" }, ctx);
+
+    expect(store.get()).toMatchObject({ review: "live", bindings: pendingBindings });
+    expect([...shortcuts.keys()]).toEqual([originalBindings.prefix, pendingBindings.prefix]);
   });
 });

@@ -1,4 +1,4 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, parseKey, truncateToWidth, type KeyId } from "@earendil-works/pi-tui";
 import {
   cloneConfig,
@@ -30,6 +30,23 @@ export function parseConfigCommand(input: string): ConfigCommandSelection | unde
 
 function displayLayout(layout: OverlayLayout): string {
   return LAYOUT_CHOICES.find((choice) => choice.value === layout)?.label ?? layout;
+}
+
+/** Report the durable review value separately from higher-precedence runtime layers. */
+export function reportPersistedReviewPolicy(
+  ctx: ExtensionContext,
+  store: ConfigStore,
+  savedReview: HunkConfig["review"],
+): void {
+  const effective = store.get().review;
+  if (effective !== savedReview) {
+    ctx.ui.notify(
+      `Hunk review=${savedReview} was saved to .pi/hunk.json, but PI_HUNK_REVIEW keeps review=${effective}.`,
+      "warning",
+    );
+    return;
+  }
+  ctx.ui.notify(`Hunk review set to ${savedReview} in .pi/hunk.json.`, "info");
 }
 
 /** Convert one raw terminal keypress into a safe Pi shortcut identifier. */
@@ -130,7 +147,8 @@ async function persistProjectChange(
 
   let saved: HunkConfig;
   try {
-    saved = await store.persist(ctx, "project", patch);
+    await store.persist(ctx, "project", patch);
+    saved = store.getLoaded();
   } catch (error) {
     ctx.ui.notify(
       `Could not update project Hunk config: ${error instanceof Error ? error.message : String(error)}`,
@@ -165,6 +183,9 @@ async function persistProjectChange(
   }
   if (notifySaved && overlayChanged) {
     messages.push(`Layout: ${displayLayout(saved.overlay.layout)}.`);
+  }
+  if (before.review !== after.review) {
+    reportPersistedReviewPolicy(ctx, store, after.review);
   }
   if (messages.length > 0) ctx.ui.notify(messages.join(" "), "info");
   return saved;
@@ -208,7 +229,8 @@ async function configureInteractively(
       ]);
       if (!confirmed?.startsWith("Restore")) continue;
       try {
-        const restored = await store.resetProject(ctx);
+        await store.resetProject(ctx);
+        const restored = store.getLoaded();
         if (
           (["prefix", "toggle", "show"] as const).some(
             (binding) => restored.bindings[binding] !== runtimeBindings[binding],
@@ -319,7 +341,8 @@ export async function handleConfigCommand(
   const current = store.get();
   if (input.trim() === "restore") {
     try {
-      const restored = await store.resetProject(ctx);
+      await store.resetProject(ctx);
+      const restored = store.getLoaded();
       const shortcutsChanged = (["prefix", "toggle", "show"] as const).some(
         (binding) => restored.bindings[binding] !== current.bindings[binding],
       );

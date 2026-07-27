@@ -28,13 +28,14 @@ import {
   type SettledDecision,
 } from "./config.ts";
 import { ReviewCoordinator } from "./coordinator.ts";
-import { handleConfigCommand } from "./config-command.ts";
+import { handleConfigCommand, reportPersistedReviewPolicy } from "./config-command.ts";
 import {
   readHunkReview,
   ReviewHandoffGate,
   type AutomaticReviewResult,
   type HunkFeedbackResult,
   type HunkReviewNote,
+  type ReviewSessionDrain,
   type ReviewSessionWaiter,
 } from "./review-handoff.ts";
 import type { HunkRunner } from "./hunk-session.ts";
@@ -123,13 +124,19 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
   coordinator.onStateChange(() => {
     if (statusContext) updateStatus(statusContext, store.get(), coordinator);
   });
-  reviewGate.onLateSubmission(async (notes) => {
+  reviewGate.onLateProbeWarning((message) => {
+    statusContext?.ui.notify(message, "warning");
+  });
+  reviewGate.onLateSubmission(async (notes, delivery) => {
     const ctx = statusContext;
-    if (!ctx) throw new Error("The Pi session ended before late Hunk feedback was delivered.");
+    if (!ctx || delivery.signal.aborted) {
+      throw new Error("The Pi session ended before late Hunk feedback was delivered.");
+    }
     try {
       const message = formatManualFeedback(notes);
-      if (ctx.isIdle()) pi.sendUserMessage(message);
-      else pi.sendUserMessage(message, { deliverAs: "followUp" });
+      // Pi's current API is fire-and-forget: followUp avoids the idle-check
+      // race, but a void return still cannot confirm asynchronous acceptance.
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
     } catch (error) {
       try {
         ctx.ui.notify(
@@ -141,14 +148,9 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
       }
       throw error;
     }
-    try {
-      ctx.ui.notify(
-        `Sent ${notes.length} Hunk feedback note${notes.length === 1 ? "" : "s"} to the agent.`,
-        "info",
-      );
-    } catch {
-      // The user turn was sent; a notification failure must not duplicate it.
-    }
+    // A return from sendUserMessage does not acknowledge host acceptance.
+    // Keep the queue/dedupe record recoverable until Pi exposes such a signal.
+    return { status: "unconfirmed" };
   });
 
   const diagnostics: SettledDiagnostics = { decision: null };
@@ -197,18 +199,24 @@ async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     registerPrefix,
     setStatusContext,
   } = deps;
+  // Retire the prior epoch before exposing the new Pi context. A blocked old
+  // handler can finish later, but can neither target nor mutate this session.
+  reportSessionDrain(ctx, reviewGate.resetSession());
   setStatusContext(ctx);
   try {
     await coordinator.activateSession();
   } catch {
-    // Best-effort; never block session startup indefinitely.
-    coordinator.revive();
+    // Best-effort; never leave a surviving surface orphaned during recovery.
+    try {
+      await coordinator.revive();
+    } catch {
+      // Session setup continues even when final cleanup is unavailable.
+    }
   }
   detector.reset();
-  reviewGate.resetSession();
   diagnostics.decision = null;
   try {
-    await store.reload(ctx, (message) => ctx.ui.notify(message, "warning"));
+    await store.startSession(ctx, (message) => ctx.ui.notify(message, "warning"));
   } catch (error) {
     ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
   }
@@ -220,14 +228,33 @@ async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promi
 async function onSessionShutdown(ctx: ExtensionContext, deps: LifecycleDeps): Promise<void> {
   const { detector, coordinator, reviewGate, setStatusContext } = deps;
   detector.reset();
+  // Abort and drain feedback before surface teardown can trigger more probes,
+  // and revoke the delivery context before any asynchronous shutdown wait.
+  const drained = reviewGate.resetSession();
+  setStatusContext(undefined);
+  reportSessionDrain(ctx, drained);
   try {
     await coordinator.shutdown();
   } catch {
     // Best-effort.
   }
-  reviewGate.resetSession();
-  setStatusContext(undefined);
   ctx.ui.setStatus("hunk", undefined);
+}
+
+function reportSessionDrain(ctx: ExtensionContext, drain: ReviewSessionDrain): void {
+  if (drain.notes.length === 0) return;
+  const summaries = drain.notes.map((note) => `${note.file}: ${note.summary}`).join("; ");
+  try {
+    ctx.ui.notify(
+      `${drain.notes.length} Hunk feedback note${drain.notes.length === 1 ? "" : "s"} ` +
+        `from the ending session remain recoverable in their originating Hunk review; delivery ` +
+        `was not confirmed, and they will not be sent through the new Pi session: ${summaries}`,
+      "warning",
+    );
+  } catch {
+    // The full drain has already been returned to this lifecycle boundary;
+    // teardown must not fail solely because the old UI context is unavailable.
+  }
 }
 
 /** agent_start: reset coordinator flags for the new agent turn. */
@@ -341,9 +368,8 @@ function onToolExecutionEnd(
   if (!config.followEdits) return;
   if (!coordinator.hasLiveSurface() && !coordinator.getEarlyOpenPromise()) return;
 
-  const target = evidence.targets[0];
-  if (!target) return;
-  coordinator.scheduleFollowEdit(ctx, config, target);
+  if (evidence.targets.length === 0) return;
+  void coordinator.scheduleFollowEditCandidates(ctx, config, evidence.targets);
 }
 
 /**
@@ -415,6 +441,16 @@ async function onAgentSettled(ctx: ExtensionContext, deps: LifecycleDeps): Promi
       config.review === "live" ? (coordinator.hasLiveSurface() ? "live" : "recover") : "auto";
     const presented = await reviewGate.presentAutomatic(ctx, source);
     if (presented.status === "reviewable") {
+      diagnostics.decision =
+        presented.routing === "reused"
+          ? { action: "skipped", reason: "already-open" }
+          : presented.routing === "recovered"
+            ? { action: "opened", reason: "recover" }
+            : presented.routing === "rerouted"
+              ? { action: "opened", reason: "reroute" }
+              : presented.routing === "replaced"
+                ? { action: "opened", reason: "replacement" }
+                : { action: "opened", reason: "mutation" };
       updateStatus(ctx, store.get(), coordinator);
       if (presented.unresolved) ctx.ui.notify(UNRESOLVED_MUTATION_WARNING, "warning");
       return;
@@ -793,15 +829,7 @@ async function handleReviewCommand(
     );
     return;
   }
-  const effective = store.get().review;
-  if (effective !== value) {
-    ctx.ui.notify(
-      `Hunk review=${value} was saved to .pi/hunk.json, but PI_HUNK_REVIEW keeps review=${effective}.`,
-      "warning",
-    );
-    return;
-  }
-  ctx.ui.notify(`Hunk review set to ${value} in .pi/hunk.json.`, "info");
+  reportPersistedReviewPolicy(ctx, store, value);
 }
 
 function updateStatus(

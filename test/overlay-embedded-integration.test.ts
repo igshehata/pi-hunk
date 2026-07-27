@@ -16,6 +16,7 @@ vi.mock("../extensions/overlay/pty.ts", () => ({
 
 import { cloneConfig, DEFAULT_CONFIG } from "../extensions/config.ts";
 import { EmbeddedHunk } from "../extensions/overlay/embedded.ts";
+import { spawnOverlayPty } from "../extensions/overlay/pty.ts";
 import { OverlaySurface, type OverlayComponent } from "../extensions/overlay/surface.ts";
 
 beforeEach(() => vi.clearAllMocks());
@@ -111,13 +112,40 @@ describe("critical surface + embedded Hunk integration", () => {
     harness.mounted!.handleInput!("\x1b[<35;25;20M");
     expect(pty.write).not.toHaveBeenCalled();
 
+    // A split owns a drag that started inside and clamps its outside drag/up.
+    harness.mounted!.handleInput!("\x1b[<0;75;20M");
+    harness.mounted!.handleInput!("\x1b[<32;25;20M");
+    harness.mounted!.handleInput!("\x1b[<0;25;20m");
+    expect(pty.write.mock.calls.map(([data]) => data)).toEqual([
+      "\x1b[<0;25;20M",
+      "\x1b[<32;1;20M",
+      "\x1b[<0;1;20m",
+    ]);
+
+    // Losing keyboard focus is not a surface lifecycle boundary: Pi may blur
+    // the component as the captured pointer leaves its rectangle.
+    harness.mounted!.handleInput!("\x1b[<0;75;20M");
+    (harness.mounted as EmbeddedHunk).focused = false;
+    pty.write.mockClear();
+    harness.mounted!.handleInput!("\x1b[<0;25;20m");
+    expect(pty.write).toHaveBeenCalledWith("\x1b[<0;1;20m");
+    (harness.mounted as EmbeddedHunk).focused = true;
+
+    // Hide/show is a capture lifecycle boundary; an old outside release must
+    // not leak into the newly presented surface.
+    pty.write.mockClear();
+    harness.mounted!.handleInput!("\x1b[<0;75;20M");
     await surface.hide();
     expect(harness.handle.hidden).toBe(true);
     expect(harness.tui.render(100)).toEqual(["pi:100"]);
+    await surface.show();
+    pty.write.mockClear();
+    harness.mounted!.handleInput!("\x1b[<0;25;20m");
+    expect(pty.write).not.toHaveBeenCalled();
     await surface.close();
   });
 
-  it("keeps float hover and click coordinates on the same reported row", async () => {
+  it("starts a 75% float at its resolved PTY geometry and keeps mouse rows aligned", async () => {
     const harness = integrationHarness();
     const surface = new OverlaySurface((options) => new EmbeddedHunk(options));
     const config = cloneConfig(DEFAULT_CONFIG);
@@ -130,6 +158,13 @@ describe("critical surface + embedded Hunk integration", () => {
       { cwd: "/repo", command: "hunk", args: ["diff"], source: "shortcut" },
       config,
     );
+    // The child must never observe a transient full-terminal geometry before
+    // Pi's first component render; Hunk lays out its initial frame immediately.
+    expect(spawnOverlayPty).toHaveBeenCalledWith(
+      expect.objectContaining({ columns: 75, rows: 30 }),
+    );
+    expect(pty.resize).not.toHaveBeenCalled();
+
     harness.mounted!.render(75);
     pty.write.mockClear();
 
@@ -138,7 +173,20 @@ describe("critical surface + embedded Hunk integration", () => {
     // click it changes the target. Hover and mouse-up must reach the same cell.
     harness.mounted!.handleInput!("\x1b[<35;20;10M");
     harness.mounted!.handleInput!("\x1b[<0;20;10M");
-    expect(pty.write.mock.calls.map(([data]) => data)).toEqual(["\x1b[<35;8;6M", "\x1b[<0;8;6M"]);
+    harness.mounted!.handleInput!("\x1b[<32;100;40M");
+    harness.mounted!.handleInput!("\x1b[<0;100;40m");
+    expect(pty.write.mock.calls.map(([data]) => data)).toEqual([
+      "\x1b[<35;8;6M",
+      "\x1b[<0;8;6M",
+      "\x1b[<32;75;30M",
+      "\x1b[<0;75;30m",
+    ]);
+
+    // Embed mode uses the shared Kitty-to-xterm input translator.
+    pty.write.mockClear();
+    harness.mounted!.handleInput!("\x1b[57364;1:2u");
+    harness.mounted!.handleInput!("\x1b[57364;1:3u");
+    expect(pty.write.mock.calls.map(([data]) => data)).toEqual(["\x1bOP"]);
     await surface.close();
   });
 

@@ -30,15 +30,23 @@ export function argsKey(command: string, args: string[], cwd?: string): string {
   return JSON.stringify(cwd === undefined ? [command, ...args] : [cwd, command, ...args]);
 }
 
-export function resolveOverlayRows(maxHeight: OverlaySize, terminalRows: number): number {
-  const rows = Math.max(1, terminalRows);
-  if (typeof maxHeight === "number") {
-    return Math.max(1, Math.min(rows, Math.floor(maxHeight)));
+function resolveOverlaySize(size: OverlaySize, terminalSize: number): number {
+  const available = Math.max(1, terminalSize);
+  if (typeof size === "number") {
+    return Math.max(1, Math.min(available, Math.floor(size)));
   }
 
-  const percentage = Number.parseFloat(maxHeight.slice(0, -1));
+  const percentage = Number.parseFloat(size.slice(0, -1));
   if (Number.isFinite(percentage) && percentage > 0) {
-    return Math.max(1, Math.min(rows, Math.floor((rows * percentage) / 100)));
+    return Math.max(1, Math.min(available, Math.floor((available * percentage) / 100)));
   }
-  return rows;
+  return available;
+}
+
+export function resolveOverlayColumns(width: OverlaySize, terminalColumns: number): number {
+  return resolveOverlaySize(width, terminalColumns);
+}
+
+export function resolveOverlayRows(maxHeight: OverlaySize, terminalRows: number): number {
+  return resolveOverlaySize(maxHeight, terminalRows);
 }
