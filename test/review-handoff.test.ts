@@ -1069,6 +1069,86 @@ describe("asynchronous Hunk comment handoff", () => {
     }
   });
 
+  it("requeues a current route-owned candidate before closing a mismatched surface", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-current-mismatch-")));
+    const repoRoot = join(root, "repo");
+    const seedRoot = join(root, "seeds");
+    const repoFile = join(repoRoot, "file.ts");
+    const seedPath = join(seedRoot, "file.ts");
+    try {
+      await Promise.all([
+        mkdir(repoRoot, { recursive: true }),
+        mkdir(seedRoot, { recursive: true }),
+      ]);
+      await writeFile(repoFile, "export const inside = true;\n");
+      await symlink(repoFile, seedPath);
+
+      const coordinator = new FakeCoordinator();
+      coordinator.pid = 101;
+      const adoptedSession = session({
+        sessionId: "adopted",
+        cwd: repoRoot,
+        repoRoot,
+        files: [{ path: "file.ts" }],
+      });
+      const outsideSession = session({
+        sessionId: "outside",
+        cwd: seedRoot,
+        repoRoot: seedRoot,
+        files: [{ path: "file.ts" }],
+      });
+      let lookup = 0;
+      const waitForSession = vi.fn(async () => ({
+        status: "reviewable" as const,
+        session: lookup++ < 2 ? adoptedSession : outsideSession,
+      }));
+      const gate = new ReviewHandoffGate(
+        coordinator as unknown as ReviewCoordinator,
+        () => DEFAULT_CONFIG,
+        runner([], [adoptedSession, outsideSession]),
+        waitForSession,
+      );
+      gate.addEvidence({
+        mutation: true,
+        targets: [seedPath],
+        unresolved: false,
+        revision: 1,
+      });
+      const ctx = { cwd: root, mode: "tui" } as ExtensionContext;
+
+      // The external seed initially resolves through its symlink into the
+      // adopted repository and becomes the current route-owned candidate.
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot,
+      });
+      gate.onLateSubmission(acceptedDelivery);
+
+      // Replacing the symlink with a real external file makes the same current
+      // candidate canonical but no longer covered by the adopted repository.
+      await rm(seedPath);
+      await writeFile(seedPath, "export const outside = true;\n");
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "unavailable",
+        reason: "repo-root-mismatch",
+      });
+      expect(coordinator.releaseSurfaceForRouting).toHaveBeenCalledOnce();
+      expect(coordinator.state).toBe("closed");
+
+      // The close notification above synchronously runs the production state
+      // listener. A later automatic attempt must still retry this exact seed.
+      await expect(gate.presentAutomatic(ctx)).resolves.toMatchObject({
+        status: "reviewable",
+        repoRoot: seedRoot,
+      });
+      expect(coordinator.ensureOpen).toHaveBeenCalledTimes(3);
+      // A successful retry consumes the sole queued copy of the candidate.
+      await expect(gate.next(ctx)).resolves.toEqual({ status: "no-evidence" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("forgets the automatic target when its managed surface closes", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-async-close-")));
     try {

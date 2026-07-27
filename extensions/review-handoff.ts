@@ -537,6 +537,13 @@ export class ReviewHandoffGate {
     this.pending.push(candidate);
   }
 
+  private requeueCurrentCandidate(candidate: ReviewCandidate): void {
+    if (this.current?.candidate === candidate) this.current = null;
+    if (this.pendingKeys.has(candidate.key)) return;
+    this.pendingKeys.add(candidate.key);
+    this.pending.unshift(candidate);
+  }
+
   private surfaceMatches(identity: RouteSurfaceIdentity): boolean {
     const info = this.coordinator.getActiveInfo();
     return Boolean(
@@ -764,6 +771,9 @@ export class ReviewHandoffGate {
         // Do not leave a route-owned surface showing an unrelated repository.
         // A matching pre-existing manual surface remains intact and retryable.
         if (candidate.closeWhenEmpty) {
+          // Closing emits synchronously; preserve a candidate that came from
+          // current before the production state listener clears that pointer.
+          if (existing) this.requeueCurrentCandidate(candidate);
           await this.releaseCandidateSurface(candidate);
           if (!isCurrentRoute()) return staleRoute();
         }
@@ -778,13 +788,7 @@ export class ReviewHandoffGate {
       // Retarget so the next attempt launches near the real file (repo B),
       // then close the mismatched surface and continue the routing loop.
       candidate.target = seedCanonical;
-      if (existing) {
-        this.current = null;
-        if (!this.pendingKeys.has(candidate.key)) {
-          this.pendingKeys.add(candidate.key);
-          this.pending.unshift(candidate);
-        }
-      }
+      if (existing) this.requeueCurrentCandidate(candidate);
       return { status: "no-diff", candidate };
     }
 
