@@ -266,10 +266,7 @@ describe("direct /hunk config", () => {
     await handleConfigCommand("left no-wrap", ctx, store, inactiveCoordinator);
 
     await expect(access(projectPath)).rejects.toThrow();
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("Usage:"),
-      "warning",
-    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Usage:"), "warning");
   });
 
   it("supports direct project reset and restores inherited global settings", async () => {

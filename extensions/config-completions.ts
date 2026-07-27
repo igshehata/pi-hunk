@@ -69,7 +69,7 @@ export const RESERVED_SUBCOMMANDS = new Set([
 function subcommandValues(
   first: string,
   argumentIndex: number,
-  tokens: string[],
+  _tokens: string[],
 ): string[] | undefined {
   if (first === "review") {
     if (argumentIndex === 1) return ["off", "after-run", "live"];

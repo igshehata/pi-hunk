@@ -8,8 +8,7 @@ import type { HunkExit } from "./embedded.ts";
 const ENABLE_MOUSE = "\x1b[?1003h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 // Best-effort restore when leaving takeover so Pi's next full paint is not dirty.
-const RESTORE_TERMINAL =
-  "\x1b[0m\x1b]8;;\x07\x1b[?2026l\x1b[?6l\x1b[?7h\x1b[?25h" + DISABLE_MOUSE;
+const RESTORE_TERMINAL = "\x1b[0m\x1b]8;;\x07\x1b[?2026l\x1b[?6l\x1b[?7h\x1b[?25h" + DISABLE_MOUSE;
 const DEFAULT_STARTUP_FRAME_DEADLINE_MS = 12_000;
 const STARTUP_TIMEOUT_EXIT_CODE = 124;
 
@@ -117,24 +116,20 @@ export class TakeoverHunk implements Component, Focusable {
     this.runtime = options.tui as unknown as TuiPaintRuntime;
     this.originalRequestRender = this.runtime.requestRender.bind(options.tui);
 
-    try {
-      this.pty = spawnOverlayPty({
-        command: options.command,
-        args: options.args,
-        cwd: options.cwd,
-        columns: this.columns,
-        rows: this.rows,
-        env: {
-          ...process.env,
-          TERM: "xterm-256color",
-          COLORTERM: "truecolor",
-          TERM_PROGRAM: "pi-hunk-takeover",
-          FORCE_COLOR: "3",
-        } as Record<string, string>,
-      });
-    } catch (error) {
-      throw error;
-    }
+    this.pty = spawnOverlayPty({
+      command: options.command,
+      args: options.args,
+      cwd: options.cwd,
+      columns: this.columns,
+      rows: this.rows,
+      env: {
+        ...process.env,
+        TERM: "xterm-256color",
+        COLORTERM: "truecolor",
+        TERM_PROGRAM: "pi-hunk-takeover",
+        FORCE_COLOR: "3",
+      } as Record<string, string>,
+    });
 
     const gen = this.generation;
     this.subscriptions.push(

@@ -6,11 +6,7 @@ import { resolve } from "node:path";
 // inside open() via loadEmbedded so a broken native build fails over instead of
 // crashing extension load for every user (see #14).
 import type { EmbeddedOptions, HunkExit } from "./embedded.ts";
-import {
-  resolveOverlayHostMode,
-  resolveOverlayLayout,
-  type HunkConfig,
-} from "../config.ts";
+import { resolveOverlayHostMode, resolveOverlayLayout, type HunkConfig } from "../config.ts";
 import {
   argsKey,
   resolveOverlayRows,
@@ -460,7 +456,7 @@ export class OverlaySurface {
                 this.experimentalPiWrap = installExperimentalPiWrap(tui, overlay.layout);
               } catch (error) {
                 this.experimentalPiWrap = undefined;
-                ctx.ui.notify(
+                ctx.ui.notify?.(
                   `Pi split wrap is unavailable: ${error instanceof Error ? error.message : String(error)}`,
                   "warning",
                 );
@@ -469,13 +465,14 @@ export class OverlaySurface {
               this.experimentalPiWrap = undefined;
             }
             // Exclusive region paint is core for left/right when wrap installed.
+            // Incomplete TUI mocks (unit tests) fall back to classic embed without crashing open().
             try {
               const exclusiveEligible =
                 hostMode === "exclusive" && this.experimentalPiWrap !== undefined;
               this.exclusiveFrame = installExclusiveFrame(tui, overlay.layout, exclusiveEligible);
             } catch (error) {
               this.exclusiveFrame = undefined;
-              ctx.ui.notify(
+              ctx.ui.notify?.(
                 `Exclusive Hunk painting is unavailable: ${error instanceof Error ? error.message : String(error)}`,
                 "warning",
               );

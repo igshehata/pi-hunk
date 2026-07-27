@@ -28,9 +28,7 @@ export interface OverlayConfig {
  */
 export type OverlayHostMode = "embed" | "exclusive" | "takeover";
 
-export function resolveOverlayHostMode(
-  overlay: Pick<OverlayConfig, "layout">,
-): OverlayHostMode {
+export function resolveOverlayHostMode(overlay: Pick<OverlayConfig, "layout">): OverlayHostMode {
   if (overlay.layout === "full") return "takeover";
   if (overlay.layout === "left" || overlay.layout === "right") return "exclusive";
   return "embed";

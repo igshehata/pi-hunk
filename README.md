@@ -201,12 +201,13 @@ By default, Hunk opens in the right half of the terminal and Pi always wraps int
 derived from layout only — not separate flags:
 
 - `full` → same-tab **takeover** (Hunk owns the TTY; Pi paint suspended)
-- `left`/`right` → **exclusive** region paint (Pi wraps into remaining columns; direct Hunk rectangle writes while focused)
+- `left`/`right` → **exclusive** region paint (Pi wraps into remaining columns; direct Hunk
+  rectangle writes while focused)
 - `float` → classic **embed** composite
 
-Toggle with `/hunk config full`, `/hunk config right`, or `/hunk config float`.
-`/hunk status` reports `host=takeover|exclusive|embed` plus exclusive-frame lease counters when active.
-See [HOST_MODES.md](HOST_MODES.md) for paint paths.
+Toggle with `/hunk config full`, `/hunk config right`, or `/hunk config float`. `/hunk status`
+reports `host=takeover|exclusive|embed` plus exclusive-frame lease counters when active. See
+[HOST_MODES.md](HOST_MODES.md) for paint paths.
 
 Pi-hunk does not own Hunk's theme, transparency, presentation, or keybindings. Configure those in
 Hunk's `~/.config/hunk/config.toml` or repository-local `.hunk/config.toml`.

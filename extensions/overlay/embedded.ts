@@ -283,11 +283,7 @@ export class EmbeddedHunk implements Component, Focusable {
         this.terminal.feed(data);
         this.contentGeneration += 1;
         if (!this.synchronizedFrameOpen) this.renderedLines = undefined;
-        if (
-          this.isVisibleState() &&
-          this.startupState === "ready" &&
-          !this.synchronizedFrameOpen
-        ) {
+        if (this.isVisibleState() && this.startupState === "ready" && !this.synchronizedFrameOpen) {
           this.requestFrame();
         }
       }),
@@ -451,9 +447,10 @@ export class EmbeddedHunk implements Component, Focusable {
    * boundary at any byte. Capability query `ESC[?2026$p` never ends with h/l so
    * it does not open or close a frame.
    */
-  private observeSynchronizedFrameOutput(
-    data: string | Uint8Array,
-  ): { started: boolean; ended: boolean } {
+  private observeSynchronizedFrameOutput(data: string | Uint8Array): {
+    started: boolean;
+    ended: boolean;
+  } {
     let markerLength = this.synchronizedFrameMarkerLength;
     let frameOpen = this.synchronizedFrameOpen;
     let frameStarted = false;

@@ -1,24 +1,25 @@
 # Host modes (shipped on feat/host-modes-and-atomic-frames)
 
-Host mode is **not** a config flag. It is derived from overlay layout via
-`resolveOverlayHostMode`:
+Host mode is **not** a config flag. It is derived from overlay layout via `resolveOverlayHostMode`:
 
-| Mode | Derived when | Layouts | Paint path |
-| --- | --- | --- | --- |
-| **Embed** | `layout: "float"` | float | PTY → libghostty → HTML → Pi composite |
+| Mode          | Derived when                  | Layouts         | Paint path                                                                                                              |
+| ------------- | ----------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **Embed**     | `layout: "float"`             | float           | PTY → libghostty → HTML → Pi composite                                                                                  |
 | **Exclusive** | `layout: "left"` or `"right"` | left/right only | PTY → libghostty → HTML → direct rect (Pi composite suppressed when leased); Pi always wraps into the remaining columns |
-| **Takeover** | `layout: "full"` | full | PTY → raw VT to TTY (no libghostty/HTML/Pi) |
+| **Takeover**  | `layout: "full"`              | full            | PTY → raw VT to TTY (no libghostty/HTML/Pi)                                                                             |
 
 ```ts
 // full → takeover
 // left/right → exclusive (Pi wrap always on)
 // float → embed
-resolveOverlayHostMode({ layout })
+resolveOverlayHostMode({ layout });
 ```
 
 ## Atomic DEC 2026 frames (all embed/exclusive)
 
-PTY bytes always feed libghostty. Publish (invalidate + requestFrame / exclusive direct paint) only when no synchronized frame is open (`ESC[?2026h` … `ESC[?2026l`). Partial chunks keep the previous complete snapshot.
+PTY bytes always feed libghostty. Publish (invalidate + requestFrame / exclusive direct paint) only
+when no synchronized frame is open (`ESC[?2026h` … `ESC[?2026l`). Partial chunks keep the previous
+complete snapshot.
 
 ## Configure layout (host follows)
 
