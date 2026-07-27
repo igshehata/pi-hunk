@@ -117,6 +117,11 @@ Choose a layout directly:
 | `left`  | Hunk and Pi side by side              |
 | `float` | Hunk in a centered overlay            |
 
+> **Note:** For the best experience, pi-hunk is intended to be used in full-screen (`full`) mode.
+>
+> **Warning:** The `left`, `right`, and `float` layouts may use more CPU or feel less responsive,
+> especially in large terminals. Switch back to `full` if you notice slower rendering.
+
 `PI_HUNK_REVIEW` can override the saved review policy. Pi-hunk warns when that happens.
 
 Themes, presentation, and Hunk keybindings stay in Hunk's own
