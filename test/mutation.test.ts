@@ -71,6 +71,65 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: "env FOO=1 printf '>'" })).toBe(false);
   });
 
+  it("parses GNU env split-string argv conservatively", () => {
+    // Exact review example plus every supported spelling.
+    expect(isMutation("bash", { command: `env -S 'bash -c "touch generated.ts"'` })).toBe(true);
+    expect(isMutation("bash", { command: `env -S'bash -c "touch generated.ts"'` })).toBe(true);
+    expect(
+      isMutation("bash", { command: `env --split-string 'bash -c "touch generated.ts"'` }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", { command: `env --split-string='bash -c "touch generated.ts"'` }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: `env --split-string='-i -u OLD FOO=1 bash -c "mkdir out"'`,
+      }),
+    ).toBe(true);
+    expect(isMutation("bash", { command: `env -S 'FOO=1 bash -c' 'touch generated.ts'` })).toBe(
+      true,
+    );
+    expect(isMutation("bash", { command: `env -S 'touch generated.ts'` })).toBe(true);
+    expect(isMutation("bash", { command: `env -S 'env touch generated.ts'` })).toBe(true);
+    expect(isMutation("bash", { command: `env -S 'git apply patch.diff'` })).toBe(true);
+
+    expect(isMutation("bash", { command: `env -S 'bash -c "git status"'` })).toBe(false);
+    expect(
+      isMutation("bash", { command: `env -S 'bash -c "echo \\"please rm the file\\""'` }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", { command: `env --split-string='printf "touch generated.ts"'` }),
+    ).toBe(false);
+    expect(isMutation("bash", { command: `env -S 'echo "example; touch file.ts"'` })).toBe(false);
+    expect(isMutation("bash", { command: `env -u touch -C rm bash -c 'git status'` })).toBe(false);
+    expect(isMutation("bash", { command: `env -uSOMETHING bash -c 'git status'` })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: `env --unset=touch --chdir=rm --argv0 mkdir bash -c 'git status'`,
+      }),
+    ).toBe(false);
+
+    // Malformed and runtime-dependent values remain mutation evidence.
+    expect(isMutation("bash", { command: `env -S 'bash -c "git status'` })).toBe(true);
+    expect(isMutation("bash", { command: "env --split-string" })).toBe(true);
+    expect(isMutation("bash", { command: `env -S '$COMMAND --version'` })).toBe(true);
+    expect(isMutation("bash", { command: `env -S 'bash -c "\${COMMAND}"'` })).toBe(true);
+
+    let nestedMutation = `bash -c "touch generated.ts"`;
+    for (let depth = 0; depth < 2; depth += 1) {
+      nestedMutation = `-S ${JSON.stringify(nestedMutation)}`;
+    }
+    expect(isMutation("bash", { command: `env -S '${nestedMutation}'` })).toBe(true);
+
+    let deeplyNested = `bash -c "git status"`;
+    for (let depth = 0; depth < 3; depth += 1) {
+      deeplyNested = `-S ${JSON.stringify(deeplyNested)}`;
+    }
+    expect(isMutation("bash", { command: `env -S '${deeplyNested}'` })).toBe(false);
+    deeplyNested = `-S ${JSON.stringify(deeplyNested)}`;
+    expect(isMutation("bash", { command: `env -S '${deeplyNested}'` })).toBe(true);
+  });
+
   it("records nested and ambiguous pathless shell mutations as unresolved evidence", () => {
     const detector = new ChangeDetector();
 

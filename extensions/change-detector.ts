@@ -15,6 +15,8 @@ const PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
 const NESTED_SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash"]);
 /** Bound pathological nesting / command-substitution style chains. */
 const MAX_NESTED_SHELL_DEPTH = 4;
+const MAX_ENV_SPLIT_EXPANSIONS = 4;
+const MAX_ENV_SPLIT_WORDS = 4_096;
 const MAX_SHELL_COMMAND_LENGTH = 100_000;
 /** Wrapper options whose values must be skipped before locating the utility/`-c`. */
 const ENV_VALUE_SHORT_FLAGS = new Set(["u", "C", "S"]);
@@ -194,6 +196,57 @@ function tokenizeShellWords(segment: string): ShellWords {
   return { words, unclosedQuote };
 }
 
+function tokenizeEnvSplitString(value: string): ShellWords | "ambiguous" {
+  const words: ShellWord[] = [];
+  let i = 0;
+
+  while (i < value.length) {
+    while (i < value.length && /\s/.test(value[i]!)) i += 1;
+    if (i >= value.length) break;
+
+    let word = "";
+    let quote: "'" | '"' | undefined;
+    while (i < value.length) {
+      const char = value[i]!;
+      if (!quote && /\s/.test(char)) break;
+      if (char === "\\" && quote !== "'") {
+        i += 1;
+        if (i >= value.length) return "ambiguous";
+        // GNU env gives several alphabetic escapes special meanings (including
+        // separators and early termination). Leave those uncommon forms as
+        // mutation evidence rather than approximating their argv.
+        if (/[cfnrtv_]/.test(value[i]!)) return "ambiguous";
+        word += value[i]!;
+        i += 1;
+        continue;
+      }
+      if (quote) {
+        if (char === quote) quote = undefined;
+        else {
+          if (quote === '"' && (char === "$" || char === "`")) return "ambiguous";
+          word += char;
+        }
+        i += 1;
+        continue;
+      }
+      if (char === "'" || char === '"') {
+        quote = char;
+        i += 1;
+        continue;
+      }
+      // Split-string performs variable expansion and has comment handling of
+      // its own. Their resulting argv depends on runtime/parser details.
+      if (char === "$" || char === "`" || char === "#") return "ambiguous";
+      word += char;
+      i += 1;
+    }
+    if (quote) return "ambiguous";
+    words.push({ value: word, start: -1 });
+  }
+
+  return { words, unclosedQuote: false };
+}
+
 function commandBasename(word: string): string {
   const normalized = word.replaceAll("\\", "/");
   const slash = normalized.lastIndexOf("/");
@@ -208,6 +261,46 @@ function isEnvironmentAssignment(word: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
 }
 
+function directCommandLooksMutating(words: ShellWord[], commandIndex: number): boolean {
+  const command = commandBasename(words[commandIndex]!.value);
+  const args = words.slice(commandIndex + 1).map((word) => word.value);
+
+  if (
+    command === "apply_patch" ||
+    command === "tee" ||
+    command === "mv" ||
+    command === "cp" ||
+    command === "rm" ||
+    command === "touch" ||
+    command === "mkdir" ||
+    command === "truncate"
+  ) {
+    return true;
+  }
+  if (command === "git") return args[0] === "apply";
+  if (command === "jj") {
+    return new Set([
+      "abandon",
+      "commit",
+      "describe",
+      "duplicate",
+      "edit",
+      "new",
+      "rebase",
+      "restore",
+      "squash",
+      "undo",
+    ]).has(args[0] ?? "");
+  }
+  if (command === "sl") {
+    return new Set(["amend", "commit", "goto", "rebase", "revert"]).has(args[0] ?? "");
+  }
+  if (command === "sed") return args[0] === "-i" || args[0]?.startsWith("-i") === true;
+  if (command === "perl") return args[0]?.startsWith("-pi") === true;
+  if (command === "npm") return ["install", "uninstall", "update"].includes(args[0] ?? "");
+  return false;
+}
+
 /**
  * If `segment` is a recognized shell (optionally under assignments/`env …`)
  * with `-c`/`-lc`, return its command string. `"mutating"` means peeling a
@@ -215,14 +308,20 @@ function isEnvironmentAssignment(word: string): boolean {
  * option value could not be recovered safely.
  */
 function extractNestedShellPayload(segment: string): string | "ambiguous" | "mutating" | undefined {
-  const { words, unclosedQuote } = tokenizeShellWords(segment);
-  if (unclosedQuote) return "ambiguous";
+  const tokenized = tokenizeShellWords(segment);
+  if (tokenized.unclosedQuote) return "ambiguous";
+  const words = tokenized.words;
   if (words.length === 0) return undefined;
 
   let i = 0;
+  let envSplitExpansions = 0;
+  let hadEnvSplit = false;
   while (i < words.length && isEnvironmentAssignment(words[i]!.value)) i += 1;
 
-  // Peel one or more `env` prefixes and their assignments/flags.
+  // Peel one or more `env` prefixes and their assignments/flags. GNU env's
+  // split-string options inject their parsed words back into the remaining
+  // argv, so options, assignments, commands, and trailing outer argv all keep
+  // their normal positions.
   while (i < words.length && commandBasename(words[i]!.value) === "env") {
     i += 1;
     while (i < words.length) {
@@ -236,10 +335,28 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
         continue;
       }
       if (word.startsWith("--")) {
-        const [flag] = word.split("=", 1);
-        if (ENV_VALUE_LONG_FLAGS.has(flag!)) {
+        const equalsIndex = word.indexOf("=");
+        const flag = equalsIndex === -1 ? word : word.slice(0, equalsIndex);
+        if (flag === "--split-string") {
+          const consumesNextWord = equalsIndex === -1;
+          if (consumesNextWord && i + 1 >= words.length) return "ambiguous";
+          const value = consumesNextWord ? words[i + 1]!.value : word.slice(equalsIndex + 1);
+          const split = tokenizeEnvSplitString(value);
+          envSplitExpansions += 1;
+          hadEnvSplit = true;
+          if (
+            split === "ambiguous" ||
+            envSplitExpansions > MAX_ENV_SPLIT_EXPANSIONS ||
+            words.length - (consumesNextWord ? 2 : 1) + split.words.length > MAX_ENV_SPLIT_WORDS
+          ) {
+            return "ambiguous";
+          }
+          words.splice(i, consumesNextWord ? 2 : 1, ...split.words);
+          continue;
+        }
+        if (ENV_VALUE_LONG_FLAGS.has(flag)) {
           i += 1;
-          if (word.includes("=")) continue;
+          if (equalsIndex !== -1) continue;
           if (i >= words.length) return "ambiguous";
           i += 1;
           continue;
@@ -250,6 +367,24 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
       if (word.startsWith("-") && word !== "-") {
         const flags = word.slice(1);
         const valueFlagIndex = [...flags].findIndex((flag) => ENV_VALUE_SHORT_FLAGS.has(flag));
+        if (valueFlagIndex >= 0 && flags[valueFlagIndex] === "S") {
+          const attachedValue = flags.slice(valueFlagIndex + 1);
+          const consumesNextWord = attachedValue.length === 0;
+          if (consumesNextWord && i + 1 >= words.length) return "ambiguous";
+          const value = consumesNextWord ? words[i + 1]!.value : attachedValue;
+          const split = tokenizeEnvSplitString(value);
+          envSplitExpansions += 1;
+          hadEnvSplit = true;
+          if (
+            split === "ambiguous" ||
+            envSplitExpansions > MAX_ENV_SPLIT_EXPANSIONS ||
+            words.length - (consumesNextWord ? 2 : 1) + split.words.length > MAX_ENV_SPLIT_WORDS
+          ) {
+            return "ambiguous";
+          }
+          words.splice(i, consumesNextWord ? 2 : 1, ...split.words);
+          continue;
+        }
         i += 1;
         // A value-taking flag at the end of a cluster consumes the next word;
         // otherwise the remainder of that cluster is its attached value.
@@ -266,7 +401,9 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
 
   if (i >= words.length) return undefined;
   if (!isNestedShellName(words[i]!.value)) {
-    const peeled = segment.slice(words[i]!.start);
+    if (hadEnvSplit && directCommandLooksMutating(words, i)) return "mutating";
+    const start = words[i]!.start;
+    const peeled = start >= 0 ? segment.slice(start) : "";
     return MUTATING_SHELL.test(maskQuotedShellText(peeled)) ? "mutating" : undefined;
   }
   i += 1;
