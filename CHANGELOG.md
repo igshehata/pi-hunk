@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0
+
+### Minor Changes
+
+- 45a4407: Open full-screen by default, keep Pi visible beside left and right layouts, and prevent
+  partial Hunk frames from flashing.
+- f343d60: Open automatic reviews for every repository Pi changes, queue additional repositories,
+  and skip empty reviews without guessing unresolved shell paths.
+
+### Patch Changes
+
+- 2eba995: Send new comments back to Pi whenever Hunk is hidden, including for manually opened
+  reviews, without blocking the agent.
+- 30a3ce1: Prevent lost feedback, reviews opening in the wrong repository, config corruption,
+  lingering Hunk processes, broken keyboard or mouse input, and startup screen glitches.
+- 2b81233: Keep inline comments recoverable after failed delivery and warn when a shell change
+  cannot be routed to a repository.
+- 2b81233: Make floating and side-by-side reviews smoother and require Hunk 0.17.6 or newer for
+  reliable startup.
+
 ## 0.1.0 — 2026-07-18
 
 Initial public release of pi-hunk:
