@@ -104,11 +104,39 @@ describe("exclusive EmbeddedHunk integration", () => {
     });
     expect(terminal.writes.join("")).toContain("\x1b[2;6H");
 
+    // Frame N must be snapshotted and directly painted even when frame N+1
+    // starts later in the same PTY chunk.
+    terminal.writes = [];
+    onData("\x1b[?2026h\x1b[1;1HNNNNN\x1b[?2026l" + "\x1b[?2026h\x1b[1;1HPART1");
+    await Promise.resolve();
+    expect(terminal.writes.join("")).toContain("NNNNN");
+    expect(terminal.writes.join("")).not.toContain("PART1");
+    expect(exclusive.getStats()).toMatchObject({ state: "exclusive", revocations: 0 });
+
+    // Finish the open frame, then reproduce the cross-chunk race: the second
+    // chunk opens N+1 before N's queued direct-paint microtask can read a frame.
+    onData("\x1b[?2026l");
+    await Promise.resolve();
+    terminal.writes = [];
+    onData("\x1b[?2026h\x1b[1;1HMMMMM\x1b[?2026l");
+    onData("\x1b[?2026h\x1b[1;1HPART2");
+    await Promise.resolve();
+    expect(terminal.writes.join("")).toContain("MMMMM");
+    expect(terminal.writes.join("")).not.toContain("PART2");
+    expect(exclusive.getStats()).toMatchObject({ state: "exclusive", revocations: 0 });
+
     terminal.onInput?.("j");
     await waitForRender();
     expect(pty.write).toHaveBeenCalledWith("j");
     expect(base.renders).toBe(baseRenders);
     expect(exclusive.getStats().suppressedInputRenders).toBe(1);
+
+    // Exclusive mode reaches the same translator through TUI terminal input.
+    terminal.onInput?.("\x1b[57365;1:2u");
+    terminal.onInput?.("\x1b[57365;1:3u");
+    await waitForRender();
+    expect(pty.write).toHaveBeenCalledWith("\x1bOQ");
+    expect(pty.write).not.toHaveBeenCalledWith("\x1b[57365;1:3u");
 
     exclusive.setVisible(false);
     component.setVisible(false);

@@ -27,7 +27,7 @@ function harness(
   options: {
     failFirstMount?: boolean;
     mode?: "tui" | "rpc" | "print";
-    idle?: boolean;
+    idle?: boolean | (() => boolean);
   } = {},
 ) {
   const events = new Map<string, (event: any, ctx: ExtensionCommandContext) => any>();
@@ -89,7 +89,7 @@ function harness(
   const ctx = {
     cwd,
     mode: options.mode ?? "tui",
-    isIdle: () => options.idle ?? true,
+    isIdle: () => (typeof options.idle === "function" ? options.idle() : (options.idle ?? true)),
     isProjectTrusted: () => false,
     waitForIdle: vi.fn(async () => undefined),
     ui: {
@@ -449,7 +449,7 @@ describe("automatic review policies in action", () => {
     expect(runtime.coordinator.getActiveInfo()).toBeNull();
   });
 
-  it("preserves and restores a pre-existing live surface with different args", async () => {
+  it("replaces a same-directory manual show surface with the configured automatic review", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-live-preexisting-"));
     temporaryDirectories.push(root);
     process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
@@ -460,7 +460,7 @@ describe("automatic review policies in action", () => {
       store: new ConfigStore(),
       detector: new LiveDetector() as unknown as ChangeDetector,
       coordinator: runtime.coordinator,
-      reviewRun: reviewableRun(root),
+      reviewRun: commentReviewRun(root, () => []),
     });
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
 
@@ -477,22 +477,6 @@ describe("automatic review policies in action", () => {
     expect(mount.component.visible).toBe(false);
     vi.mocked(runtime.handle.setHidden).mockClear();
     vi.mocked(runtime.handle.focus).mockClear();
-
-    const assertPreExistingUnchanged = (visible: boolean) => {
-      expect(runtime.mounts).toHaveLength(1);
-      expect(runtime.mounts[0]).toBe(mount);
-      expect(runtime.coordinator.getActiveInfo()).toMatchObject({
-        state: visible ? "visible" : "hidden",
-        argsKey: info.argsKey,
-      });
-      expect(runtime.mounts[0]!.options.args).toEqual(["show"]);
-      expect(runtime.mounts[0]!.component).toBe(mount.component);
-      expect(runtime.mounts[0]!.component.visible).toBe(visible);
-      expect(runtime.mounts[0]!.component.dispose).not.toHaveBeenCalled();
-      if (visible) expect(runtime.handle.setHidden).toHaveBeenCalledWith(false);
-      else expect(runtime.handle.setHidden).not.toHaveBeenCalled();
-      expect(runtime.handle.focus).not.toHaveBeenCalled();
-    };
 
     const editInput = { path: "src/a.ts", edits: [{ oldText: "a", newText: "b" }] };
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -516,7 +500,15 @@ describe("automatic review policies in action", () => {
       runtime.ctx,
     );
     await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
-    assertPreExistingUnchanged(false);
+    // Failed mutations leave the unrelated manual surface alone.
+    expect(runtime.mounts).toHaveLength(1);
+    expect(runtime.mounts[0]).toBe(mount);
+    expect(runtime.coordinator.getActiveInfo()).toMatchObject({
+      state: "hidden",
+      argsKey: info.argsKey,
+    });
+    expect(runtime.mounts[0]!.options.args).toEqual(["show"]);
+    expect(runtime.mounts[0]!.component.dispose).not.toHaveBeenCalled();
 
     await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
     await runtime.events.get("tool_execution_start")?.(
@@ -539,16 +531,28 @@ describe("automatic review policies in action", () => {
       runtime.ctx,
     );
     await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
-    assertPreExistingUnchanged(true);
+
+    // Successful mutations must open the configured automatic command/argv
+    // rather than restoring an unrelated same-directory show surface.
+    expect(mount.component.dispose).toHaveBeenCalled();
+    expect(runtime.mounts).toHaveLength(2);
+    expect(runtime.mounts[1]!.options.args).toEqual(DEFAULT_CONFIG.hunk.args);
+    expect(runtime.coordinator.getActiveInfo()).toMatchObject({
+      state: "visible",
+      source: expect.stringMatching(/^(auto|live|recover)$/),
+    });
+    expect(runtime.coordinator.getActiveInfo()?.argsKey).toContain("diff");
+    expect(runtime.coordinator.getActiveInfo()?.argsKey).not.toContain("show");
+    expect(runtime.mounts[1]!.component.visible).toBe(true);
 
     await runtime.commands.get("hunk")?.("status", runtime.ctx);
     expect(runtime.ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining("last-auto-open=skipped(already-open)"),
+      expect.stringContaining("last-auto-open=opened(replacement)"),
       "info",
     );
   });
 
-  it("does not destroy a pre-existing manual surface when current-run evidence is empty", async () => {
+  it("closes a mismatched manual surface after automatic review finds no-diff", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-hunk-manual-no-diff-"));
     temporaryDirectories.push(root);
     process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
@@ -591,10 +595,10 @@ describe("automatic review policies in action", () => {
     );
     await runtime.events.get("agent_settled")?.({ type: "agent_settled" }, runtime.ctx);
 
-    expect(runtime.mounts).toHaveLength(1);
-    expect(runtime.mounts[0]).toBe(manualMount);
-    expect(manualMount.component.dispose).not.toHaveBeenCalled();
-    expect(runtime.coordinator.getActiveInfo()?.state).toBe("hidden");
+    // Automatic routing must not treat the show surface as the working-copy
+    // review. It opens the configured watcher, observes no-diff, and closes.
+    expect(manualMount.component.dispose).toHaveBeenCalled();
+    expect(runtime.coordinator.getActiveInfo()).toBeNull();
   });
 
   it("keeps invalid structured paths as unresolved evidence without throwing from follow-edits", async () => {
@@ -900,6 +904,12 @@ describe("automatic review policies in action", () => {
     expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalled();
     expect(runtime.mounts[1]!.options.cwd).toBe(join(repoB, "src"));
     expect(runtime.coordinator.getActiveInfo()).toMatchObject({ repoRoot: repoB });
+
+    await runtime.commands.get("hunk")?.("status", runtime.ctx);
+    expect(runtime.ctx.ui.notify).toHaveBeenLastCalledWith(
+      expect.stringContaining("last-auto-open=opened(reroute)"),
+      "info",
+    );
   });
 
   it.each(liveMutationCases)(
@@ -916,6 +926,7 @@ describe("automatic review policies in action", () => {
         detector: new LiveDetector() as unknown as ChangeDetector,
         coordinator: runtime.coordinator,
         reviewRun: reviewableRun(root),
+        reviewWaitForSession: immediateSessionWait(1),
       });
       await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
       await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -949,6 +960,7 @@ describe("automatic review policies in action", () => {
         detector: new LiveDetector() as unknown as ChangeDetector,
         coordinator: runtime.coordinator,
         reviewRun: reviewableRun(root),
+        reviewWaitForSession: immediateSessionWait(1),
       });
       await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
       await runtime.events.get("agent_start")?.({ type: "agent_start" }, runtime.ctx);
@@ -1127,6 +1139,72 @@ describe("automatic review policies in action", () => {
     await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
     expect(runtime.events.has("before_agent_start")).toBe(false);
     expect(runtime.tools.has("hunk_review")).toBe(false);
+  });
+
+  it("keeps fire-and-forget feedback recoverable after asynchronous host rejection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-unconfirmed-feedback-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+
+    const comments = [
+      {
+        noteId: "user:unconfirmed",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [1, 1],
+        body: "Keep this recoverable",
+      },
+    ];
+    let idle = true;
+    let asynchronousHostRejections = 0;
+    const runtime = harness(root, { idle: () => idle });
+    runtime.sendUserMessage.mockImplementation(() => {
+      // Model Pi beginning to stream after an idle observation, then rejecting
+      // the fire-and-forget prompt outside the extension's synchronous call.
+      idle = false;
+      void Promise.resolve()
+        .then(() => {
+          throw new Error("host rejected prompt asynchronously");
+        })
+        .catch(() => {
+          asynchronousHostRejections += 1;
+        });
+    });
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      coordinator: runtime.coordinator,
+      reviewRun: commentReviewRun(root, () => comments),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+
+    await runtime.commands.get("hunk")?.("", runtime.ctx);
+    expect(runtime.ctx.isIdle()).toBe(true);
+    runtime.mounts[0]!.options.onToggleRequest?.();
+
+    await vi.waitFor(() => expect(runtime.sendUserMessage).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(asynchronousHostRejections).toBe(1));
+    expect(runtime.ctx.isIdle()).toBe(false);
+    expect(runtime.sendUserMessage.mock.calls[0]?.[1]).toEqual({ deliverAs: "followUp" });
+    expect(runtime.ctx.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringMatching(/^Sent .*Hunk feedback/),
+      "info",
+    );
+
+    // A void host return is not acceptance: the explicit recovery action must
+    // still see and retry the same note rather than deduping/removing it.
+    await runtime.commands.get("hunk")?.("feedback", runtime.ctx);
+    expect(runtime.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(runtime.sendUserMessage.mock.calls[1]?.[0]).toContain('"noteId": "user:unconfirmed"');
+    expect(runtime.sendUserMessage.mock.calls[1]?.[1]).toEqual({ deliverAs: "followUp" });
+    expect(runtime.ctx.ui.notify).toHaveBeenLastCalledWith(
+      expect.stringContaining("remain queued"),
+      "info",
+    );
+    expect(runtime.ctx.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringMatching(/^Sent .*Hunk feedback/),
+      "info",
+    );
   });
 
   it("submits comments on every manual Hunk hide without hunk_review", async () => {

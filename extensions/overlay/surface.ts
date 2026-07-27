@@ -9,6 +9,7 @@ import type { EmbeddedOptions, HunkExit } from "./embedded.ts";
 import { resolveOverlayHostMode, resolveOverlayLayout, type HunkConfig } from "../config.ts";
 import {
   argsKey,
+  resolveOverlayColumns,
   resolveOverlayRows,
   type OpenRequest,
   type SurfaceSessionInfo,
@@ -339,7 +340,20 @@ export class OverlaySurface {
     repoRoot?: string;
     fileCount: number;
   }): boolean {
-    if (this.currentPid !== undefined && metadata.pid !== this.currentPid) return false;
+    // Starting is not authoritative: the component/PTY may not exist yet and a
+    // missing pid must never behave like a wildcard. Only the exact positive pid
+    // of a mounted visible/hidden surface may receive managed-session metadata.
+    if (this.state !== "visible" && this.state !== "hidden") return false;
+    if (
+      !Number.isInteger(this.currentPid) ||
+      this.currentPid === undefined ||
+      this.currentPid <= 0
+    ) {
+      return false;
+    }
+    if (!Number.isInteger(metadata.pid) || metadata.pid <= 0 || metadata.pid !== this.currentPid) {
+      return false;
+    }
     this.currentSessionId = metadata.sessionId;
     this.currentRepoRoot = metadata.repoRoot;
     this.currentFileCount = metadata.fileCount;
@@ -502,12 +516,14 @@ export class OverlaySurface {
                 "warning",
               );
             }
+            const initialColumns = resolveOverlayColumns(geometry.width, tui.terminal.columns);
             const initialRows = resolveOverlayRows(geometry.maxHeight, tui.terminal.rows);
             const component = createComponent({
               command: request.command,
               args: request.args,
               cwd: request.cwd,
               tui,
+              initialColumns,
               initialRows,
               resolveRows: (terminalRows) => resolveOverlayRows(geometry.maxHeight, terminalRows),
               resolveMouseViewport: (
@@ -595,8 +611,9 @@ export class OverlaySurface {
               margin: 0,
             },
             onHandle: (handle) => {
-              if (gen !== this.generation) {
-                // Cancelled before mount completed — remove only this entry.
+              if (gen !== this.generation || this.state !== "starting") {
+                // Cancelled/failed before mount completed — remove only this
+                // stale entry before it can be assigned or mutate state.
                 try {
                   handle.hide();
                 } catch {
@@ -619,8 +636,11 @@ export class OverlaySurface {
         )
         .catch((error) => {
           // custom() rejected before/without onHandle (factory/PTY throw).
+          // Invalidate this generation as part of the failure itself so a
+          // delayed onHandle cannot race open()'s rejection cleanup and revive
+          // a closed surface.
           if (gen === this.generation && this.state === "starting") {
-            this.settleStart?.(error);
+            this.cancelBeforeMount(gen, error);
           }
         });
 
@@ -856,6 +876,9 @@ export class OverlaySurface {
 
   private forceReset(gen: number): void {
     if (gen !== this.generation) return;
+    // Every failed-start reset invalidates callbacks before releasing refs.
+    this.generation += 1;
+    const newGen = this.generation;
     const component = this.component;
     const handle = this.handle;
     this.component = undefined;
@@ -870,7 +893,7 @@ export class OverlaySurface {
     } catch {
       // ignore
     }
-    this.finishClosed(gen);
+    this.finishClosed(newGen);
   }
 
   private finishClosed(gen: number): void {

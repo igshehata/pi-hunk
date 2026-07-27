@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -15,6 +24,7 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   delete process.env.PI_HUNK_CONFIG;
+  delete process.env.PI_HUNK_REVIEW;
   await Promise.all(
     temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -78,6 +88,27 @@ describe("prefix keyboard capture", () => {
   });
 });
 
+describe("config persistence", () => {
+  it("ignores a symlink planted at the formerly predictable temp path", async () => {
+    const { ctx, root } = await testProject([]);
+    const configPath = process.env.PI_HUNK_CONFIG!;
+    const victim = join(root, "external-victim.txt");
+    const planted = join(root, `.global-hunk.json.${process.pid}.0.tmp`);
+    await writeFile(victim, "do not overwrite\n");
+    await symlink(victim, planted);
+
+    const store = new ConfigStore();
+    await store.persist(ctx, "global", { review: "live" });
+
+    expect(await readFile(victim, "utf8")).toBe("do not overwrite\n");
+    expect((await lstat(planted)).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(await readFile(configPath, "utf8"))).toEqual({ review: "live" });
+    expect(
+      (await readdir(root)).filter((name) => name.startsWith(".global-hunk.json.tmp-")),
+    ).toEqual([]);
+  });
+});
+
 describe("interactive /hunk config", () => {
   it("auto-saves every changed setting to the trusted project without a Save step", async () => {
     const { ctx, projectPath } = await testProject([
@@ -109,6 +140,22 @@ describe("interactive /hunk config", () => {
       },
     });
     expect(ctx.ui.select).not.toHaveBeenCalledWith("Save Hunk config", expect.anything());
+  });
+
+  it("persists an interactive review choice while reporting the environment-effective policy", async () => {
+    process.env.PI_HUNK_REVIEW = "off";
+    const { ctx, projectPath } = await testProject(["Review behavior: off", "live", "Done"]);
+    const store = new ConfigStore();
+    await store.reload(ctx);
+
+    await handleConfigCommand("", ctx, store, inactiveCoordinator);
+
+    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({ review: "live" });
+    expect(store.get().review).toBe("off");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Hunk review=live was saved to .pi/hunk.json, but PI_HUNK_REVIEW keeps review=off.",
+      "warning",
+    );
   });
 
   it("closes without writing when nothing changed", async () => {

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { AutoOpenSuppressionReason, HunkConfig } from "./config.ts";
 import { navigateHunkSession, type LiveHunkSession } from "./hunk-session.ts";
 import type { HunkExit } from "./overlay/embedded.ts";
+import { canonicalPathIsInside } from "./path-routing.ts";
 import type { ExclusiveFrameStats } from "./overlay/exclusive-frame.ts";
 import { OverlaySurface } from "./overlay/surface.ts";
 import type { LaunchSource, OpenRequest, SurfaceSessionInfo } from "./overlay/types.ts";
@@ -10,6 +11,14 @@ import type { LaunchSource, OpenRequest, SurfaceSessionInfo } from "./overlay/ty
 export interface CoordinatorDeps {
   overlay?: OverlaySurface;
   navigateHunk?: typeof navigateHunkSession;
+}
+
+/** Surface identity captured when a follow-edit is scheduled. */
+interface FollowSurfaceIdentity {
+  pid?: number;
+  sessionId?: string;
+  argsKey: string;
+  launchCwd: string;
 }
 
 type CoordinatorLifecyclePhase = "active" | "activating" | "shutting-down" | "shutdown";
@@ -116,12 +125,18 @@ export class ReviewCoordinator {
   private readonly overlay: OverlaySurface;
   private readonly navigateHunk: typeof navigateHunkSession;
   private active: OverlaySurface | null = null;
+  /** Set only by the owned child's natural-exit callback until closed publishes. */
+  private naturalClosePending = false;
   private transitionQueue: Promise<void> = Promise.resolve();
   private generation = 0;
   private followRevision = 0;
+  private followCandidateRevision = 0;
   private followNavigationQueue: Promise<void> = Promise.resolve();
   private followTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingFollowPath: string | undefined;
+  private pendingFollowIdentity: FollowSurfaceIdentity | null = null;
+  /** Identity published by the exact live preflight open a pending follow awaits. */
+  private earlyFollowIdentity: FollowSurfaceIdentity | null = null;
   private runState = initialRunState();
   private lifecycle: CoordinatorLifecycleState = { phase: "active", revision: 0 };
   private readonly stateListeners = new Set<() => void>();
@@ -129,7 +144,7 @@ export class ReviewCoordinator {
   constructor(deps: CoordinatorDeps = {}) {
     this.overlay = deps.overlay ?? new OverlaySurface();
     this.navigateHunk = deps.navigateHunk ?? navigateHunkSession;
-    this.overlay.setStateListener(() => this.notifyStateChange());
+    this.overlay.setStateListener(() => this.onOverlayStateChange());
     this.overlay.setChildExitListener?.((result) => this.onChildExit(result));
     this.overlay.setTransitionScheduler?.((operation) => {
       // A focused-component shortcut is an explicit user action; once queued,
@@ -191,6 +206,7 @@ export class ReviewCoordinator {
   }
 
   resetRunFlags(): void {
+    this.earlyFollowIdentity = null;
     this.transitionRun({ type: "reset" });
   }
 
@@ -247,6 +263,7 @@ export class ReviewCoordinator {
   ): Promise<void> {
     await this.exclusive(async () => {
       this.assertAlive();
+      const priorIdentity = this.captureFollowIdentity();
       const hadLiveSurface = this.overlay.isLive();
       const requestCwd =
         source === "shortcut" && hadLiveSurface
@@ -254,11 +271,22 @@ export class ReviewCoordinator {
           : launchCwd;
       await this.overlay.ensure(ctx, this.buildRequest(config, args, source, requestCwd), config);
       if (!this.overlay.isLive()) {
+        this.cancelPendingFollow();
         if (this.overlay.getState() === "closed") return;
         throw new Error("Hunk overlay did not become live.");
       }
       this.active = this.overlay;
+      // A different managed surface must not inherit follow work from its predecessor.
+      const nextIdentity = this.captureFollowIdentity();
+      if (
+        (priorIdentity &&
+          (!nextIdentity || !this.sameFollowIdentity(priorIdentity, nextIdentity))) ||
+        (!priorIdentity && !(source === "live" && !hadLiveSurface))
+      ) {
+        this.cancelPendingFollow();
+      }
       if (source === "live" && !hadLiveSurface) {
+        this.earlyFollowIdentity = nextIdentity;
         this.transitionRun({ type: "early-surface", event: "opened" });
       } else if (source !== "live") {
         this.transitionRun({ type: "early-surface", event: "adopt" });
@@ -311,6 +339,7 @@ export class ReviewCoordinator {
   ): Promise<void> {
     await this.exclusive(async () => {
       this.assertAlive();
+      const priorIdentity = this.captureFollowIdentity();
       const request = this.buildRequest(
         config,
         args,
@@ -319,16 +348,24 @@ export class ReviewCoordinator {
       );
       if (this.active?.isLive()) {
         await this.active.toggle(ctx, request, config);
+        const nextIdentity = this.captureFollowIdentity();
+        if (!nextIdentity || !this.sameFollowIdentity(priorIdentity, nextIdentity)) {
+          this.cancelPendingFollow();
+        }
         this.transitionRun({ type: "early-surface", event: "adopt" });
         return;
       }
 
       await this.overlay.toggle(ctx, request, config);
       if (!this.overlay.isLive()) {
+        this.cancelPendingFollow();
         if (this.overlay.getState() === "closed") return;
         throw new Error("Hunk overlay did not become live.");
       }
       this.active = this.overlay;
+      // A cold user toggle cannot be the live preflight surface awaited by a
+      // null-identity follow request.
+      this.cancelPendingFollow();
       this.transitionRun({ type: "early-surface", event: "adopt" });
     });
     this.notifyStateChange();
@@ -336,7 +373,10 @@ export class ReviewCoordinator {
 
   async closeActive(): Promise<boolean> {
     this.suppressAutoOpenForRun("dismissed");
-    const closed = await this.exclusive(() => this.closeActiveUnlocked());
+    const closed = await this.exclusive(async () => {
+      this.cancelPendingFollow();
+      return this.closeActiveUnlocked();
+    });
     this.notifyStateChange();
     return closed;
   }
@@ -344,6 +384,7 @@ export class ReviewCoordinator {
   /** Internal queue transition: close without dismissal/cancellation semantics. */
   async releaseSurfaceForRouting(): Promise<boolean> {
     const closed = await this.exclusive(async () => {
+      this.cancelPendingFollow();
       const surface = this.active;
       if (!surface || (!surface.isLive() && surface.getState() === "closed")) {
         this.active = null;
@@ -360,6 +401,7 @@ export class ReviewCoordinator {
   async closeEarlySurfaceOpenedForRun(): Promise<boolean> {
     const closed = await this.exclusive(async () => {
       if (this.runState.earlySurface !== "owned") return false;
+      this.cancelPendingFollow();
       const surface = this.active;
       if (!surface || (!surface.isLive() && surface.getState() === "closed")) {
         this.active = null;
@@ -375,19 +417,79 @@ export class ReviewCoordinator {
     return closed;
   }
 
+  /**
+   * Select the first mutation target canonically contained by the repository
+   * adopted for the active managed session. If metadata is not available, or
+   * none is covered, preserve the previous first-target navigation so its
+   * intentional outside-repository diagnostic still reaches the user.
+   */
+  async scheduleFollowEditCandidates(
+    ctx: ExtensionContext,
+    config: HunkConfig,
+    filePaths: readonly string[],
+  ): Promise<void> {
+    const fallback = filePaths[0];
+    if (!fallback || (!this.hasLiveSurface() && !this.getEarlyOpenPromise())) return;
+
+    const candidateRevision = ++this.followCandidateRevision;
+    const identity = this.captureFollowIdentity();
+    const repoRoot = this.getActiveInfo()?.repoRoot;
+    if (!identity || !repoRoot) {
+      if (candidateRevision === this.followCandidateRevision) {
+        this.scheduleFollowEditResolved(ctx, config, fallback);
+      }
+      return;
+    }
+
+    let target = fallback;
+    try {
+      const covered = await Promise.all(
+        filePaths.map((filePath) => canonicalPathIsInside(filePath, repoRoot)),
+      );
+      const coveredIndex = covered.indexOf(true);
+      if (coveredIndex >= 0) target = filePaths[coveredIndex]!;
+    } catch {
+      // Preserve the existing navigation diagnostic when canonical inspection
+      // itself fails rather than silently dropping successful mutation evidence.
+    }
+
+    if (
+      candidateRevision !== this.followCandidateRevision ||
+      !this.isFollowTargetSurface(identity)
+    ) {
+      return;
+    }
+    this.scheduleFollowEditResolved(ctx, config, target);
+  }
+
   scheduleFollowEdit(ctx: ExtensionContext, config: HunkConfig, filePath: string): void {
+    this.followCandidateRevision += 1;
+    this.scheduleFollowEditResolved(ctx, config, filePath);
+  }
+
+  private scheduleFollowEditResolved(
+    ctx: ExtensionContext,
+    config: HunkConfig,
+    filePath: string,
+  ): void {
     if (!this.hasLiveSurface() && !this.getEarlyOpenPromise()) return;
 
     this.pendingFollowPath = filePath;
+    // Capture the active surface at schedule time so a later replacement cannot
+    // inherit delayed navigation for a previous review.
+    this.pendingFollowIdentity = this.captureFollowIdentity();
     const revision = ++this.followRevision;
     if (this.followTimer) clearTimeout(this.followTimer);
     const generation = this.generation;
+    const identity = this.pendingFollowIdentity;
+    const earlyOpenPromise = identity ? null : this.getEarlyOpenPromise();
     this.followTimer = setTimeout(() => {
       this.followTimer = null;
       const target = this.pendingFollowPath;
       this.pendingFollowPath = undefined;
+      this.pendingFollowIdentity = null;
       if (!target || !this.isActiveLifecycle() || generation !== this.generation) return;
-      void this.runFollow(ctx, config, target, generation, revision);
+      void this.runFollow(ctx, config, target, generation, revision, identity, earlyOpenPromise);
     }, 150);
   }
 
@@ -402,37 +504,91 @@ export class ReviewCoordinator {
   async activateSession(): Promise<void> {
     const revision = this.requestLifecycle("activate");
     await this.exclusive(async () => {
-      if (this.overlay.isLive() || this.active) await this.cleanupAll();
+      if (this.overlay.getState() !== "closed" || this.active) await this.cleanupAll();
       this.generation += 1;
       this.active = null;
+      this.naturalClosePending = false;
       this.transitionRun({ type: "reset" });
     });
     this.completeLifecycle(revision, "activating", "active");
     this.notifyStateChange();
   }
 
-  revive(): void {
+  async revive(): Promise<void> {
     const next = LIFECYCLE_REVIVE_TRANSITIONS[this.lifecycle.phase];
     if (next !== "active") return;
-    this.lifecycle = { phase: next, revision: this.lifecycle.revision + 1 };
-    this.generation += 1;
-    this.active = null;
-    this.transitionRun({ type: "reset" });
+    // Recovery is a real queued activation, not a metadata reset. This ensures
+    // an overlay which survived an interrupted lifecycle is closed and disposed
+    // before ownership references are cleared or a later open is admitted.
+    await this.activateSession();
   }
 
   private async cleanupAll(): Promise<void> {
     this.generation += 1;
-    if (this.followTimer) clearTimeout(this.followTimer);
-    this.followTimer = null;
-    this.pendingFollowPath = undefined;
+    this.cancelPendingFollow();
     this.transitionRun({ type: "reset" });
 
     try {
       await this.overlay.close();
-    } catch {
-      // Best-effort session cleanup.
+    } catch (error) {
+      // Never orphan a surface after failed recovery. A close which actually
+      // reached the definitive terminal state may still have thrown from an
+      // observer, but otherwise retain ownership so a later recovery can retry.
+      if (this.overlay.getState() !== "closed" || this.overlay.isLive()) throw error;
+    }
+    if (this.overlay.getState() !== "closed" || this.overlay.isLive()) {
+      throw new Error("Hunk overlay cleanup did not reach the closed state.");
     }
     this.active = null;
+    this.naturalClosePending = false;
+  }
+
+  private cancelPendingFollow(): void {
+    if (this.followTimer) clearTimeout(this.followTimer);
+    this.followTimer = null;
+    this.pendingFollowPath = undefined;
+    this.pendingFollowIdentity = null;
+    this.earlyFollowIdentity = null;
+    this.followRevision += 1;
+    this.followCandidateRevision += 1;
+  }
+
+  private captureFollowIdentity(): FollowSurfaceIdentity | null {
+    const info = this.getActiveInfo();
+    if (!info) return null;
+    return {
+      pid: info.pid,
+      sessionId: info.sessionId,
+      argsKey: info.argsKey,
+      launchCwd: info.launchCwd,
+    };
+  }
+
+  private sameFollowIdentity(
+    expected: FollowSurfaceIdentity | null,
+    actual: FollowSurfaceIdentity | null,
+  ): boolean {
+    if (!expected || !actual) return false;
+    if (expected.argsKey !== actual.argsKey) return false;
+    if (expected.launchCwd !== actual.launchCwd) return false;
+    // When both sides know a pid/session, they must match. Missing values are
+    // allowed so an early open can still adopt metadata later without false
+    // cancellation, but a known identity must never target a different process.
+    if (expected.pid !== undefined && actual.pid !== undefined && expected.pid !== actual.pid) {
+      return false;
+    }
+    if (
+      expected.sessionId !== undefined &&
+      actual.sessionId !== undefined &&
+      expected.sessionId !== actual.sessionId
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  private isFollowTargetSurface(identity: FollowSurfaceIdentity | null): boolean {
+    return Boolean(identity && this.sameFollowIdentity(identity, this.captureFollowIdentity()));
   }
 
   private assertAlive(): void {
@@ -454,8 +610,25 @@ export class ReviewCoordinator {
     return closed;
   }
 
+  private onOverlayStateChange(): void {
+    // A child-exit callback is emitted immediately before owned removal. Keep
+    // ownership until the surface publishes its definitive closed transition;
+    // a close event can then never clear a replacement opened afterward.
+    if (
+      this.naturalClosePending &&
+      this.active === this.overlay &&
+      this.overlay.getState() === "closed"
+    ) {
+      this.naturalClosePending = false;
+      this.active = null;
+      this.transitionRun({ type: "early-surface", event: "adopt" });
+    }
+    this.notifyStateChange();
+  }
+
   private onChildExit(result: HunkExit): void {
-    this.transitionRun({ type: "early-surface", event: "adopt" });
+    this.cancelPendingFollow();
+    this.naturalClosePending = this.active === this.overlay;
     if (result.exitCode === 0 && (result.signal ?? 0) === 0) {
       this.suppressAutoOpenForRun("dismissed");
     }
@@ -476,9 +649,16 @@ export class ReviewCoordinator {
     };
   }
 
-  private isCurrentFollow(generation: number, revision: number): boolean {
+  private isCurrentFollow(
+    generation: number,
+    revision: number,
+    identity: FollowSurfaceIdentity | null,
+  ): boolean {
     return (
-      this.isActiveLifecycle() && generation === this.generation && revision === this.followRevision
+      this.isActiveLifecycle() &&
+      generation === this.generation &&
+      revision === this.followRevision &&
+      this.isFollowTargetSurface(identity)
     );
   }
 
@@ -488,32 +668,46 @@ export class ReviewCoordinator {
     filePath: string,
     generation: number,
     revision: number,
+    initialIdentity: FollowSurfaceIdentity | null,
+    earlyOpenPromise: Promise<void> | null,
   ): Promise<void> {
-    if (!this.isCurrentFollow(generation, revision)) return;
-    const earlyOpenPromise = this.getEarlyOpenPromise();
-    if (earlyOpenPromise) {
+    if (
+      !this.isActiveLifecycle() ||
+      generation !== this.generation ||
+      revision !== this.followRevision
+    ) {
+      return;
+    }
+
+    let identity = initialIdentity;
+    if (!identity) {
+      if (!earlyOpenPromise) return;
       try {
         await earlyOpenPromise;
       } catch {
         return;
       }
+      identity = this.earlyFollowIdentity;
     }
+    if (!this.isCurrentFollow(generation, revision, identity)) return;
     if (!this.hasLiveSurface()) return;
 
     await new Promise((resolve) => setTimeout(resolve, 200));
-    if (!this.isCurrentFollow(generation, revision)) return;
+    if (!this.isCurrentFollow(generation, revision, identity)) return;
 
     await this.queueFollowNavigation(async () => {
-      if (!this.isCurrentFollow(generation, revision)) return;
+      if (!this.isCurrentFollow(generation, revision, identity)) return;
 
       const navigate = () => {
         const info = this.getActiveInfo();
+        // Always navigate with the captured surface identity when known so a
+        // concurrent active-info swap cannot redirect the RPC.
         return this.navigateHunk({
-          cwd: info?.repoRoot ?? info?.launchCwd ?? ctx.cwd,
+          cwd: info?.repoRoot ?? identity?.launchCwd ?? info?.launchCwd ?? ctx.cwd,
           filePath,
           hunkBinary: config.hunk.command,
-          sessionId: info?.sessionId,
-          managedPid: info?.pid,
+          sessionId: identity?.sessionId ?? info?.sessionId,
+          managedPid: identity?.pid ?? info?.pid,
         });
       };
 
@@ -522,10 +716,10 @@ export class ReviewCoordinator {
       } catch {
         try {
           await new Promise((resolve) => setTimeout(resolve, 400));
-          if (!this.isCurrentFollow(generation, revision)) return;
+          if (!this.isCurrentFollow(generation, revision, identity)) return;
           await navigate();
         } catch (error) {
-          if (!this.isCurrentFollow(generation, revision)) return;
+          if (!this.isCurrentFollow(generation, revision, identity)) return;
           const message = error instanceof Error ? error.message : String(error);
           try {
             ctx.ui.notify(`Hunk follow-edit navigation failed: ${message}`, "warning");

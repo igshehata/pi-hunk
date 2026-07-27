@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, mkdtemp, open, readFile, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,31 +23,96 @@ import {
  * config-schema.ts; this module only decides WHERE config comes from and goes.
  */
 
-async function readJson(path: string): Promise<unknown | undefined> {
+/** Callback for non-fatal config problems (invalid values that fell back). */
+export type ConfigWarning = (message: string) => void;
+
+type JsonReadResult =
+  | { status: "missing" }
+  | { status: "valid"; value: unknown }
+  | { status: "malformed"; detail: string };
+
+/** ENOENT, JSON syntax, and real read failures have deliberately distinct semantics. */
+async function readJson(path: string): Promise<JsonReadResult> {
+  let source: string;
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    source = await readFile(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "missing" };
     throw new Error(
-      `Invalid Hunk config at ${path}: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not read Hunk config at ${path}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
     );
+  }
+
+  try {
+    return { status: "valid", value: JSON.parse(source) };
+  } catch (error) {
+    return {
+      status: "malformed",
+      detail: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
-let temporaryConfigSequence = 0;
+async function readConfigLayer(path: string, onWarning?: ConfigWarning): Promise<unknown> {
+  const result = await readJson(path);
+  if (result.status === "valid") return result.value;
+  if (result.status === "malformed") {
+    onWarning?.(`Ignoring malformed Hunk config at ${path}: ${result.detail}`);
+  }
+  return undefined;
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  let directory: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    directory = await open(path, constants.O_RDONLY);
+    await directory.sync();
+  } catch (error) {
+    // Windows and some filesystems do not permit opening/fsyncing directories.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EINVAL" && code !== "EISDIR" && code !== "EPERM" && code !== "ENOTSUP") {
+      throw error;
+    }
+  } finally {
+    await directory?.close().catch(() => undefined);
+  }
+}
+
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true });
-  const temporary = join(
-    directory,
-    `.${basename(path)}.${process.pid}.${temporaryConfigSequence++}.tmp`,
-  );
+
+  // The random, mode-0700 directory is created atomically in the destination
+  // directory. O_EXCL + O_NOFOLLOW then ensures the file we write is the one
+  // this operation created, rather than a preplanted link or shared temp path.
+  const temporaryDirectory = await mkdtemp(join(directory, `.${basename(path)}.tmp-`));
+  const temporary = join(temporaryDirectory, "config");
+  let file: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    file = await open(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await file.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await file.sync();
+    await file.close();
+    file = undefined;
     await rename(temporary, path);
+    await syncDirectory(directory);
   } catch (error) {
-    await rm(temporary, { force: true }).catch(() => undefined);
+    await file?.close().catch(() => undefined);
+    // Unlink/rmdir only the two artifacts created by this operation. Never use
+    // recursive cleanup on a path in an attacker-writable parent directory.
+    await unlink(temporary).catch((cleanupError) => {
+      if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") throw cleanupError;
+    });
     throw error;
+  } finally {
+    await rmdir(temporaryDirectory).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    });
   }
 }
 
@@ -57,9 +123,6 @@ export function globalConfigPath(): string {
 export function projectConfigPath(cwd: string): string {
   return join(cwd, CONFIG_DIR_NAME, "hunk.json");
 }
-
-/** Callback for non-fatal config problems (invalid values that fell back). */
-export type ConfigWarning = (message: string) => void;
 
 /** Warn for invalid public values handled by config-schema's fallback merge. */
 function warnInvalidCoreConfig(raw: unknown, path: string, onWarning?: ConfigWarning): void {
@@ -191,12 +254,12 @@ export async function loadConfig(
 ): Promise<HunkConfig> {
   let config = cloneConfig(DEFAULT_CONFIG);
   const globalPath = globalConfigPath();
-  const globalRaw = await readJson(globalPath);
+  const globalRaw = await readConfigLayer(globalPath, onWarning);
   config = applyConfigLayer(config, globalRaw, globalPath, onWarning);
 
   if (ctx.isProjectTrusted()) {
     const projectPath = projectConfigPath(ctx.cwd);
-    const projectRaw = await readJson(projectPath);
+    const projectRaw = await readConfigLayer(projectPath, onWarning);
     config = applyConfigLayer(config, projectRaw, projectPath, onWarning);
   }
 
@@ -233,30 +296,49 @@ function deepMergeRecords(
 
 export class ConfigStore {
   private config: HunkConfig = cloneConfig(DEFAULT_CONFIG);
+  private loadedConfig: HunkConfig = cloneConfig(DEFAULT_CONFIG);
+  private sessionOverrides: Record<string, unknown> = {};
 
   get(): HunkConfig {
     return cloneConfig(this.config);
   }
 
-  /** Replace the in-memory session config. */
+  /** Config from files/environment before durable runtime session overrides. */
+  getLoaded(): HunkConfig {
+    return cloneConfig(this.loadedConfig);
+  }
+
+  /** Replace and retain the in-memory config until the next session starts. */
   setSession(config: HunkConfig): HunkConfig {
+    this.sessionOverrides = { ...cloneConfig(config) };
     this.config = cloneConfig(config);
     return this.get();
   }
 
+  /** Apply and retain a runtime override across file reloads in this Pi session. */
   patchSession(partial: unknown): HunkConfig {
-    this.config = applyConfig(this.config, partial);
+    if (isRecord(partial)) {
+      this.sessionOverrides = deepMergeRecords(this.sessionOverrides, partial);
+    }
+    this.config = applyConfig(this.loadedConfig, this.sessionOverrides);
     return this.get();
   }
 
   async reload(ctx: ExtensionContext, onWarning?: ConfigWarning): Promise<HunkConfig> {
-    this.config = await loadConfig(ctx, onWarning);
+    this.loadedConfig = await loadConfig(ctx, onWarning);
+    this.config = applyConfig(this.loadedConfig, this.sessionOverrides);
     return this.get();
   }
 
+  /** Start a fresh Pi runtime, discarding overrides retained by the prior session. */
+  async startSession(ctx: ExtensionContext, onWarning?: ConfigWarning): Promise<HunkConfig> {
+    this.sessionOverrides = {};
+    return this.reload(ctx, onWarning);
+  }
+
   /**
-   * Persist a partial update to global or trusted project config, then reload session.
-   * Project scope requires a trusted project.
+   * Persist a partial update to global or trusted project config, then reload files
+   * beneath the retained runtime session overrides. Project scope requires trust.
    */
   async resetProject(ctx: ExtensionContext): Promise<HunkConfig> {
     if (!ctx.isProjectTrusted()) throw new Error("Project config requires a trusted project.");
@@ -273,11 +355,12 @@ export class ConfigStore {
       throw new Error("Project config requires a trusted project.");
     }
     const path = scope === "global" ? globalConfigPath() : projectConfigPath(ctx.cwd);
-    // Sparse write: preserve the existing raw file and deep-merge only the patch
-    // keys. Never materialize defaults into the file so it stays minimal and any
-    // key the user did not set continues to track the shipped defaults.
+    // Repair policy: valid JSON remains a sparse deep merge; a malformed target
+    // is atomically replaced by this trusted command's sparse patch. Missing and
+    // malformed files both use an empty raw base, while genuine read/permission
+    // failures still reject without touching the destination.
     const existing = await readJson(path);
-    const base = isRecord(existing) ? existing : {};
+    const base = existing.status === "valid" && isRecord(existing.value) ? existing.value : {};
     const patch = isRecord(partial) ? partial : {};
     const merged = deepMergeRecords(base, patch);
     await writeJsonAtomic(path, merged);

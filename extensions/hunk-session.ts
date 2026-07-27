@@ -234,7 +234,14 @@ const DEFAULT_SESSION_RETRY_DELAYS_MS = [0, 75, 125, 200, 300, 450, 650] as cons
 
 /**
  * Wait through Hunk registration/watch-reload races. A non-empty frame wins
- * immediately; an empty frame is terminal only after the bounded retry window.
+ * immediately.
+ *
+ * Empty frames are not terminal: session list has no registration revision or
+ * post-mutation reload timestamp, so `fileCount: 0` cannot prove the completed
+ * mutation is included. Until Hunk exposes that handshake, keep an empty managed
+ * registration reviewable so the live surface stays open for a later reload.
+ * Callers that already know emptiness is authoritative may still synthesize
+ * `{ status: "no-diff" }` without going through this waiter.
  */
 export async function waitForManagedHunkSession(
   options: ManagedHunkSessionWaitOptions,
@@ -256,7 +263,8 @@ export async function waitForManagedHunkSession(
     lastEmpty = session;
   }
 
-  return lastEmpty ? { status: "no-diff", session: lastEmpty } : { status: "not-found" };
+  // Empty is unconfirmed without freshness evidence — do not cache terminal no-diff.
+  return lastEmpty ? { status: "reviewable", session: lastEmpty } : { status: "not-found" };
 }
 
 async function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {

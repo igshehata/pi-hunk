@@ -10,7 +10,7 @@ export function shouldEarlyOpenOnMutation(options: {
   return options.review === "live" && options.uiMode === "tui" && !options.alreadyOpenedForRun;
 }
 
-export type SettledOpenReason = "mutation" | "recover";
+export type SettledOpenReason = "mutation" | "recover" | "reroute" | "replacement";
 export type SettledSkipReason =
   | "no-change"
   | "review-off"

@@ -2,5 +2,5 @@
 "pi-hunk": patch
 ---
 
-Submit unseen Hunk comments automatically on every hide, including diff and show reviews opened
-manually, and remove the blocking review/approval workflow.
+Send new comments back to Pi whenever Hunk is hidden, including for manually opened reviews, without
+blocking the agent.
