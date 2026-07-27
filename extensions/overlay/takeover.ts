@@ -147,14 +147,24 @@ export class TakeoverHunk implements Component, Focusable {
     );
 
     // Intercept input at the TUI listener level so nothing else consumes keys
-    // while takeover is active (including Pi's editor).
-    this.removeInputListener = this.tui.addInputListener((data) => {
-      if (this.lifecycle !== "running" || this.presentation !== "active") {
-        return undefined;
+    // while takeover is active (including Pi's editor). Unit harnesses may omit
+    // addInputListener; fall back to Component.handleInput only.
+    const addInputListener = (
+      this.tui as TUI & {
+        addInputListener?: (
+          listener: (data: string) => { consume?: boolean } | undefined,
+        ) => () => void;
       }
-      this.handleInput(data);
-      return { consume: true };
-    });
+    ).addInputListener;
+    if (typeof addInputListener === "function") {
+      this.removeInputListener = addInputListener.call(this.tui, (data) => {
+        if (this.lifecycle !== "running" || this.presentation !== "active") {
+          return undefined;
+        }
+        this.handleInput(data);
+        return { consume: true };
+      });
+    }
 
     this.enterTakeover();
     this.armStartupDeadline();

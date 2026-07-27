@@ -2,5 +2,6 @@
 "pi-hunk": minor
 ---
 
-Add experimental same-tab takeover and exclusive-region painting, and publish only complete DEC 2026
-synchronized Hunk frames so embed/exclusive paths stop painting partial scroll state.
+Default to full-screen same-tab takeover, use exclusive region paint for left/right splits (with Pi
+wrap always on), and publish only complete DEC 2026 synchronized Hunk frames on embed/exclusive
+paths so partial scroll state is not painted.

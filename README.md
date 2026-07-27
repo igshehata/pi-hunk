@@ -180,7 +180,7 @@ A typical sparse project configuration:
 {
   "review": "live",
   "overlay": {
-    "layout": "right"
+    "layout": "full"
   },
   "bindings": {
     "prefix": "ctrl+space",
@@ -196,11 +196,11 @@ Configuration precedence, from lowest to highest:
 shipped defaults → ~/.pi/agent/hunk.json → trusted .pi/hunk.json → PI_HUNK_REVIEW
 ```
 
-By default, Hunk opens in the right half of the terminal and Pi always wraps into the left half for
-`left`/`right` layouts. Available layouts are `full`, `left`, `right`, and `float`. Host mode is
-derived from layout only — not separate flags:
+By default, Hunk opens **full screen** in same-tab **takeover** (Hunk owns the TTY). Available
+layouts are `full`, `left`, `right`, and `float`. Host mode is derived from layout only — not
+separate flags:
 
-- `full` → same-tab **takeover** (Hunk owns the TTY; Pi paint suspended)
+- `full` → same-tab **takeover** (Hunk owns the TTY; Pi paint suspended) — **default**
 - `left`/`right` → **exclusive** region paint (Pi wraps into remaining columns; direct Hunk
   rectangle writes while focused)
 - `float` → classic **embed** composite

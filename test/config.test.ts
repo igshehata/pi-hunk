@@ -12,18 +12,19 @@ import {
 } from "../extensions/config.ts";
 
 describe("overlay config", () => {
-  it("ships a right-split overlay by default", () => {
+  it("ships a full-screen takeover overlay by default", () => {
     expect(DEFAULT_CONFIG).toEqual(
       expect.objectContaining({
         review: "after-run",
         followEdits: true,
         hunk: { command: "hunk", args: ["diff", "--watch"] },
         overlay: {
-          layout: "right",
+          layout: "full",
         },
         bindings: { prefix: "ctrl+space", toggle: "h", show: "s" },
       }),
     );
+    expect(resolveOverlayHostMode(DEFAULT_CONFIG.overlay)).toBe("takeover");
     expect(DEFAULT_CONFIG).not.toHaveProperty("display");
     expect(DEFAULT_CONFIG).not.toHaveProperty("split");
     expect(DEFAULT_CONFIG).not.toHaveProperty("fallback");

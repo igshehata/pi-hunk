@@ -378,16 +378,16 @@ export class OverlaySurface {
     //
     // Host mode is derived from layout only — not user flags.
     // full → takeover; left/right → exclusive (Pi wrap always on); float → embed.
+    // Injected factories (unit tests) always win so harnesses can mount fakes / EmbeddedHunk
+    // under a full layout without requiring a real takeover-capable TUI.
     const hostMode = resolveOverlayHostMode(config.overlay);
     const useTakeover = hostMode === "takeover";
     let createComponent: OverlayComponentFactory;
-    if (useTakeover) {
-      // Never reuse a cached embed factory for takeover (and do not cache takeover).
-      // Tests that inject createComponent still win only when takeover is off.
+    if (this.createComponent) {
+      createComponent = this.createComponent;
+    } else if (useTakeover) {
       const mod = await defaultLoadTakeover();
       createComponent = (options) => new mod.TakeoverHunk(options);
-    } else if (this.createComponent) {
-      createComponent = this.createComponent;
     } else {
       const mod = await this.loadEmbedded();
       createComponent = (options) => new mod.EmbeddedHunk(options);

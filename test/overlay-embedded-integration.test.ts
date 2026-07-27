@@ -79,10 +79,11 @@ function integrationHarness() {
 }
 
 describe("critical surface + embedded Hunk integration", () => {
-  it("mounts the default wrapped right split and delivers overlay-local wheel/hover coordinates", async () => {
+  it("mounts a right exclusive split and delivers overlay-local wheel/hover coordinates", async () => {
     const harness = integrationHarness();
     const surface = new OverlaySurface((options) => new EmbeddedHunk(options));
     const config = cloneConfig(DEFAULT_CONFIG);
+    config.overlay = { layout: "right" };
 
     await surface.open(
       harness.ctx,

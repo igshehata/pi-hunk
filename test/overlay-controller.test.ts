@@ -758,8 +758,11 @@ describe("OverlaySurface state machine", () => {
       throw new Error("native binding unavailable");
     });
     const surface = new OverlaySurface(undefined, { loadEmbedded });
+    // float uses the embed host (not full takeover), so loadEmbedded is exercised.
+    const config = cloneConfig(DEFAULT_CONFIG);
+    config.overlay = { layout: "float" };
 
-    await expect(surface.open(harness.ctx, request(), cloneConfig(DEFAULT_CONFIG))).rejects.toThrow(
+    await expect(surface.open(harness.ctx, request(), config)).rejects.toThrow(
       "native binding unavailable",
     );
     expect(loadEmbedded).toHaveBeenCalledOnce();

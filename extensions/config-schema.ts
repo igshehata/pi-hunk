@@ -55,7 +55,8 @@ export interface HunkConfig {
 }
 
 export const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
-  layout: "right",
+  // full → takeover host (Hunk owns the TTY). left/right use exclusive+wrap.
+  layout: "full",
 };
 
 const OVERLAY_LAYOUTS: Record<OverlayLayout, ResolvedOverlayLayout> = {
