@@ -393,7 +393,6 @@ describe("OverlaySurface state machine", () => {
     const config = cloneConfig(DEFAULT_CONFIG);
     config.overlay = {
       layout: "right",
-      experimentalPiWrap: true,
     };
 
     await surface.open(harness.ctx, request(), config);
@@ -416,7 +415,6 @@ describe("OverlaySurface state machine", () => {
     const config = cloneConfig(DEFAULT_CONFIG);
     config.overlay = {
       layout: "right",
-      experimentalPiWrap: true,
     };
 
     // Capture before open: exclusive/wrap shims replace tui.requestRender after install.
@@ -562,7 +560,6 @@ describe("OverlaySurface state machine", () => {
     const config = cloneConfig(DEFAULT_CONFIG);
     config.overlay = {
       layout: "right",
-      experimentalPiWrap: true,
     };
 
     await expect(surface.open(harness.ctx, request(), config)).rejects.toThrow("pty spawn failed");

@@ -180,8 +180,7 @@ A typical sparse project configuration:
 {
   "review": "live",
   "overlay": {
-    "layout": "right",
-    "experimentalPiWrap": true
+    "layout": "right"
   },
   "bindings": {
     "prefix": "ctrl+space",
@@ -197,15 +196,15 @@ Configuration precedence, from lowest to highest:
 shipped defaults → ~/.pi/agent/hunk.json → trusted .pi/hunk.json → PI_HUNK_REVIEW
 ```
 
-By default, Hunk opens in the right half of the terminal and Pi wraps into the left half. Available
-layouts are `full`, `left`, `right`, and `float`; Pi wrapping can be toggled for left and right
-layouts. Host mode is derived from layout (and wrap), not separate flags:
+By default, Hunk opens in the right half of the terminal and Pi always wraps into the left half for
+`left`/`right` layouts. Available layouts are `full`, `left`, `right`, and `float`. Host mode is
+derived from layout only — not separate flags:
 
 - `full` → same-tab **takeover** (Hunk owns the TTY; Pi paint suspended)
-- `left`/`right` + wrap → **exclusive** region paint (direct Hunk rectangle writes while focused)
-- `float` or unwrapped split → classic **embed** composite
+- `left`/`right` → **exclusive** region paint (Pi wraps into remaining columns; direct Hunk rectangle writes while focused)
+- `float` → classic **embed** composite
 
-Toggle with `/hunk config full`, `/hunk config right experimental-wrap`, or `/hunk config right no-wrap`.
+Toggle with `/hunk config full`, `/hunk config right`, or `/hunk config float`.
 `/hunk status` reports `host=takeover|exclusive|embed` plus exclusive-frame lease counters when active.
 See [HOST_MODES.md](HOST_MODES.md) for paint paths.
 

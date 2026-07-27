@@ -380,8 +380,8 @@ export class OverlaySurface {
     // a failed import rejects open() with state still "closed" so the
     // coordinator's fallback chain engages cleanly (#14).
     //
-    // Host mode is derived from layout (and wrap for exclusive) — not user flags.
-    // full → takeover; left/right+wrap → exclusive embed; else classic embed.
+    // Host mode is derived from layout only — not user flags.
+    // full → takeover; left/right → exclusive (Pi wrap always on); float → embed.
     const hostMode = resolveOverlayHostMode(config.overlay);
     const useTakeover = hostMode === "takeover";
     let createComponent: OverlayComponentFactory;
@@ -454,18 +454,14 @@ export class OverlaySurface {
               };
             }
 
-            // Takeover suspends Pi paint itself; never install wrap beside it.
-            if (!useTakeover) {
+            // left/right always wrap Pi into the remaining columns; full/float never.
+            if (hostMode === "exclusive") {
               try {
-                this.experimentalPiWrap = installExperimentalPiWrap(
-                  tui,
-                  overlay.layout,
-                  overlay.experimentalPiWrap,
-                );
+                this.experimentalPiWrap = installExperimentalPiWrap(tui, overlay.layout);
               } catch (error) {
                 this.experimentalPiWrap = undefined;
                 ctx.ui.notify(
-                  `Experimental Pi word wrap is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+                  `Pi split wrap is unavailable: ${error instanceof Error ? error.message : String(error)}`,
                   "warning",
                 );
               }

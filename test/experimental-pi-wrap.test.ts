@@ -164,11 +164,12 @@ describe("experimental Pi split wrapping", () => {
     expect(tui.render(100)).toEqual(["pi:100"]);
   });
 
-  it("does nothing for non-split layouts or without explicit opt-in", () => {
+  it("does nothing for non-split layouts or when disabled", () => {
     const { tui } = fakeTui();
     const originalRender = tui.render;
 
-    expect(installExperimentalPiWrap(tui, "full", true)).toBeUndefined();
+    expect(installExperimentalPiWrap(tui, "full")).toBeUndefined();
+    expect(installExperimentalPiWrap(tui, "float")).toBeUndefined();
     expect(installExperimentalPiWrap(tui, "right", false)).toBeUndefined();
     expect(tui.render).toBe(originalRender);
   });

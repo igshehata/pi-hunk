@@ -20,39 +20,12 @@ const LAYOUT_CHOICES: Array<{ value: OverlayLayout; label: string }> = [
 
 export interface ConfigCommandSelection {
   layout: OverlayLayout;
-  experimentalPiWrap: boolean;
 }
 
-export function parseConfigCommand(
-  input: string,
-  currentExperimentalPiWrap: boolean,
-): ConfigCommandSelection | undefined {
+export function parseConfigCommand(input: string): ConfigCommandSelection | undefined {
   const tokens = input.trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0 || !isOverlayLayout(tokens[0])) return undefined;
-
-  let experimentalPiWrap = currentExperimentalPiWrap;
-  let requestedWrapOn = false;
-  let requestedWrapOff = false;
-  for (const token of tokens.slice(1)) {
-    if (token === "experimental-wrap" || token === "wrap") {
-      requestedWrapOn = true;
-      experimentalPiWrap = true;
-    } else if (token === "no-experimental-wrap" || token === "no-wrap") {
-      requestedWrapOff = true;
-      experimentalPiWrap = false;
-    } else return undefined;
-  }
-
-  if (requestedWrapOn && requestedWrapOff) return undefined;
-
-  if (tokens[0] === "full" || tokens[0] === "float") {
-    if (requestedWrapOn) return undefined;
-    experimentalPiWrap = false;
-  }
-  return {
-    layout: tokens[0],
-    experimentalPiWrap,
-  };
+  if (tokens.length !== 1 || !isOverlayLayout(tokens[0])) return undefined;
+  return { layout: tokens[0] };
 }
 
 function displayLayout(layout: OverlayLayout): string {
@@ -127,11 +100,8 @@ function buildPatch(before: HunkConfig, after: HunkConfig): Record<string, unkno
   if (before.followEdits !== after.followEdits) patch.followEdits = after.followEdits;
 
   const overlay: Record<string, unknown> = {};
-  const layoutChanged = before.overlay.layout !== after.overlay.layout;
-  const wrapChanged = before.overlay.experimentalPiWrap !== after.overlay.experimentalPiWrap;
-  if (layoutChanged || wrapChanged) {
-    if (layoutChanged) overlay.layout = after.overlay.layout;
-    overlay.experimentalPiWrap = after.overlay.experimentalPiWrap;
+  if (before.overlay.layout !== after.overlay.layout) {
+    overlay.layout = after.overlay.layout;
   }
   if (Object.keys(overlay).length > 0) patch.overlay = overlay;
 
@@ -183,9 +153,7 @@ async function persistProjectChange(
     store.patchSession({ bindings: runtimeBindings });
   }
 
-  const overlayChanged =
-    before.overlay.layout !== saved.overlay.layout ||
-    before.overlay.experimentalPiWrap !== saved.overlay.experimentalPiWrap;
+  const overlayChanged = before.overlay.layout !== saved.overlay.layout;
   const messages: string[] = [];
   if (notifySaved) messages.push("Hunk configuration updated in .pi/hunk.json.");
   if (overlayChanged && coordinator.hasLiveSurface()) {
@@ -196,12 +164,7 @@ async function persistProjectChange(
     messages.push(`Run /reload to activate the Pi-hunk chord ${chord}.`);
   }
   if (notifySaved && overlayChanged) {
-    const extras = [
-      saved.overlay.experimentalPiWrap ? "Pi wrapping experimental" : undefined,
-    ].filter(Boolean);
-    messages.push(
-      `Layout: ${displayLayout(saved.overlay.layout)}${extras.length ? `, ${extras.join(", ")}` : ""}.`,
-    );
+    messages.push(`Layout: ${displayLayout(saved.overlay.layout)}.`);
   }
   if (messages.length > 0) ctx.ui.notify(messages.join(" "), "info");
   return saved;
@@ -214,7 +177,7 @@ async function configureInteractively(
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify(
-      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap]",
+      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore | full|left|right|float",
       "warning",
     );
     return;
@@ -223,14 +186,12 @@ async function configureInteractively(
   let current = store.get();
   const runtimeBindings = { ...current.bindings };
   while (true) {
-    const wrapState = current.overlay.experimentalPiWrap ? "on (experimental)" : "off";
     const choice = await ctx.ui.select(
       "Pi-hunk configuration — changes auto-save to .pi/hunk.json",
       [
         `Review behavior: ${current.review}`,
         `Follow edits: ${current.followEdits ? "on" : "off"}`,
         `Overlay layout: ${current.overlay.layout}`,
-        `Pi word wrap: ${wrapState}`,
         `Hunk prefix: ${current.bindings.prefix}`,
         `Toggle hotkey: ${current.bindings.toggle}`,
         `Show hotkey: ${current.bindings.show}`,
@@ -261,9 +222,7 @@ async function configureInteractively(
           ? ` Run /reload to activate the restored Hunk chord; the current chord remains active until then.`
           : "";
         const overlayMessage =
-          coordinator.hasLiveSurface() &&
-          (current.overlay.layout !== restored.overlay.layout ||
-            current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap)
+          coordinator.hasLiveSurface() && current.overlay.layout !== restored.overlay.layout
             ? " Close and reopen the current Hunk review to apply the restored layout."
             : "";
         ctx.ui.notify(
@@ -297,20 +256,6 @@ async function configureInteractively(
       const selected = LAYOUT_CHOICES.find((item) => item.label === selectedLabel);
       if (!selected) continue;
       next.overlay.layout = selected.value;
-      if (selected.value === "full" || selected.value === "float") {
-        next.overlay.experimentalPiWrap = false;
-      }
-    } else if (choice.startsWith("Pi word wrap:")) {
-      if (current.overlay.layout !== "left" && current.overlay.layout !== "right") {
-        ctx.ui.notify("Experimental Pi word wrap only applies to left and right layouts.", "info");
-        continue;
-      }
-      const wrap = await ctx.ui.select("Pi word wrapping", [
-        "Off — overlay only (stable)",
-        "On — wrap Pi beside Hunk (experimental)",
-      ]);
-      if (!wrap) continue;
-      next.overlay.experimentalPiWrap = wrap.startsWith("On");
     } else if (choice.startsWith("Hunk prefix:")) {
       const binding = await captureBinding(ctx, "prefix", current.bindings.prefix, "prefix", [
         current.bindings.toggle,
@@ -379,9 +324,7 @@ export async function handleConfigCommand(
         (binding) => restored.bindings[binding] !== current.bindings[binding],
       );
       if (shortcutsChanged) store.patchSession({ bindings: current.bindings });
-      const overlayChanged =
-        current.overlay.layout !== restored.overlay.layout ||
-        current.overlay.experimentalPiWrap !== restored.overlay.experimentalPiWrap;
+      const overlayChanged = current.overlay.layout !== restored.overlay.layout;
       ctx.ui.notify(
         `Project Hunk configuration removed; inherited/default settings restored.${shortcutsChanged ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then." : ""}${overlayChanged && coordinator.hasLiveSurface() ? " Close and reopen the current Hunk review to apply the restored layout." : ""}`,
         "info",
@@ -395,25 +338,14 @@ export async function handleConfigCommand(
     return;
   }
 
-  const direct = parseConfigCommand(input, current.overlay.experimentalPiWrap);
+  const direct = parseConfigCommand(input);
   if (!direct) {
-    const tokens = input.trim().split(/\s+/);
-    const requestsSplitExperiment = tokens
-      .slice(1)
-      .some((token) => ["experimental-wrap", "wrap"].includes(token));
-    const nonSplitLayout = tokens[0] === "full" || tokens[0] === "float";
-    ctx.ui.notify(
-      requestsSplitExperiment && nonSplitLayout
-        ? "Experimental Pi wrapping only applies to left and right layouts."
-        : "Usage: /hunk config restore | full|left|right|float [experimental-wrap|no-wrap]",
-      "warning",
-    );
+    ctx.ui.notify("Usage: /hunk config restore | full|left|right|float", "warning");
     return;
   }
 
   const next = cloneConfig(current);
   next.overlay.layout = direct.layout;
-  next.overlay.experimentalPiWrap = direct.experimentalPiWrap;
   if (Object.keys(buildPatch(current, next)).length === 0) {
     ctx.ui.notify("Hunk configuration is unchanged.", "info");
     return;

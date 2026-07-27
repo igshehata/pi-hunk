@@ -136,17 +136,11 @@ function warnInvalidBindings(
 
 function warnInvalidOverlayConfig(raw: unknown, path: string, onWarning?: ConfigWarning): void {
   if (!onWarning || !isRecord(raw) || !isRecord(raw.overlay)) return;
-  const { layout, experimentalPiWrap } = raw.overlay;
+  const { layout } = raw.overlay;
   if (layout !== undefined && !isOverlayLayout(layout)) {
     onWarning(
       `Ignoring invalid overlay.layout ${JSON.stringify(layout)} in ${path}. ` +
         `Use "full", "left", "right", or "float".`,
-    );
-  }
-  if (experimentalPiWrap !== undefined && typeof experimentalPiWrap !== "boolean") {
-    onWarning(
-      `Ignoring invalid overlay.experimentalPiWrap ${JSON.stringify(experimentalPiWrap)} in ${path}; ` +
-        `expected true or false.`,
     );
   }
 }
@@ -159,7 +153,7 @@ function warnUnknownConfig(raw: unknown, path: string, onWarning?: ConfigWarning
     .map((key) => key);
   const nested: Array<[string, Set<string>]> = [
     ["hunk", new Set(["command", "args"])],
-    ["overlay", new Set(["layout", "experimentalPiWrap"])],
+    ["overlay", new Set(["layout"])],
     ["bindings", new Set(["prefix", "toggle", "show"])],
   ];
   for (const [section, keys] of nested) {

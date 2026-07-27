@@ -1,19 +1,19 @@
 # Host modes (shipped on feat/host-modes-and-atomic-frames)
 
-Host mode is **not** a config flag. It is derived from overlay layout (+ wrap for exclusive) via
+Host mode is **not** a config flag. It is derived from overlay layout via
 `resolveOverlayHostMode`:
 
 | Mode | Derived when | Layouts | Paint path |
 | --- | --- | --- | --- |
-| **Embed** | float, or left/right without wrap | left/right/float | PTY → libghostty → HTML → Pi composite |
-| **Exclusive** | left/right + `experimentalPiWrap` | left/right only | PTY → libghostty → HTML → direct rect (Pi composite suppressed when leased) |
+| **Embed** | `layout: "float"` | float | PTY → libghostty → HTML → Pi composite |
+| **Exclusive** | `layout: "left"` or `"right"` | left/right only | PTY → libghostty → HTML → direct rect (Pi composite suppressed when leased); Pi always wraps into the remaining columns |
 | **Takeover** | `layout: "full"` | full | PTY → raw VT to TTY (no libghostty/HTML/Pi) |
 
 ```ts
 // full → takeover
-// left/right + experimentalPiWrap → exclusive
-// else → embed
-resolveOverlayHostMode({ layout, experimentalPiWrap })
+// left/right → exclusive (Pi wrap always on)
+// float → embed
+resolveOverlayHostMode({ layout })
 ```
 
 ## Atomic DEC 2026 frames (all embed/exclusive)
@@ -24,8 +24,8 @@ PTY bytes always feed libghostty. Publish (invalidate + requestFrame / exclusive
 
 ```text
 /hunk config full                 # takeover
-/hunk config right experimental-wrap   # exclusive (default for right)
-/hunk config right no-wrap        # embed split
+/hunk config right                # exclusive split (Pi wraps automatically)
+/hunk config left                 # exclusive split (Pi wraps automatically)
 /hunk config float                # embed float
 ```
 

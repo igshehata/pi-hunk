@@ -101,9 +101,10 @@ describe("TakeoverHunk", () => {
 });
 
 describe("resolveOverlayHostMode", () => {
-  it("maps layout and wrap to takeover, exclusive, or embed", () => {
-    expect(resolveOverlayHostMode({ layout: "full", experimentalPiWrap: false })).toBe("takeover");
-    expect(resolveOverlayHostMode({ layout: "right", experimentalPiWrap: true })).toBe("exclusive");
-    expect(resolveOverlayHostMode({ layout: "float", experimentalPiWrap: false })).toBe("embed");
+  it("maps layout to takeover, exclusive, or embed", () => {
+    expect(resolveOverlayHostMode({ layout: "full" })).toBe("takeover");
+    expect(resolveOverlayHostMode({ layout: "right" })).toBe("exclusive");
+    expect(resolveOverlayHostMode({ layout: "left" })).toBe("exclusive");
+    expect(resolveOverlayHostMode({ layout: "float" })).toBe("embed");
   });
 });

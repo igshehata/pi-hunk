@@ -122,7 +122,6 @@ describe("critical surface + embedded Hunk integration", () => {
     const config = cloneConfig(DEFAULT_CONFIG);
     config.overlay = {
       layout: "float",
-      experimentalPiWrap: false,
     };
 
     await surface.open(

@@ -749,7 +749,6 @@ async function handleStatus(
   ctx.ui.notify(
     `Hunk: review=${config.review}, layout=${config.overlay.layout}, ` +
       `host=${hostMode}, ` +
-      `experimental-pi-wrap=${config.overlay.experimentalPiWrap ? "on" : "off"}, ` +
       `active=${active}, command=${config.hunk.command}\n` +
       `open-notes=${openNotes}, last-auto-open=${describeSettledDecision(diagnostics.decision)}` +
       (exclusiveStats

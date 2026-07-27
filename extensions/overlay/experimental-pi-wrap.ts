@@ -2,14 +2,13 @@ import type { TUI } from "@earendil-works/pi-tui";
 import type { OverlayLayout } from "../config.ts";
 
 /**
- * Experimental split companion for Pi 0.80.x.
+ * Split companion for Pi 0.80.x left/right layouts.
  *
  * Pi renders its base component tree at the full terminal width and composites
  * overlays afterwards. There is currently no supported API for reserving
- * columns beside an overlay, so this opt-in shim narrows the root render width
- * while a left/right Hunk pane is visible. It deliberately lives behind
- * `overlay.experimentalPiWrap` because it replaces one public method on the TUI
- * instance. Reflow stays on Pi's differential renderer; forcing a full-screen
+ * columns beside an overlay, so this shim narrows the root render width while a
+ * left/right Hunk pane is visible. Always installed for split layouts (not user
+ * config). Reflow stays on Pi's differential renderer; forcing a full-screen
  * clear here causes visible flicker during rapid show/hide transitions.
  */
 export interface ExperimentalPiWrapController {
@@ -20,7 +19,7 @@ export interface ExperimentalPiWrapController {
 export function installExperimentalPiWrap(
   tui: TUI,
   layout: OverlayLayout,
-  enabled: boolean,
+  enabled = true,
 ): ExperimentalPiWrapController | undefined {
   if (!enabled || (layout !== "left" && layout !== "right")) return undefined;
 

@@ -87,8 +87,6 @@ describe("interactive /hunk config", () => {
       "off",
       "Overlay layout: right",
       "Left — 50% split pane",
-      "Pi word wrap: on (experimental)",
-      "Off — overlay only (stable)",
       "Done",
     ]);
     const store = new ConfigStore();
@@ -101,7 +99,6 @@ describe("interactive /hunk config", () => {
       followEdits: false,
       overlay: {
         layout: "left",
-        experimentalPiWrap: false,
       },
     });
     expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
@@ -109,7 +106,6 @@ describe("interactive /hunk config", () => {
       followEdits: false,
       overlay: {
         layout: "left",
-        experimentalPiWrap: false,
       },
     });
     expect(ctx.ui.select).not.toHaveBeenCalledWith("Save Hunk config", expect.anything());
@@ -247,44 +243,31 @@ describe("direct /hunk config", () => {
     const store = new ConfigStore();
     await store.reload(ctx);
 
-    await handleConfigCommand("left no-wrap", ctx, store, inactiveCoordinator);
+    await handleConfigCommand("left", ctx, store, inactiveCoordinator);
 
     expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
       overlay: {
         layout: "left",
-        experimentalPiWrap: false,
       },
     });
     expect(store.get().overlay).toEqual({
       layout: "left",
-      experimentalPiWrap: false,
     });
   });
 
-  it("rejects exclusive and takeover tokens as invalid config flags", async () => {
+  it("rejects exclusive, takeover, and wrap tokens as invalid config flags", async () => {
     const { ctx, projectPath } = await testProject([]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
     await handleConfigCommand("right experimental-exclusive", ctx, store, inactiveCoordinator);
     await handleConfigCommand("full experimental-takeover", ctx, store, inactiveCoordinator);
+    await handleConfigCommand("right experimental-wrap", ctx, store, inactiveCoordinator);
+    await handleConfigCommand("left no-wrap", ctx, store, inactiveCoordinator);
 
     await expect(access(projectPath)).rejects.toThrow();
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("Usage:"),
-      "warning",
-    );
-  });
-
-  it("rejects experimental wrapping for non-split layouts instead of discarding it", async () => {
-    const { ctx, projectPath } = await testProject([]);
-    const store = new ConfigStore();
-
-    await handleConfigCommand("full experimental-wrap", ctx, store, inactiveCoordinator);
-
-    await expect(access(projectPath)).rejects.toThrow();
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "Experimental Pi wrapping only applies to left and right layouts.",
       "warning",
     );
   });

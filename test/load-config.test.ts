@@ -36,7 +36,7 @@ describe("config loading", () => {
       join(root, ".pi", "hunk.json"),
       JSON.stringify({
         followEdits: false,
-        overlay: { layout: "right", experimentalPiWrap: true },
+        overlay: { layout: "right" },
       }),
     );
 
@@ -45,7 +45,6 @@ describe("config loading", () => {
     expect(config.followEdits).toBe(false);
     expect(config.overlay).toEqual({
       layout: "right",
-      experimentalPiWrap: true,
     });
     expect(config.bindings.prefix).toBe("ctrl+x");
   });
@@ -117,7 +116,6 @@ describe("config loading", () => {
       JSON.stringify({
         overlay: {
           layout: "diagonal",
-          experimentalPiWrap: "yes",
         },
       }),
     );
@@ -127,15 +125,11 @@ describe("config loading", () => {
 
     expect(config.overlay).toEqual({
       layout: "right",
-      experimentalPiWrap: true,
     });
-    expect(warnings).toEqual([
-      expect.stringContaining("invalid overlay.layout"),
-      expect.stringContaining("invalid overlay.experimentalPiWrap"),
-    ]);
+    expect(warnings).toEqual([expect.stringContaining("invalid overlay.layout")]);
   });
 
-  it("ignores removed exclusive/takeover overlay keys as unknown", async () => {
+  it("ignores removed wrap/exclusive/takeover overlay keys as unknown", async () => {
     const root = await temporaryDirectory("hunk-overlay-legacy-");
     const globalPath = join(root, "global.json");
     process.env.PI_HUNK_CONFIG = globalPath;
@@ -156,10 +150,11 @@ describe("config loading", () => {
 
     expect(config.overlay).toEqual({
       layout: "right",
-      experimentalPiWrap: true,
     });
     expect(warnings).toEqual([
-      expect.stringContaining("overlay.experimentalExclusiveFrame, overlay.experimentalTakeover"),
+      expect.stringContaining(
+        "overlay.experimentalPiWrap, overlay.experimentalExclusiveFrame, overlay.experimentalTakeover",
+      ),
     ]);
   });
 
