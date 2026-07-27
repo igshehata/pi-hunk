@@ -17,7 +17,11 @@ vi.mock("../extensions/overlay/pty.ts", () => ({
 
 import { cloneConfig, DEFAULT_CONFIG } from "../extensions/config.ts";
 import type { EmbeddedOptions } from "../extensions/overlay/embedded.ts";
-import { OverlaySurface, type OverlayComponent } from "../extensions/overlay/surface.ts";
+import {
+  OverlaySurface,
+  type OverlayComponent,
+  type OverlayComponentFactory,
+} from "../extensions/overlay/surface.ts";
 import {
   resolveOverlayRows,
   type OpenRequest,
@@ -45,6 +49,14 @@ function request(args = ["diff", "--watch"]): OpenRequest {
     args,
     source: "manual",
   };
+}
+
+function componentConstructor(
+  factory: OverlayComponentFactory,
+): new (options: EmbeddedOptions) => OverlayComponent {
+  return function ComponentConstructor(options: EmbeddedOptions) {
+    return factory(options);
+  } as unknown as new (options: EmbeddedOptions) => OverlayComponent;
 }
 
 /**
@@ -359,6 +371,68 @@ describe("OverlaySurface state machine", () => {
       expect(harness.overlayOptions.at(-1)).toEqual(options);
       await surface.close();
     }
+  });
+
+  it("reselects the production host factory after layout changes", async () => {
+    const harness = createHarness();
+    const createEmbedded = vi.fn((options: EmbeddedOptions) => harness.createComponent(options));
+    const createTakeover = vi.fn((options: EmbeddedOptions) => harness.createComponent(options));
+    const loadEmbedded = vi.fn(async () => ({
+      EmbeddedHunk: componentConstructor(createEmbedded),
+    }));
+    const loadTakeover = vi.fn(async () => ({
+      TakeoverHunk: componentConstructor(createTakeover),
+    }));
+    const surface = new OverlaySurface(undefined, { loadEmbedded, loadTakeover });
+    const config = cloneConfig(DEFAULT_CONFIG);
+
+    config.overlay.layout = "float";
+    await surface.open(harness.ctx, request(), config);
+    await surface.close();
+    expect(createEmbedded).toHaveBeenCalledTimes(1);
+    expect(createTakeover).not.toHaveBeenCalled();
+
+    config.overlay.layout = "full";
+    await surface.open(harness.ctx, request(), config);
+    await surface.close();
+    expect(createEmbedded).toHaveBeenCalledTimes(1);
+    expect(createTakeover).toHaveBeenCalledTimes(1);
+
+    config.overlay.layout = "right";
+    await surface.open(harness.ctx, request(), config);
+    await surface.close();
+    expect(createEmbedded).toHaveBeenCalledTimes(2);
+    expect(createTakeover).toHaveBeenCalledTimes(1);
+    expect(loadEmbedded).toHaveBeenCalledOnce();
+    expect(loadTakeover).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces concurrent opens while the lazy host factory loads", async () => {
+    const harness = createHarness();
+    const createEmbedded = vi.fn((options: EmbeddedOptions) => harness.createComponent(options));
+    let finishLoad!: (module: {
+      EmbeddedHunk: new (options: EmbeddedOptions) => OverlayComponent;
+    }) => void;
+    const pendingLoad = new Promise<{
+      EmbeddedHunk: new (options: EmbeddedOptions) => OverlayComponent;
+    }>((resolve) => {
+      finishLoad = resolve;
+    });
+    const loadEmbedded = vi.fn(() => pendingLoad);
+    const surface = new OverlaySurface(undefined, { loadEmbedded });
+    const config = cloneConfig(DEFAULT_CONFIG);
+    config.overlay.layout = "float";
+
+    const first = surface.open(harness.ctx, request(), config);
+    const duplicate = surface.open(harness.ctx, request(), config);
+    expect(surface.getState()).toBe("closed");
+    finishLoad({ EmbeddedHunk: componentConstructor(createEmbedded) });
+
+    await Promise.all([first, duplicate]);
+    expect(surface.getState()).toBe("visible");
+    expect(harness.components).toHaveLength(1);
+    expect(createEmbedded).toHaveBeenCalledOnce();
+    await surface.close();
   });
 
   it("resolves overlay-local mouse viewports for split and floating layouts", async () => {

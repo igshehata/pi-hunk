@@ -63,6 +63,7 @@ type EmbeddedLoader = () => Promise<EmbeddedModule>;
 type TakeoverModule = {
   TakeoverHunk: new (options: EmbeddedOptions) => OverlayComponent;
 };
+type TakeoverLoader = () => Promise<TakeoverModule>;
 
 /**
  * Cached dynamic import of the embedded PTY component. A rejected import (broken
@@ -102,6 +103,8 @@ export interface OverlaySurfaceOptions {
   startTimeoutMs?: number;
   /** Injectable embedded-module loader (tests / alternate builds). */
   loadEmbedded?: EmbeddedLoader;
+  /** Injectable takeover-module loader (tests / alternate builds). */
+  loadTakeover?: TakeoverLoader;
   /** Notified after every surface state transition (see coordinator.onStateChange). */
   onStateChange?: () => void;
   /** Notified only for natural child PTY exits, before the surface closes. */
@@ -169,13 +172,13 @@ const ALLOWED_STATE_TRANSITIONS: Record<SurfaceState, readonly SurfaceState[]> =
 export class OverlaySurface {
   private state: SurfaceState = "closed";
   private generation = 0;
-  /**
-   * Component factory. When undefined (production default), it is resolved lazily
-   * on first open() from the dynamically-imported embedded module and cached here.
-   * Tests inject a fake factory directly.
-   */
-  private createComponent: OverlayComponentFactory | undefined;
+  /** Tests may inject one factory for every host mode; production caches each
+   * layout-derived host implementation separately so config changes reselect it. */
+  private readonly injectedCreateComponent: OverlayComponentFactory | undefined;
+  private embeddedCreateComponent: OverlayComponentFactory | undefined;
+  private takeoverCreateComponent: OverlayComponentFactory | undefined;
   private readonly loadEmbedded: EmbeddedLoader;
+  private readonly loadTakeover: TakeoverLoader;
   private readonly startTimeoutMs: number;
   private readonly startupFrameDeadlineMs: number | undefined;
   private stateListener: (() => void) | undefined;
@@ -199,8 +202,9 @@ export class OverlaySurface {
   private startTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(createComponent?: OverlayComponentFactory, options: OverlaySurfaceOptions = {}) {
-    this.createComponent = createComponent;
+    this.injectedCreateComponent = createComponent;
     this.loadEmbedded = options.loadEmbedded ?? defaultLoadEmbedded;
+    this.loadTakeover = options.loadTakeover ?? defaultLoadTakeover;
     this.startTimeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     this.startupFrameDeadlineMs = options.startupFrameDeadlineMs;
     this.stateListener = options.onStateChange;
@@ -370,10 +374,10 @@ export class OverlaySurface {
     }
 
     // Resolve the component factory BEFORE any state mutation. When a factory is
-    // already available (injected in tests, or cached from a prior open) this is
+    // already available (injected in tests, or cached for this host mode) this is
     // fully synchronous, so a caller observing state right after open() still
-    // sees "starting". Only the production lazy path awaits the dynamic import;
-    // a failed import rejects open() with state still "closed" so the
+    // sees "starting". Only the first production open for a host mode awaits its
+    // dynamic import; a failed import rejects with state still "closed" so the
     // coordinator's fallback chain engages cleanly (#14).
     //
     // Host mode is derived from layout only — not user flags.
@@ -383,16 +387,37 @@ export class OverlaySurface {
     const hostMode = resolveOverlayHostMode(config.overlay);
     const useTakeover = hostMode === "takeover";
     let createComponent: OverlayComponentFactory;
-    if (this.createComponent) {
-      createComponent = this.createComponent;
+    if (this.injectedCreateComponent) {
+      createComponent = this.injectedCreateComponent;
     } else if (useTakeover) {
-      const mod = await defaultLoadTakeover();
-      createComponent = (options) => new mod.TakeoverHunk(options);
+      if (!this.takeoverCreateComponent) {
+        const mod = await this.loadTakeover();
+        this.takeoverCreateComponent = (options) => new mod.TakeoverHunk(options);
+      }
+      createComponent = this.takeoverCreateComponent;
     } else {
-      const mod = await this.loadEmbedded();
-      createComponent = (options) => new mod.EmbeddedHunk(options);
-      this.createComponent = createComponent;
+      if (!this.embeddedCreateComponent) {
+        const mod = await this.loadEmbedded();
+        this.embeddedCreateComponent = (options) => new mod.EmbeddedHunk(options);
+      }
+      createComponent = this.embeddedCreateComponent;
     }
+
+    // A first-time lazy host import yields before startPromise is installed.
+    // Reconcile a concurrent opener that may have started while this call was
+    // awaiting the factory, just as the entry guard above does.
+    if (this.startPromise) {
+      await this.startPromise;
+      if (
+        this.isLive() &&
+        this.currentArgsKey === argsKey(request.command, request.args, resolve(request.cwd))
+      ) {
+        if (this.state === "hidden") await this.show();
+        return;
+      }
+      if (this.isLive()) await this.close();
+    }
+    if (this.state !== "closed") await this.close();
 
     this.transitionState("starting");
     const gen = ++this.generation;

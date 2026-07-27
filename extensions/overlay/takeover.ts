@@ -53,8 +53,8 @@ interface TuiPaintRuntime {
  * Child PTY bytes are written straight to the terminal. Leaving takeover restores
  * Pi with a forced full redraw.
  *
- * Experimental: pokes TUI internals (requestRender no-op) and assumes exclusive
- * ownership of the screen while active.
+ * Experimental: pokes TUI internals (requestRender paint suppression) and
+ * assumes exclusive ownership of the screen while active.
  */
 export class TakeoverHunk implements Component, Focusable {
   private readonly tui: TUI;
@@ -72,6 +72,7 @@ export class TakeoverHunk implements Component, Focusable {
   private readonly originalRequestRender: TUI["requestRender"];
 
   private lifecycle: LifecycleState = "running";
+  private ptyDecoder = new TextDecoder();
   private presentation: PresentationState = "active";
   private prefixPending = false;
   private mouseEnabled = false;
@@ -114,7 +115,7 @@ export class TakeoverHunk implements Component, Focusable {
     this.columns = Math.max(1, options.tui.terminal.columns);
     this.rows = Math.max(1, options.tui.terminal.rows);
     this.runtime = options.tui as unknown as TuiPaintRuntime;
-    this.originalRequestRender = this.runtime.requestRender.bind(options.tui);
+    this.originalRequestRender = this.runtime.requestRender;
 
     this.pty = spawnOverlayPty({
       command: options.command,
@@ -138,7 +139,7 @@ export class TakeoverHunk implements Component, Focusable {
         this.sawOutput = true;
         this.clearStartupDeadline();
         if (this.presentation !== "active") return;
-        this.writeRaw(data);
+        this.writePtyData(data);
       }),
       this.pty.onExit((event) => {
         if (this.lifecycle !== "running" || gen !== this.generation) return;
@@ -172,23 +173,24 @@ export class TakeoverHunk implements Component, Focusable {
 
   /**
    * Surface visibility. Hidden takeover suspends VT writes and restores Pi paint;
-   * show re-enters takeover (Hunk may need a user refresh if it does not repaint).
+   * show re-enters takeover and forces Hunk to repaint the cleared alternate screen.
    */
   setVisible(visible: boolean): void {
     if (this.lifecycle !== "running") return;
     if (visible && this.presentation === "suspended") {
       this.presentation = "active";
-      this.enterTakeover();
-      // Nudge Hunk to redraw after a temporary suspend.
-      try {
-        this.pty.resize(this.columns, this.rows);
-      } catch {
-        // Child may have exited.
-      }
+      this.resetPtyDecoder();
+      this.enterTakeover({ resuming: true });
+      // Re-entry clears the alternate screen. Force an actual resize transition
+      // when geometry is unchanged so Hunk redraws without waiting for input.
+      this.syncPtyGeometry(true);
       return;
     }
     if (!visible && this.presentation === "active") {
       this.presentation = "suspended";
+      // A byte sequence split across the visibility boundary cannot be resumed:
+      // output received while hidden is intentionally discarded.
+      this.resetPtyDecoder();
       this.leaveTakeover({ restorePi: true });
     }
   }
@@ -244,18 +246,9 @@ export class TakeoverHunk implements Component, Focusable {
    * accidental composite is cheap; real content is on the TTY via passthrough.
    */
   render(_width: number): string[] {
-    // Keep PTY size in sync if the terminal resized while Pi was suspended.
-    const cols = Math.max(1, this.tui.terminal.columns);
-    const rows = Math.max(1, this.tui.terminal.rows);
-    if (cols !== this.columns || rows !== this.rows) {
-      this.columns = cols;
-      this.rows = rows;
-      try {
-        this.pty.resize(cols, rows);
-      } catch {
-        // ignore
-      }
-    }
+    // Mount transitions may still render us; use the same resize path as the
+    // requestRender shim so the child always observes physical terminal size.
+    this.syncPtyGeometry();
     return [];
   }
 
@@ -265,6 +258,7 @@ export class TakeoverHunk implements Component, Focusable {
 
   dispose(): void {
     if (this.lifecycle === "disposed") return;
+    this.flushPtyDecoder(this.lifecycle === "running" && this.presentation === "active");
     this.lifecycle = "disposed";
     this.generation += 1;
     this.clearStartupDeadline();
@@ -290,13 +284,15 @@ export class TakeoverHunk implements Component, Focusable {
     }
   }
 
-  private enterTakeover(): void {
+  private enterTakeover(options: { resuming?: boolean } = {}): void {
     this.suspendPiPaint();
     this.setMouseEnabled(true);
     // Clear screen so Hunk's alternate buffer / first paint is not mixed with Pi.
     this.writeRaw("\x1b[?1049h\x1b[2J\x1b[H");
     if (!this.sawOutput) {
       this.writeRaw("Starting Hunk (takeover)…\r\n");
+    } else if (options.resuming) {
+      this.writeRaw("Restoring Hunk…\r\n");
     }
   }
 
@@ -315,14 +311,16 @@ export class TakeoverHunk implements Component, Focusable {
   private suspendPiPaint(): void {
     if (this.paintSuspended) return;
     this.paintSuspended = true;
-    // Drop any pending Pi frame and make requestRender a no-op while Hunk owns TTY.
+    // Drop any pending Pi frame and suppress requestRender paints while Hunk owns TTY.
     if (this.runtime.renderTimer) {
       clearTimeout(this.runtime.renderTimer);
       this.runtime.renderTimer = undefined;
     }
     this.runtime.renderRequested = false;
     this.runtime.requestRender = (() => {
-      // no-op while takeover is active
+      // Pi uses requestRender for terminal resize notifications. Suppress its
+      // paint, but still propagate any geometry change to the child PTY.
+      this.syncPtyGeometry();
     }) as TUI["requestRender"];
   }
 
@@ -330,7 +328,7 @@ export class TakeoverHunk implements Component, Focusable {
     if (!this.paintSuspended) {
       if (forceRedraw) {
         try {
-          this.originalRequestRender(true);
+          this.originalRequestRender.call(this.tui, true);
         } catch {
           // ignore
         }
@@ -341,15 +339,66 @@ export class TakeoverHunk implements Component, Focusable {
     this.runtime.requestRender = this.originalRequestRender;
     if (forceRedraw) {
       try {
-        this.originalRequestRender(true);
+        this.originalRequestRender.call(this.tui, true);
       } catch {
         // ignore
       }
     }
   }
 
-  private writeRaw(data: string | Uint8Array): void {
-    const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+  private syncPtyGeometry(forceRefresh = false): void {
+    if (this.lifecycle !== "running") return;
+
+    const columns = Math.max(1, this.tui.terminal.columns);
+    const rows = Math.max(1, this.tui.terminal.rows);
+    const changed = columns !== this.columns || rows !== this.rows;
+    this.columns = columns;
+    this.rows = rows;
+
+    if (!changed && !forceRefresh) return;
+
+    if (forceRefresh && !changed) {
+      // Re-entry clears the real alternate screen, but an unchanged resize is
+      // not required to signal the child. Bounce through another valid size so
+      // Hunk receives a genuine resize and repaints at the final geometry.
+      const refreshRows = rows === 1 ? 2 : rows - 1;
+      try {
+        this.pty.resize(columns, refreshRows);
+      } catch {
+        // Always attempt to restore the real geometry below.
+      }
+    }
+
+    try {
+      this.pty.resize(columns, rows);
+    } catch {
+      // Child may have exited during a terminal resize or resume.
+    }
+  }
+
+  private writePtyData(data: string | Uint8Array): void {
+    if (typeof data === "string") {
+      // Define ordering if a backend ever mixes encoded and decoded chunks.
+      this.flushPtyDecoder(true);
+      this.writeRaw(data);
+      return;
+    }
+
+    const text = this.ptyDecoder.decode(data, { stream: true });
+    if (text) this.writeRaw(text);
+  }
+
+  private flushPtyDecoder(write: boolean): void {
+    const text = this.ptyDecoder.decode();
+    this.ptyDecoder = new TextDecoder();
+    if (write && text) this.writeRaw(text);
+  }
+
+  private resetPtyDecoder(): void {
+    this.ptyDecoder = new TextDecoder();
+  }
+
+  private writeRaw(text: string): void {
     try {
       this.tui.terminal.write(text);
     } catch {
@@ -395,6 +444,7 @@ export class TakeoverHunk implements Component, Focusable {
     if (this.lifecycle !== "running") return;
     this.lifecycle = "completed";
     this.clearStartupDeadline();
+    this.flushPtyDecoder(this.presentation === "active");
     this.leaveTakeover({ restorePi: true });
     try {
       this.done(result);

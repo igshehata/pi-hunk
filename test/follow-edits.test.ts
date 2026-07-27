@@ -302,7 +302,7 @@ describe("navigateHunkSession", () => {
   );
 
   it.runIf(process.platform !== "win32")(
-    "maps sibling git worktree targets to worktree-relative Hunk paths",
+    "rejects sibling worktree targets instead of navigating the selected worktree session",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "pi-hunk-follow-worktree-"));
       const mainRepo = join(root, "main");
@@ -319,17 +319,19 @@ describe("navigateHunkSession", () => {
         await mkdir(join(featureRepo, "extensions", "overlay"), { recursive: true });
         await writeFile(join(featureRepo, "extensions", "overlay", "surface.ts"), "export {};\n");
 
-        const run = runner([session({ pid: 909, cwd: mainRepo, repoRoot: mainRepo })], (argv) =>
-          expect(argv[5]).toBe("extensions/overlay/surface.ts"),
-        );
+        const run = runner([session({ pid: 909, cwd: mainRepo, repoRoot: mainRepo })]);
 
-        await navigateHunkSession({
-          cwd: featureRepo,
-          filePath: join(featureRepo, "extensions", "overlay", "surface.ts"),
-          managedPid: 909,
-          run,
-        });
-        expect(run).toHaveBeenCalledTimes(2);
+        await expect(
+          navigateHunkSession({
+            cwd: featureRepo,
+            filePath: join(featureRepo, "extensions", "overlay", "surface.ts"),
+            managedPid: 909,
+            run,
+          }),
+        ).rejects.toThrow(/outside selected repository/);
+        // The target remains absolute evidence for repository routing; it must
+        // never be translated into a --file argument for the main worktree.
+        expect(run).toHaveBeenCalledTimes(1);
       } finally {
         await execFileAsync("git", ["-C", mainRepo, "worktree", "remove", "--force", featureRepo], {
           encoding: "utf8",

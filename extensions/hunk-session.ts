@@ -1,15 +1,9 @@
 import { execFile } from "node:child_process";
-import { realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { canonicalizePotentialPath, pathIsInside } from "./path-routing.ts";
 
 const execFileAsync = promisify(execFile);
-
-interface GitCheckout {
-  toplevel: string;
-  commonDir: string;
-}
 
 export interface HunkExecResult {
   stdout: string;
@@ -304,77 +298,6 @@ function noSessionMessage(options: HunkSessionSelectionOptions): string {
   }.`;
 }
 
-function isMissingPathError(error: unknown): boolean {
-  return (
-    error !== null &&
-    typeof error === "object" &&
-    "code" in error &&
-    ((error as { code?: unknown }).code === "ENOENT" ||
-      (error as { code?: unknown }).code === "ENOTDIR")
-  );
-}
-
-/** Nearest existing directory for git -C, walking up through missing path suffixes. */
-async function existingDirectoryFor(path: string): Promise<string | undefined> {
-  let candidate = resolve(path);
-  for (;;) {
-    try {
-      if ((await stat(candidate)).isDirectory()) return candidate;
-    } catch (error) {
-      if (!isMissingPathError(error)) return undefined;
-    }
-    const parent = dirname(candidate);
-    if (parent === candidate) return undefined;
-    candidate = parent;
-  }
-}
-
-/**
- * Resolve a path to its git worktree toplevel and shared common dir. Sibling
- * worktrees of the same repository share commonDir after realpath.
- */
-async function resolveGitCheckout(path: string): Promise<GitCheckout | undefined> {
-  const dir = await existingDirectoryFor(path);
-  if (!dir) return undefined;
-
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", dir, "rev-parse", "--show-toplevel", "--git-common-dir"],
-      {
-        encoding: "utf8",
-        timeout: 2_000,
-        maxBuffer: 64 * 1024,
-      },
-    );
-    const lines = stdout
-      .trim()
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    if (lines.length < 2) return undefined;
-
-    const toplevelRaw = lines[0]!;
-    const commonRaw = lines[1]!;
-    const toplevel = isAbsolute(toplevelRaw) ? resolve(toplevelRaw) : resolve(dir, toplevelRaw);
-    const commonDir = isAbsolute(commonRaw) ? resolve(commonRaw) : resolve(toplevel, commonRaw);
-
-    const [canonicalToplevel, canonicalCommonDir] = await Promise.all([
-      realpath(toplevel).catch(() => toplevel),
-      realpath(commonDir).catch(() => commonDir),
-    ]);
-    return { toplevel: canonicalToplevel, commonDir: canonicalCommonDir };
-  } catch {
-    return undefined;
-  }
-}
-
-function repoRelativeOrUndefined(root: string, target: string): string | undefined {
-  const repoRelative = relative(root, target);
-  if (isParentRelative(repoRelative) || isAbsolute(repoRelative)) return undefined;
-  return repoRelative || ".";
-}
-
 async function toHunkRepoRelativePath(
   filePath: string,
   piCwd: string,
@@ -385,24 +308,13 @@ async function toHunkRepoRelativePath(
     canonicalizePotentialPath(session.repoRoot ?? session.cwd),
     canonicalizePotentialPath(lexicalTarget),
   ]);
-  const direct = repoRelativeOrUndefined(repositoryRoot, target);
-  if (direct !== undefined) return direct;
-
-  // Linked git worktrees share one common dir but have distinct tops. Map the
-  // target through its own worktree root so Hunk still receives a repo-relative
-  // --file path without allowing arbitrary outside-repo navigation.
-  const [sessionCheckout, targetCheckout] = await Promise.all([
-    resolveGitCheckout(repositoryRoot),
-    resolveGitCheckout(target),
-  ]);
-  if (sessionCheckout && targetCheckout && sessionCheckout.commonDir === targetCheckout.commonDir) {
-    const worktreeRelative = repoRelativeOrUndefined(targetCheckout.toplevel, target);
-    if (worktreeRelative !== undefined) return worktreeRelative;
+  const repoRelative = relative(repositoryRoot, target);
+  if (isParentRelative(repoRelative) || isAbsolute(repoRelative)) {
+    throw new Error(
+      `Cannot navigate Hunk session ${session.sessionId}: target ${target} is outside selected repository ${repositoryRoot}.`,
+    );
   }
-
-  throw new Error(
-    `Cannot navigate Hunk session ${session.sessionId}: target ${target} is outside selected repository ${repositoryRoot}.`,
-  );
+  return repoRelative || ".";
 }
 
 /** Steer the live review to a file. The hunk index is clamped to one or more. */
