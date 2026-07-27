@@ -2,7 +2,10 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { spawnOverlayPty } from "../extensions/overlay/pty.ts";
+import {
+  __captureOwnedPosixProcessGroupFromProbe,
+  spawnOverlayPty,
+} from "../extensions/overlay/pty.ts";
 
 function fakeBackend(overrides: Record<string, unknown> = {}) {
   const pty = {
@@ -54,6 +57,69 @@ const options = {
 };
 
 describe("zigpty overlay adapter", () => {
+  describe("native process-group ownership capture", () => {
+    const pid = 4321;
+    const parentProcessId = 1234;
+    const inheritedGroup = 999;
+
+    it("retries an owned child from its inherited group to its leader group", () => {
+      const observations = [
+        { parentProcessId, processGroupId: inheritedGroup },
+        { parentProcessId, processGroupId: pid },
+      ];
+      const probe = vi.fn(() => observations.shift());
+      const pause = vi.fn();
+
+      expect(__captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause)).toBe(
+        pid,
+      );
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(pause).toHaveBeenCalledOnce();
+      expect(pause).toHaveBeenCalledWith(2);
+    });
+
+    it("bounds retries while the owned child remains in its inherited group", () => {
+      const probe = vi.fn(() => ({ parentProcessId, processGroupId: inheritedGroup }));
+      const pause = vi.fn();
+
+      expect(
+        __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause),
+      ).toBeUndefined();
+      expect(probe).toHaveBeenCalledTimes(3);
+      expect(pause).toHaveBeenCalledTimes(2);
+      expect(pause).toHaveBeenNthCalledWith(1, 2);
+      expect(pause).toHaveBeenNthCalledWith(2, 2);
+    });
+
+    it("stops without authorization when the owned child disappears during retry", () => {
+      const observations = [{ parentProcessId, processGroupId: inheritedGroup }, undefined];
+      const probe = vi.fn(() => observations.shift());
+      const pause = vi.fn();
+
+      expect(
+        __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause),
+      ).toBeUndefined();
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(pause).toHaveBeenCalledOnce();
+    });
+
+    it("stops without authorization when the observed pid is no longer owned", () => {
+      const observations = [
+        { parentProcessId, processGroupId: inheritedGroup },
+        { parentProcessId: parentProcessId + 1, processGroupId: pid },
+        { parentProcessId, processGroupId: pid },
+      ];
+      const probe = vi.fn(() => observations.shift());
+      const pause = vi.fn();
+
+      expect(
+        __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause),
+      ).toBeUndefined();
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(pause).toHaveBeenCalledOnce();
+    });
+  });
+
   it("fails actionably before spawn when native bindings are unavailable", () => {
     const { backend } = fakeBackend({ hasNative: false });
     expect(() => spawnOverlayPty(options, backend)).toThrow(

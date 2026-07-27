@@ -51,6 +51,14 @@ interface ZigPtyBackend {
 
 const backend: ZigPtyBackend = { hasNative, spawn };
 const DEFAULT_SHUTDOWN_GRACE_MS = 500;
+const PROCESS_GROUP_CAPTURE_ATTEMPTS = 3;
+const PROCESS_GROUP_CAPTURE_RETRY_MS = 2;
+const PROCESS_GROUP_PROBE_TIMEOUT_MS = 50;
+
+interface PosixProcessObservation {
+  parentProcessId: number;
+  processGroupId: number;
+}
 
 function startupFailure(message: string): Error {
   return new Error(`Hunk startup failed: ${message}`);
@@ -190,12 +198,70 @@ function preflightOverlaySpawn(options: SpawnPtyOptions): void {
   throw startupFailure(`command ${JSON.stringify(command)} was not found on child PATH.`);
 }
 
+function observePosixProcess(pid: number): PosixProcessObservation | undefined {
+  try {
+    const result = spawnSync("ps", ["-o", "ppid=,pgid=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: PROCESS_GROUP_PROBE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (result.status !== 0) return undefined;
+    const fields = result.stdout.trim().split(/\s+/);
+    if (fields.length !== 2) return undefined;
+    const parentProcessId = Number(fields[0]);
+    const processGroupId = Number(fields[1]);
+    if (
+      !Number.isInteger(parentProcessId) ||
+      parentProcessId <= 0 ||
+      !Number.isInteger(processGroupId) ||
+      processGroupId <= 0
+    ) {
+      return undefined;
+    }
+    return { parentProcessId, processGroupId };
+  } catch {
+    return undefined;
+  }
+}
+
+function pauseForProcessGroupRetry(durationMs: number): void {
+  try {
+    const waiter = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+    Atomics.wait(waiter, 0, 0, durationMs);
+  } catch {
+    // If synchronous waiting is unavailable, retry immediately rather than
+    // turning optional group capture into a post-spawn initialization failure.
+  }
+}
+
+/** @internal Exported only for deterministic ownership-probe regression tests. */
+export function __captureOwnedPosixProcessGroupFromProbe(
+  pid: number,
+  expectedParentProcessId: number,
+  probe: () => PosixProcessObservation | undefined,
+  pause: (durationMs: number) => void,
+): number | undefined {
+  for (let attempt = 0; attempt < PROCESS_GROUP_CAPTURE_ATTEMPTS; attempt += 1) {
+    const observation = probe();
+    // A missing child or changed parent may mean the pid exited and was reused.
+    // Never continue probing, let alone authorize negative-pid signalling.
+    if (!observation || observation.parentProcessId !== expectedParentProcessId) return undefined;
+    if (observation.processGroupId === pid) return pid;
+
+    // The only retryable state is our still-owned forkpty child before it has
+    // made itself the terminal process-group leader.
+    if (attempt + 1 < PROCESS_GROUP_CAPTURE_ATTEMPTS) pause(PROCESS_GROUP_CAPTURE_RETRY_MS);
+  }
+  return undefined;
+}
+
 /**
  * zigpty's native Unix backend uses forkpty and exposes only the child pid. A
- * forkpty child is also the leader of its fresh terminal process group. Verify
- * that invariant once, while the spawned pid is known to be ours, before ever
- * using Node's negative-pid process-group signalling. Fake/unsupported
- * backends and platforms safely retain leader-only backend signalling.
+ * forkpty child becomes the leader of its fresh terminal process group, but
+ * the parent can briefly run before the child's setsid/login_tty setup. Probe
+ * that transition a few times while every observation still proves the child
+ * belongs to this Node process. Fake/unsupported backends and platforms safely
+ * retain leader-only backend signalling.
  */
 function captureOwnedPosixProcessGroup(pid: number | undefined): number | undefined {
   if (
@@ -207,19 +273,12 @@ function captureOwnedPosixProcessGroup(pid: number | undefined): number | undefi
     return undefined;
   }
 
-  try {
-    const result = spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], {
-      encoding: "utf8",
-      timeout: 1000,
-    });
-    if (result.status !== 0) return undefined;
-    const fields = result.stdout.trim().split(/\s+/);
-    if (fields.length !== 1) return undefined;
-    const processGroupId = Number(fields[0]);
-    return Number.isInteger(processGroupId) && processGroupId === pid ? processGroupId : undefined;
-  } catch {
-    return undefined;
-  }
+  return __captureOwnedPosixProcessGroupFromProbe(
+    pid,
+    process.pid,
+    () => observePosixProcess(pid),
+    pauseForProcessGroupRetry,
+  );
 }
 
 function signalOwnedPosixProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {
