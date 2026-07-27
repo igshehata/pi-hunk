@@ -5,13 +5,18 @@ import type { Component, Focusable, KeyId, TUI } from "@earendil-works/pi-tui";
 import { toPtyInput, translateMouseInput, type MouseViewport } from "./input.ts";
 import { type OverlayPty, type PtySubscription, spawnOverlayPty } from "./pty.ts";
 import { renderGhosttyHtml } from "./render-buffer.ts";
+import type { ExclusiveFrameController, HunkDirectFrame } from "./exclusive-frame.ts";
 
 // Hunk enables mouse reporting inside the child PTY. Mirror it to Pi's real
 // terminal while the overlay is focused/visible and forward the resulting SGR
 // mouse events back to Hunk.
 const ENABLE_MOUSE = "\x1b[?1003h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
-const SYNCHRONIZED_FRAME_START = "\x1b[?2026h";
+// DEC synchronized-output boundaries (OpenTUI/Hunk logical paints).
+const SYNCHRONIZED_FRAME_PREFIX = "\x1b[?2026";
+const SYNCHRONIZED_FRAME_ESCAPE = 0x1b;
+const SYNCHRONIZED_FRAME_START_FINAL = "h".charCodeAt(0);
+const SYNCHRONIZED_FRAME_END_FINAL = "l".charCodeAt(0);
 const STARTUP_FRAME_FALLBACK_MS = 1000;
 const DEFAULT_STARTUP_FRAME_DEADLINE_MS = 12_000;
 const STARTUP_TIMEOUT_EXIT_CODE = 124;
@@ -122,6 +127,8 @@ export interface EmbeddedOptions {
   showKey?: KeyId;
   /** Called for prefix + showKey while the component is visible. */
   onShowRequest?: () => void;
+  /** Default-off direct-region rendering lease for focused split panes. */
+  exclusiveFrame?: ExclusiveFrameController;
 }
 
 export class EmbeddedHunk implements Component, Focusable {
@@ -138,6 +145,7 @@ export class EmbeddedHunk implements Component, Focusable {
   private readonly onToggleRequest?: () => void;
   private readonly showKey?: KeyId;
   private readonly onShowRequest?: () => void;
+  private readonly exclusiveFrame?: ExclusiveFrameController;
   private readonly startupFrameDeadlineMs: number;
   private prefixPending = false;
   private columns: number;
@@ -146,7 +154,10 @@ export class EmbeddedHunk implements Component, Focusable {
   private startupState: StartupState = "waiting";
   private presentationState: PresentationState = "visible-unfocused";
   private ptyState: PtyState = "running";
-  private startupProbeTail = "";
+  /** Prefix-match carry across PTY chunk splits for DEC 2026 markers. */
+  private synchronizedFrameMarkerLength = 0;
+  /** True between matching 2026h and 2026l; previous complete frame stays published. */
+  private synchronizedFrameOpen = false;
   private startupTimer: ReturnType<typeof setTimeout> | undefined;
   private startupDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private mouseState: "enabled" | "disabled" = "disabled";
@@ -172,6 +183,8 @@ export class EmbeddedHunk implements Component, Focusable {
     if (next === this.presentationState) return;
     this.presentationState = next;
     if (!value) this.prefixPending = false;
+    // Revoke direct terminal ownership before focus-driven cursor/mouse writes.
+    this.exclusiveFrame?.setFocused(value);
     this.updateMouseMode();
   }
 
@@ -217,6 +230,7 @@ export class EmbeddedHunk implements Component, Focusable {
     this.onToggleRequest = options.onToggleRequest;
     this.showKey = options.showKey;
     this.onShowRequest = options.onShowRequest;
+    this.exclusiveFrame = options.exclusiveFrame;
     this.startupFrameDeadlineMs = Math.max(
       0,
       options.startupFrameDeadlineMs ?? DEFAULT_STARTUP_FRAME_DEADLINE_MS,
@@ -258,16 +272,20 @@ export class EmbeddedHunk implements Component, Focusable {
     this.subscriptions.push(
       this.pty.onData((data) => {
         if (!this.isRunning() || gen !== this.generation) return;
+        const synchronizedFrame = this.observeSynchronizedFrameOutput(data);
         // Avoid exposing OpenTUI's capability-probe prelude between the startup
-        // placeholder and its first synchronized frame. Hunk/OpenTUI emits a
-        // synchronized-update begin marker when the actual UI paint starts.
-        if (this.startupState !== "ready") this.observeStartupOutput(data);
+        // placeholder and its first complete synchronized frame.
+        if (this.startupState !== "ready") this.observeStartupOutput(synchronizedFrame);
         // libghostty parses synchronously. Keep the native terminal current while
-        // hidden, but do not repaint Pi until the overlay is shown again.
+        // hidden, but do not repaint until the overlay is shown again. While a
+        // DEC 2026 frame is open, retain the previously published snapshot: a real
+        // terminal would also keep displaying the previous complete frame.
         this.terminal.feed(data);
         this.contentGeneration += 1;
-        this.renderedLines = undefined;
-        if (this.isVisibleState() && this.startupState === "ready") this.scheduleRender();
+        if (!this.synchronizedFrameOpen) this.renderedLines = undefined;
+        if (this.isVisibleState() && this.startupState === "ready" && !this.synchronizedFrameOpen) {
+          this.requestFrame();
+        }
       }),
       this.pty.onExit((event) => {
         if (!this.isRunning() || gen !== this.generation) return;
@@ -290,6 +308,8 @@ export class EmbeddedHunk implements Component, Focusable {
     if (next === this.presentationState) return;
     this.presentationState = next;
     if (!visible) this.prefixPending = false;
+    // Revoke direct terminal ownership before visibility-driven terminal writes.
+    this.exclusiveFrame?.setVisible(visible);
     this.updateMouseMode();
     // A queued microtask checks visibility before painting. Showing remains an
     // immediate correctness boundary and flushes all output parsed while hidden.
@@ -304,12 +324,14 @@ export class EmbeddedHunk implements Component, Focusable {
     if (!this.isVisibleState() || !this.isRunning()) return;
     if (!isKeyRelease(data) && this.prefixKey && matchesKey(data, this.prefixKey)) {
       this.prefixPending = true;
+      this.exclusiveFrame?.armPostInputRenderSuppression();
       return;
     }
     if (!isKeyRelease(data) && this.prefixPending) {
       this.prefixPending = false;
       if (this.toggleKey && matchesKey(data, this.toggleKey)) this.onToggleRequest?.();
       else if (this.showKey && matchesKey(data, this.showKey)) this.onShowRequest?.();
+      else this.exclusiveFrame?.armPostInputRenderSuppression();
       // Unknown suffixes cancel the Pi-hunk chord and are not sent to Hunk.
       return;
     }
@@ -324,6 +346,7 @@ export class EmbeddedHunk implements Component, Focusable {
       translated = translateMouseInput(translated, viewport);
     }
     if (translated) this.pty.write(translated);
+    this.exclusiveFrame?.armPostInputRenderSuppression();
   }
 
   render(width: number): string[] {
@@ -332,9 +355,29 @@ export class EmbeddedHunk implements Component, Focusable {
     const cols = Math.max(1, width);
     const rows = Math.max(1, this.resolveRows?.(this.tui.terminal.rows) ?? this.rows);
     this.resize(cols, rows);
+    const lines = this.renderCurrentLines();
+    this.exclusiveFrame?.observeCompositedFrame(this.directFrame(lines));
+    return lines;
+  }
+
+  private renderCurrentLines(): string[] {
     if (this.startupState !== "ready") {
       const message = "Starting Hunk…";
-      return [message, ...Array.from({ length: Math.max(0, rows - 1) }, () => "")];
+      return [message, ...Array.from({ length: Math.max(0, this.rows - 1) }, () => "")];
+    }
+    // Pi may request a render after every focused input event. During an open
+    // synchronized child frame that must not expose libghostty's partial state
+    // (embed composite or exclusive direct paint both call this path).
+    if (this.synchronizedFrameOpen) {
+      if (
+        this.renderedLines &&
+        this.renderedColumns === this.columns &&
+        this.renderedRows === this.rows
+      ) {
+        return this.renderedLines;
+      }
+      const message = "Starting Hunk…";
+      return [message, ...Array.from({ length: Math.max(0, this.rows - 1) }, () => "")];
     }
     if (
       this.renderedLines &&
@@ -353,15 +396,26 @@ export class EmbeddedHunk implements Component, Focusable {
     return this.renderedLines;
   }
 
+  private directFrame(lines = this.renderCurrentLines()): HunkDirectFrame {
+    return {
+      ready: this.startupState === "ready",
+      columns: this.columns,
+      rows: this.rows,
+      lines,
+    };
+  }
+
   /** Update the target row budget from overlay maxHeight resolution. */
   setTargetRows(rows: number): void {
     const next = Math.max(1, rows);
     if (next === this.rows) return;
+    this.exclusiveFrame?.revoke("target-rows-changed");
     this.resize(this.columns, next);
   }
 
   invalidate(): void {
-    this.renderedLines = undefined;
+    this.exclusiveFrame?.revoke("component-invalidated");
+    if (!this.synchronizedFrameOpen) this.renderedLines = undefined;
     this.tui.requestRender();
   }
 
@@ -369,6 +423,7 @@ export class EmbeddedHunk implements Component, Focusable {
     if (this.isDisposed()) return;
     this.transitionLifecycle("dispose");
     this.transitionStartup("dispose");
+    this.exclusiveFrame?.revoke("component-disposed");
     this.generation += 1;
     this.clearStartupTimers();
     this.setMouseEnabled(false);
@@ -386,12 +441,59 @@ export class EmbeddedHunk implements Component, Focusable {
     this.terminal.dispose();
   }
 
-  private observeStartupOutput(data: string | Uint8Array): void {
-    const text = typeof data === "string" ? data : new TextDecoder().decode(data);
-    const probe = this.startupProbeTail + text;
-    this.startupProbeTail = probe.slice(-SYNCHRONIZED_FRAME_START.length);
-    if (probe.includes(SYNCHRONIZED_FRAME_START)) {
+  /**
+   * Track DEC synchronized-update boundaries without decoding/copying PTY chunks.
+   * The prefix matcher is carried across reads because zigpty may split either
+   * boundary at any byte. Capability query `ESC[?2026$p` never ends with h/l so
+   * it does not open or close a frame.
+   */
+  private observeSynchronizedFrameOutput(data: string | Uint8Array): {
+    started: boolean;
+    ended: boolean;
+  } {
+    let markerLength = this.synchronizedFrameMarkerLength;
+    let frameOpen = this.synchronizedFrameOpen;
+    let frameStarted = false;
+    let frameEnded = false;
+
+    for (let index = 0; index < data.length; index++) {
+      const byte = typeof data === "string" ? data.charCodeAt(index) : data[index]!;
+
+      if (markerLength < SYNCHRONIZED_FRAME_PREFIX.length) {
+        if (byte === SYNCHRONIZED_FRAME_PREFIX.charCodeAt(markerLength)) {
+          markerLength += 1;
+          continue;
+        }
+        markerLength = byte === SYNCHRONIZED_FRAME_ESCAPE ? 1 : 0;
+        continue;
+      }
+
+      if (byte === SYNCHRONIZED_FRAME_START_FINAL) {
+        frameOpen = true;
+        frameStarted = true;
+      } else if (byte === SYNCHRONIZED_FRAME_END_FINAL) {
+        if (frameOpen) frameEnded = true;
+        frameOpen = false;
+      }
+      markerLength = byte === SYNCHRONIZED_FRAME_ESCAPE ? 1 : 0;
+    }
+
+    this.synchronizedFrameMarkerLength = markerLength;
+    this.synchronizedFrameOpen = frameOpen;
+    return { started: frameStarted, ended: frameEnded };
+  }
+
+  private observeStartupOutput(frame: { started: boolean; ended: boolean }): void {
+    if (frame.ended) {
       this.markStartupReady();
+      return;
+    }
+    if (frame.started) {
+      // Capability negotiation may have armed the no-sync fallback first. Once
+      // Hunk starts a real synchronized frame, wait for its matching reset and
+      // restore the bounded startup deadline instead of exposing it mid-paint.
+      this.clearStartupTimer();
+      this.armStartupDeadline();
       return;
     }
 
@@ -411,7 +513,12 @@ export class EmbeddedHunk implements Component, Focusable {
   }
 
   private armStartupDeadline(): void {
-    if (this.startupFrameDeadlineMs <= 0 || this.startupState !== "waiting") return;
+    if (
+      this.startupFrameDeadlineMs <= 0 ||
+      (this.startupState !== "waiting" && this.startupState !== "fallback")
+    ) {
+      return;
+    }
     this.clearStartupDeadlineTimer();
     this.startupDeadlineTimer = setTimeout(() => {
       this.startupDeadlineTimer = undefined;
@@ -440,12 +547,16 @@ export class EmbeddedHunk implements Component, Focusable {
   private markStartupReady(): void {
     if (this.startupState !== "waiting" && this.startupState !== "fallback") return;
     this.transitionStartup("ready");
-    this.startupProbeTail = "";
     this.clearStartupTimers();
   }
 
   private failStartupFrameDeadline(): void {
-    if (!this.isRunning() || this.startupState !== "waiting") return;
+    if (
+      !this.isRunning() ||
+      (this.startupState !== "waiting" && this.startupState !== "fallback")
+    ) {
+      return;
+    }
     this.transitionStartup("fail");
     this.complete(
       {
@@ -460,6 +571,7 @@ export class EmbeddedHunk implements Component, Focusable {
   private complete(result: HunkExit, options: { disposePty?: boolean } = {}): void {
     if (!this.isRunning()) return;
     this.transitionLifecycle("complete");
+    this.exclusiveFrame?.revoke("child-completed");
     this.renderQueued = false;
     this.clearStartupTimers();
     this.setMouseEnabled(false);
@@ -492,12 +604,28 @@ export class EmbeddedHunk implements Component, Focusable {
    * timer. Pi already enforces its own ~16 ms render interval, so another 16 ms
    * timeout here only doubled scrolling latency.
    */
+  private requestFrame(): void {
+    // Never publish while a synchronized child frame is open (exclusive or Pi).
+    if (this.synchronizedFrameOpen) return;
+    if (this.exclusiveFrame?.requestDirectPaint(() => this.directFrame())) return;
+    this.scheduleRender();
+  }
+
   private scheduleRender(): void {
-    if (this.renderQueued || !this.isVisibleState() || !this.isRunning()) return;
+    if (
+      this.renderQueued ||
+      this.synchronizedFrameOpen ||
+      !this.isVisibleState() ||
+      !this.isRunning()
+    ) {
+      return;
+    }
     this.renderQueued = true;
     queueMicrotask(() => {
       this.renderQueued = false;
-      if (this.isVisibleState() && this.isRunning()) this.tui.requestRender();
+      if (!this.synchronizedFrameOpen && this.isVisibleState() && this.isRunning()) {
+        this.tui.requestRender();
+      }
     });
   }
 

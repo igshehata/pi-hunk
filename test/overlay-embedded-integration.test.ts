@@ -79,10 +79,11 @@ function integrationHarness() {
 }
 
 describe("critical surface + embedded Hunk integration", () => {
-  it("mounts the default wrapped right split and delivers overlay-local wheel/hover coordinates", async () => {
+  it("mounts a right exclusive split and delivers overlay-local wheel/hover coordinates", async () => {
     const harness = integrationHarness();
     const surface = new OverlaySurface((options) => new EmbeddedHunk(options));
     const config = cloneConfig(DEFAULT_CONFIG);
+    config.overlay = { layout: "right" };
 
     await surface.open(
       harness.ctx,
@@ -120,7 +121,9 @@ describe("critical surface + embedded Hunk integration", () => {
     const harness = integrationHarness();
     const surface = new OverlaySurface((options) => new EmbeddedHunk(options));
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "float", experimentalPiWrap: false };
+    config.overlay = {
+      layout: "float",
+    };
 
     await surface.open(
       harness.ctx,
@@ -152,7 +155,7 @@ describe("critical surface + embedded Hunk integration", () => {
     onData("\x1b[?2031h\x1b]10;?\x07\x1b]11;?\x07\x1b[?2026$p\x1b[6n");
     expect(harness.mounted!.render(100)[0]).toContain("Starting Hunk");
 
-    onData("\x1b[?2026h\x1b[1;1Hready");
+    onData("\x1b[?2026h\x1b[1;1Hready\x1b[?2026l");
     await Promise.resolve();
     expect(harness.mounted!.render(100).join("\n")).toContain("ready");
     await surface.close();

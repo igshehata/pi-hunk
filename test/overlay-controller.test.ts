@@ -1,9 +1,27 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
+
+const pty = vi.hoisted(() => ({
+  write: vi.fn(),
+  resize: vi.fn(),
+  dispose: vi.fn(),
+  onData: vi.fn(() => ({ dispose: vi.fn() })),
+  onExit: vi.fn(() => ({ dispose: vi.fn() })),
+  pid: 4242,
+}));
+
+vi.mock("../extensions/overlay/pty.ts", () => ({
+  spawnOverlayPty: vi.fn(() => pty),
+}));
+
 import { cloneConfig, DEFAULT_CONFIG } from "../extensions/config.ts";
 import type { EmbeddedOptions } from "../extensions/overlay/embedded.ts";
-import { OverlaySurface, type OverlayComponent } from "../extensions/overlay/surface.ts";
+import {
+  OverlaySurface,
+  type OverlayComponent,
+  type OverlayComponentFactory,
+} from "../extensions/overlay/surface.ts";
 import {
   resolveOverlayRows,
   type OpenRequest,
@@ -33,6 +51,14 @@ function request(args = ["diff", "--watch"]): OpenRequest {
   };
 }
 
+function componentConstructor(
+  factory: OverlayComponentFactory,
+): new (options: EmbeddedOptions) => OverlayComponent {
+  return function ComponentConstructor(options: EmbeddedOptions) {
+    return factory(options);
+  } as unknown as new (options: EmbeddedOptions) => OverlayComponent;
+}
+
 /**
  * Test harness that mirrors Pi 0.80.6 overlay semantics:
  * - done() calls global hideOverlay() of the TOPMOST overlay only
@@ -50,11 +76,27 @@ function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean }
   const pendingMounts: Array<() => void> = [];
   let nextId = 1;
   const tui = {
-    terminal: { columns: 100, rows: 40, write: vi.fn() },
+    terminal: {
+      columns: 100,
+      rows: 40,
+      write: vi.fn(),
+      moveBy: vi.fn(),
+      hideCursor: vi.fn(),
+      showCursor: vi.fn(),
+      clearLine: vi.fn(),
+      clearFromCursor: vi.fn(),
+      clearScreen: vi.fn(),
+    },
     previousWidth: 100,
+    previousHeight: 40,
+    overlayStack: [] as unknown[],
+    renderRequested: false,
+    stopped: false,
     render: vi.fn((width: number) => [`pi:${width}`]),
     invalidate: vi.fn(),
     requestRender: vi.fn(),
+    stop: vi.fn(),
+    addInputListener: vi.fn(() => () => undefined),
   };
 
   const hideTopmost = () => {
@@ -331,6 +373,68 @@ describe("OverlaySurface state machine", () => {
     }
   });
 
+  it("reselects the production host factory after layout changes", async () => {
+    const harness = createHarness();
+    const createEmbedded = vi.fn((options: EmbeddedOptions) => harness.createComponent(options));
+    const createTakeover = vi.fn((options: EmbeddedOptions) => harness.createComponent(options));
+    const loadEmbedded = vi.fn(async () => ({
+      EmbeddedHunk: componentConstructor(createEmbedded),
+    }));
+    const loadTakeover = vi.fn(async () => ({
+      TakeoverHunk: componentConstructor(createTakeover),
+    }));
+    const surface = new OverlaySurface(undefined, { loadEmbedded, loadTakeover });
+    const config = cloneConfig(DEFAULT_CONFIG);
+
+    config.overlay.layout = "float";
+    await surface.open(harness.ctx, request(), config);
+    await surface.close();
+    expect(createEmbedded).toHaveBeenCalledTimes(1);
+    expect(createTakeover).not.toHaveBeenCalled();
+
+    config.overlay.layout = "full";
+    await surface.open(harness.ctx, request(), config);
+    await surface.close();
+    expect(createEmbedded).toHaveBeenCalledTimes(1);
+    expect(createTakeover).toHaveBeenCalledTimes(1);
+
+    config.overlay.layout = "right";
+    await surface.open(harness.ctx, request(), config);
+    await surface.close();
+    expect(createEmbedded).toHaveBeenCalledTimes(2);
+    expect(createTakeover).toHaveBeenCalledTimes(1);
+    expect(loadEmbedded).toHaveBeenCalledOnce();
+    expect(loadTakeover).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces concurrent opens while the lazy host factory loads", async () => {
+    const harness = createHarness();
+    const createEmbedded = vi.fn((options: EmbeddedOptions) => harness.createComponent(options));
+    let finishLoad!: (module: {
+      EmbeddedHunk: new (options: EmbeddedOptions) => OverlayComponent;
+    }) => void;
+    const pendingLoad = new Promise<{
+      EmbeddedHunk: new (options: EmbeddedOptions) => OverlayComponent;
+    }>((resolve) => {
+      finishLoad = resolve;
+    });
+    const loadEmbedded = vi.fn(() => pendingLoad);
+    const surface = new OverlaySurface(undefined, { loadEmbedded });
+    const config = cloneConfig(DEFAULT_CONFIG);
+    config.overlay.layout = "float";
+
+    const first = surface.open(harness.ctx, request(), config);
+    const duplicate = surface.open(harness.ctx, request(), config);
+    expect(surface.getState()).toBe("closed");
+    finishLoad({ EmbeddedHunk: componentConstructor(createEmbedded) });
+
+    await Promise.all([first, duplicate]);
+    expect(surface.getState()).toBe("visible");
+    expect(harness.components).toHaveLength(1);
+    expect(createEmbedded).toHaveBeenCalledOnce();
+    await surface.close();
+  });
+
   it("resolves overlay-local mouse viewports for split and floating layouts", async () => {
     const harness = createHarness();
     const surface = new OverlaySurface(harness.createComponent);
@@ -361,7 +465,9 @@ describe("OverlaySurface state machine", () => {
     const harness = createHarness();
     const surface = new OverlaySurface(harness.createComponent);
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "right", experimentalPiWrap: true };
+    config.overlay = {
+      layout: "right",
+    };
 
     await surface.open(harness.ctx, request(), config);
     expect(harness.tui.render(100)).toEqual(["pi:50"]);
@@ -381,10 +487,14 @@ describe("OverlaySurface state machine", () => {
     const originalRender = harness.tui.render;
     const surface = new OverlaySurface(harness.createComponent);
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "right", experimentalPiWrap: true };
+    config.overlay = {
+      layout: "right",
+    };
 
+    // Capture before open: exclusive/wrap shims replace tui.requestRender after install.
+    const requestRender = harness.tui.requestRender;
     await surface.open(harness.ctx, request(), config);
-    harness.tui.requestRender.mockImplementation(() => {
+    requestRender.mockImplementation(() => {
       throw new Error("render scheduling failed");
     });
 
@@ -522,7 +632,9 @@ describe("OverlaySurface state machine", () => {
       throw new Error("pty spawn failed");
     });
     const config = cloneConfig(DEFAULT_CONFIG);
-    config.overlay = { layout: "right", experimentalPiWrap: true };
+    config.overlay = {
+      layout: "right",
+    };
 
     await expect(surface.open(harness.ctx, request(), config)).rejects.toThrow("pty spawn failed");
     expect(surface.getState()).toBe("closed");
@@ -720,8 +832,11 @@ describe("OverlaySurface state machine", () => {
       throw new Error("native binding unavailable");
     });
     const surface = new OverlaySurface(undefined, { loadEmbedded });
+    // float uses the embed host (not full takeover), so loadEmbedded is exercised.
+    const config = cloneConfig(DEFAULT_CONFIG);
+    config.overlay = { layout: "float" };
 
-    await expect(surface.open(harness.ctx, request(), cloneConfig(DEFAULT_CONFIG))).rejects.toThrow(
+    await expect(surface.open(harness.ctx, request(), config)).rejects.toThrow(
       "native binding unavailable",
     );
     expect(loadEmbedded).toHaveBeenCalledOnce();

@@ -6,24 +6,29 @@ import {
   isPrefixBinding,
   isHotkeyBinding,
   resolveHunkArgs,
+  resolveOverlayHostMode,
   resolveOverlayLayout,
   splitArgs,
 } from "../extensions/config.ts";
 
 describe("overlay config", () => {
-  it("ships a wrapped right-split overlay by default", () => {
+  it("ships a full-screen takeover overlay by default", () => {
     expect(DEFAULT_CONFIG).toEqual(
       expect.objectContaining({
         review: "after-run",
         followEdits: true,
         hunk: { command: "hunk", args: ["diff", "--watch"] },
-        overlay: { layout: "right", experimentalPiWrap: true },
+        overlay: {
+          layout: "full",
+        },
         bindings: { prefix: "ctrl+space", toggle: "h", show: "s" },
       }),
     );
+    expect(resolveOverlayHostMode(DEFAULT_CONFIG.overlay)).toBe("takeover");
     expect(DEFAULT_CONFIG).not.toHaveProperty("display");
     expect(DEFAULT_CONFIG).not.toHaveProperty("split");
     expect(DEFAULT_CONFIG).not.toHaveProperty("fallback");
+    expect(DEFAULT_CONFIG.overlay).not.toHaveProperty("experimentalPiWrap");
   });
 
   it("cannot reactivate removed display integrations", () => {
@@ -38,11 +43,13 @@ describe("overlay config", () => {
   it("layers sparse supported values", () => {
     const config = applyConfig(cloneConfig(DEFAULT_CONFIG), {
       review: "live",
-      overlay: { layout: "right", experimentalPiWrap: true },
+      overlay: { layout: "right" },
       bindings: { prefix: "ctrl+x", toggle: "t", show: "l" },
     });
     expect(config.review).toBe("live");
-    expect(config.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(config.overlay).toEqual({
+      layout: "right",
+    });
     expect(config.bindings).toEqual({ prefix: "ctrl+x", toggle: "t", show: "l" });
   });
 
@@ -66,10 +73,19 @@ describe("overlay config", () => {
     expect(config.bindings).toEqual(DEFAULT_CONFIG.bindings);
   });
 
-  it("does not reset an inherited layout when only the experiment flag is layered", () => {
-    const global = applyConfig(cloneConfig(DEFAULT_CONFIG), { overlay: { layout: "right" } });
+  it("ignores legacy experimentalPiWrap overlay keys", () => {
+    const global = applyConfig(cloneConfig(DEFAULT_CONFIG), { overlay: { layout: "left" } });
     const project = applyConfig(global, { overlay: { experimentalPiWrap: true } });
-    expect(project.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(project.overlay).toEqual({
+      layout: "left",
+    });
+  });
+
+  it("derives host mode from layout only", () => {
+    expect(resolveOverlayHostMode({ layout: "full" })).toBe("takeover");
+    expect(resolveOverlayHostMode({ layout: "right" })).toBe("exclusive");
+    expect(resolveOverlayHostMode({ layout: "left" })).toBe("exclusive");
+    expect(resolveOverlayHostMode({ layout: "float" })).toBe("embed");
   });
 
   it("resolves the four named layouts", () => {

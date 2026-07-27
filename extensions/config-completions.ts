@@ -69,7 +69,7 @@ export const RESERVED_SUBCOMMANDS = new Set([
 function subcommandValues(
   first: string,
   argumentIndex: number,
-  tokens: string[],
+  _tokens: string[],
 ): string[] | undefined {
   if (first === "review") {
     if (argumentIndex === 1) return ["off", "after-run", "live"];
@@ -77,8 +77,7 @@ function subcommandValues(
   }
   if (first === "config") {
     if (argumentIndex === 1) return ["restore", "full", "left", "right", "float"];
-    if (tokens[1] === "restore") return undefined;
-    return ["experimental-wrap", "no-wrap"];
+    return undefined;
   }
   return undefined;
 }

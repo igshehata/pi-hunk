@@ -18,8 +18,20 @@ export type OverlaySize = number | `${number}%`;
 /** Pi-owned presentation only. Hunk's own config remains authoritative. */
 export interface OverlayConfig {
   layout: OverlayLayout;
-  /** Experimental: re-render Pi beside left/right overlays at the remaining width. */
-  experimentalPiWrap: boolean;
+}
+
+/**
+ * Internal host selection — not user config. Derived from layout only.
+ * - full → same-tab takeover (Hunk owns the TTY)
+ * - left/right → exclusive region paint (Pi always wrapped into remaining columns)
+ * - float → classic embed composite
+ */
+export type OverlayHostMode = "embed" | "exclusive" | "takeover";
+
+export function resolveOverlayHostMode(overlay: Pick<OverlayConfig, "layout">): OverlayHostMode {
+  if (overlay.layout === "full") return "takeover";
+  if (overlay.layout === "left" || overlay.layout === "right") return "exclusive";
+  return "embed";
 }
 
 export interface ResolvedOverlayLayout {
@@ -43,8 +55,8 @@ export interface HunkConfig {
 }
 
 export const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
-  layout: "right",
-  experimentalPiWrap: true,
+  // full → takeover host (Hunk owns the TTY). left/right use exclusive+wrap.
+  layout: "full",
 };
 
 const OVERLAY_LAYOUTS: Record<OverlayLayout, ResolvedOverlayLayout> = {
@@ -176,9 +188,7 @@ function applyOverlayConfig(base: OverlayConfig, input: unknown): OverlayConfig 
   if (!isRecord(input)) return base;
   const next = { ...base };
   if (isOverlayLayout(input.layout)) next.layout = input.layout;
-  if (typeof input.experimentalPiWrap === "boolean") {
-    next.experimentalPiWrap = input.experimentalPiWrap;
-  }
+  // experimentalPiWrap and other legacy overlay keys are ignored as unknown.
   return next;
 }
 

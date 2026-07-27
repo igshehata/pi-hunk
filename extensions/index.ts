@@ -21,6 +21,7 @@ import {
   hunkArgumentCompletions,
   isReviewPolicy,
   resolveHunkArgs,
+  resolveOverlayHostMode,
   settledAutoOpenAction,
   shouldEarlyOpenOnMutation,
   type HunkConfig,
@@ -726,6 +727,7 @@ async function handleStatus(
 ): Promise<void> {
   const config = store.get();
   const info = coordinator.getActiveInfo();
+  const exclusiveStats = coordinator.getExclusiveFrameStats();
   const active = info
     ? `overlay:${info.state}${info.detail ? `(${info.detail})` : ""}` +
       ` launchCwd=${info.launchCwd}${info.repoRoot ? ` repoRoot=${info.repoRoot}` : ""}`
@@ -743,11 +745,17 @@ async function handleStatus(
   } catch (error) {
     openNotes = `unavailable(${error instanceof Error ? error.message : String(error)})`;
   }
+  const hostMode = resolveOverlayHostMode(config.overlay);
   ctx.ui.notify(
     `Hunk: review=${config.review}, layout=${config.overlay.layout}, ` +
-      `experimental-pi-wrap=${config.overlay.experimentalPiWrap ? "on" : "off"}, ` +
+      `host=${hostMode}, ` +
       `active=${active}, command=${config.hunk.command}\n` +
-      `open-notes=${openNotes}, last-auto-open=${describeSettledDecision(diagnostics.decision)}`,
+      `open-notes=${openNotes}, last-auto-open=${describeSettledDecision(diagnostics.decision)}` +
+      (exclusiveStats
+        ? `\nexclusive-frame: state=${exclusiveStats.state}, direct=${exclusiveStats.directFrames}, ` +
+          `rows=${exclusiveStats.directRows}, bytes=${exclusiveStats.directBytes}, ` +
+          `revocations=${exclusiveStats.revocations}, suppressed-input=${exclusiveStats.suppressedInputRenders}`
+        : ""),
     "info",
   );
 }

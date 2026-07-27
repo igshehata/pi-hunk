@@ -36,14 +36,16 @@ describe("config loading", () => {
       join(root, ".pi", "hunk.json"),
       JSON.stringify({
         followEdits: false,
-        overlay: { layout: "right", experimentalPiWrap: true },
+        overlay: { layout: "right" },
       }),
     );
 
     const config = await loadConfig(context(root));
     expect(config.review).toBe("live");
     expect(config.followEdits).toBe(false);
-    expect(config.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(config.overlay).toEqual({
+      layout: "right",
+    });
     expect(config.bindings.prefix).toBe("ctrl+x");
   });
 
@@ -112,17 +114,47 @@ describe("config loading", () => {
     await writeFile(
       globalPath,
       JSON.stringify({
-        overlay: { layout: "diagonal", experimentalPiWrap: "yes" },
+        overlay: {
+          layout: "diagonal",
+        },
       }),
     );
     const warnings: string[] = [];
 
     const config = await loadConfig(context(root), (warning) => warnings.push(warning));
 
-    expect(config.overlay).toEqual({ layout: "right", experimentalPiWrap: true });
+    expect(config.overlay).toEqual({
+      layout: "full",
+    });
+    expect(warnings).toEqual([expect.stringContaining("invalid overlay.layout")]);
+  });
+
+  it("ignores removed wrap/exclusive/takeover overlay keys as unknown", async () => {
+    const root = await temporaryDirectory("hunk-overlay-legacy-");
+    const globalPath = join(root, "global.json");
+    process.env.PI_HUNK_CONFIG = globalPath;
+    await writeFile(
+      globalPath,
+      JSON.stringify({
+        overlay: {
+          layout: "right",
+          experimentalPiWrap: true,
+          experimentalExclusiveFrame: true,
+          experimentalTakeover: true,
+        },
+      }),
+    );
+    const warnings: string[] = [];
+
+    const config = await loadConfig(context(root), (warning) => warnings.push(warning));
+
+    expect(config.overlay).toEqual({
+      layout: "right",
+    });
     expect(warnings).toEqual([
-      expect.stringContaining("invalid overlay.layout"),
-      expect.stringContaining("invalid overlay.experimentalPiWrap"),
+      expect.stringContaining(
+        "overlay.experimentalPiWrap, overlay.experimentalExclusiveFrame, overlay.experimentalTakeover",
+      ),
     ]);
   });
 

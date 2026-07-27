@@ -62,14 +62,11 @@ describe("hunkArgumentCompletions", () => {
     expect(values("config res")).toEqual(["config restore"]);
   });
 
-  it("offers only layout modifiers, with no persistence scopes", () => {
+  it("offers no second-token config modifiers", () => {
     expect(values("review live ")).toEqual([]);
     expect(values("config restore ")).toEqual([]);
-    expect(values("config right e")).toEqual(["config right experimental-wrap"]);
-    expect(values("config right ")).toEqual([
-      "config right experimental-wrap",
-      "config right no-wrap",
-    ]);
+    expect(values("config right e")).toEqual([]);
+    expect(values("config right ")).toEqual([]);
   });
 
   it("returns null for verbs and unknown first tokens on the second token", () => {
@@ -79,30 +76,25 @@ describe("hunkArgumentCompletions", () => {
 });
 
 describe("/hunk config parsing", () => {
-  it("parses direct project changes without a scope", () => {
-    expect(parseConfigCommand("right", false)).toEqual({
-      layout: "right",
-      experimentalPiWrap: false,
-    });
-    expect(parseConfigCommand("left experimental-wrap", false)).toEqual({
-      layout: "left",
-      experimentalPiWrap: true,
-    });
+  it("parses direct layout changes without a scope", () => {
+    expect(parseConfigCommand("right")).toEqual({ layout: "right" });
+    expect(parseConfigCommand("left")).toEqual({ layout: "left" });
+    expect(parseConfigCommand("float")).toEqual({ layout: "float" });
+    expect(parseConfigCommand("full")).toEqual({ layout: "full" });
   });
 
-  it("disables inherited wrapping for non-split layouts and rejects explicit wrap intent", () => {
-    expect(parseConfigCommand("float", true)).toEqual({
-      layout: "float",
-      experimentalPiWrap: false,
-    });
-    expect(parseConfigCommand("full experimental-wrap", false)).toBeUndefined();
-    expect(parseConfigCommand("float wrap", false)).toBeUndefined();
-  });
-
-  it("rejects unknown layouts, flags, and removed scopes", () => {
-    expect(parseConfigCommand("custom", false)).toBeUndefined();
-    expect(parseConfigCommand("right magic", false)).toBeUndefined();
-    expect(parseConfigCommand("right session", false)).toBeUndefined();
-    expect(parseConfigCommand("right persist", false)).toBeUndefined();
+  it("rejects wrap, exclusive, takeover, and other unknown flags", () => {
+    expect(parseConfigCommand("left experimental-wrap")).toBeUndefined();
+    expect(parseConfigCommand("right no-wrap")).toBeUndefined();
+    expect(parseConfigCommand("full experimental-wrap")).toBeUndefined();
+    expect(parseConfigCommand("float wrap")).toBeUndefined();
+    expect(parseConfigCommand("right experimental-exclusive")).toBeUndefined();
+    expect(parseConfigCommand("full experimental-takeover")).toBeUndefined();
+    expect(parseConfigCommand("right takeover")).toBeUndefined();
+    expect(parseConfigCommand("float exclusive")).toBeUndefined();
+    expect(parseConfigCommand("custom")).toBeUndefined();
+    expect(parseConfigCommand("right magic")).toBeUndefined();
+    expect(parseConfigCommand("right session")).toBeUndefined();
+    expect(parseConfigCommand("right persist")).toBeUndefined();
   });
 });

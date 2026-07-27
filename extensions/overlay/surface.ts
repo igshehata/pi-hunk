@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 // inside open() via loadEmbedded so a broken native build fails over instead of
 // crashing extension load for every user (see #14).
 import type { EmbeddedOptions, HunkExit } from "./embedded.ts";
-import { resolveOverlayLayout, type HunkConfig } from "../config.ts";
+import { resolveOverlayHostMode, resolveOverlayLayout, type HunkConfig } from "../config.ts";
 import {
   argsKey,
   resolveOverlayRows,
@@ -18,6 +18,11 @@ import {
   installExperimentalPiWrap,
   type ExperimentalPiWrapController,
 } from "./experimental-pi-wrap.ts";
+import {
+  installExclusiveFrame,
+  type ExclusiveFrameController,
+  type ExclusiveFrameStats,
+} from "./exclusive-frame.ts";
 
 /**
  * Native Pi overlay surface with a persistent PTY toggle.
@@ -54,6 +59,12 @@ export type OverlayTransitionScheduler = <T>(operation: () => Promise<T>) => Pro
 type EmbeddedModule = { EmbeddedHunk: new (options: EmbeddedOptions) => OverlayComponent };
 type EmbeddedLoader = () => Promise<EmbeddedModule>;
 
+/** Minimal shape of the lazily-loaded takeover module. */
+type TakeoverModule = {
+  TakeoverHunk: new (options: EmbeddedOptions) => OverlayComponent;
+};
+type TakeoverLoader = () => Promise<TakeoverModule>;
+
 /**
  * Cached dynamic import of the embedded PTY component. A rejected import (broken
  * native build) is not cached, so a later open() can retry; the rejection
@@ -73,11 +84,27 @@ function defaultLoadEmbedded(): Promise<EmbeddedModule> {
   return embeddedModulePromise;
 }
 
+let takeoverModulePromise: Promise<TakeoverModule> | null = null;
+function defaultLoadTakeover(): Promise<TakeoverModule> {
+  if (!takeoverModulePromise) {
+    takeoverModulePromise = import("./takeover.ts").then(
+      (mod) => mod as unknown as TakeoverModule,
+      (error) => {
+        takeoverModulePromise = null;
+        throw error;
+      },
+    );
+  }
+  return takeoverModulePromise;
+}
+
 export interface OverlaySurfaceOptions {
   /** Milliseconds to wait for the overlay handle before failing open(). */
   startTimeoutMs?: number;
   /** Injectable embedded-module loader (tests / alternate builds). */
   loadEmbedded?: EmbeddedLoader;
+  /** Injectable takeover-module loader (tests / alternate builds). */
+  loadTakeover?: TakeoverLoader;
   /** Notified after every surface state transition (see coordinator.onStateChange). */
   onStateChange?: () => void;
   /** Notified only for natural child PTY exits, before the surface closes. */
@@ -145,13 +172,13 @@ const ALLOWED_STATE_TRANSITIONS: Record<SurfaceState, readonly SurfaceState[]> =
 export class OverlaySurface {
   private state: SurfaceState = "closed";
   private generation = 0;
-  /**
-   * Component factory. When undefined (production default), it is resolved lazily
-   * on first open() from the dynamically-imported embedded module and cached here.
-   * Tests inject a fake factory directly.
-   */
-  private createComponent: OverlayComponentFactory | undefined;
+  /** Tests may inject one factory for every host mode; production caches each
+   * layout-derived host implementation separately so config changes reselect it. */
+  private readonly injectedCreateComponent: OverlayComponentFactory | undefined;
+  private embeddedCreateComponent: OverlayComponentFactory | undefined;
+  private takeoverCreateComponent: OverlayComponentFactory | undefined;
   private readonly loadEmbedded: EmbeddedLoader;
+  private readonly loadTakeover: TakeoverLoader;
   private readonly startTimeoutMs: number;
   private readonly startupFrameDeadlineMs: number | undefined;
   private stateListener: (() => void) | undefined;
@@ -166,6 +193,7 @@ export class OverlaySurface {
   private currentRepoRoot: string | undefined;
   private currentFileCount: number | undefined;
   private experimentalPiWrap: ExperimentalPiWrapController | undefined;
+  private exclusiveFrame: ExclusiveFrameController | undefined;
   private currentArgsKey: string | undefined;
   private startPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -174,8 +202,9 @@ export class OverlaySurface {
   private startTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(createComponent?: OverlayComponentFactory, options: OverlaySurfaceOptions = {}) {
-    this.createComponent = createComponent;
+    this.injectedCreateComponent = createComponent;
     this.loadEmbedded = options.loadEmbedded ?? defaultLoadEmbedded;
+    this.loadTakeover = options.loadTakeover ?? defaultLoadTakeover;
     this.startTimeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     this.startupFrameDeadlineMs = options.startupFrameDeadlineMs;
     this.stateListener = options.onStateChange;
@@ -299,6 +328,10 @@ export class OverlaySurface {
     };
   }
 
+  getExclusiveFrameStats(): ExclusiveFrameStats | null {
+    return this.exclusiveFrame?.getStats() ?? null;
+  }
+
   /** Adopt authoritative metadata from the Hunk session selected by managed PID. */
   adoptManagedSession(metadata: {
     sessionId: string;
@@ -340,18 +373,51 @@ export class OverlaySurface {
       await this.close();
     }
 
-    // Resolve the embedded factory BEFORE any state mutation. When a factory is
-    // already available (injected in tests, or cached from a prior open) this is
+    // Resolve the component factory BEFORE any state mutation. When a factory is
+    // already available (injected in tests, or cached for this host mode) this is
     // fully synchronous, so a caller observing state right after open() still
-    // sees "starting". Only the production lazy path awaits the dynamic import;
-    // a failed import rejects open() with state still "closed" so the
+    // sees "starting". Only the first production open for a host mode awaits its
+    // dynamic import; a failed import rejects with state still "closed" so the
     // coordinator's fallback chain engages cleanly (#14).
-    let createComponent = this.createComponent;
-    if (!createComponent) {
-      const mod = await this.loadEmbedded();
-      createComponent = (options) => new mod.EmbeddedHunk(options);
-      this.createComponent = createComponent;
+    //
+    // Host mode is derived from layout only — not user flags.
+    // full → takeover; left/right → exclusive (Pi wrap always on); float → embed.
+    // Injected factories (unit tests) always win so harnesses can mount fakes / EmbeddedHunk
+    // under a full layout without requiring a real takeover-capable TUI.
+    const hostMode = resolveOverlayHostMode(config.overlay);
+    const useTakeover = hostMode === "takeover";
+    let createComponent: OverlayComponentFactory;
+    if (this.injectedCreateComponent) {
+      createComponent = this.injectedCreateComponent;
+    } else if (useTakeover) {
+      if (!this.takeoverCreateComponent) {
+        const mod = await this.loadTakeover();
+        this.takeoverCreateComponent = (options) => new mod.TakeoverHunk(options);
+      }
+      createComponent = this.takeoverCreateComponent;
+    } else {
+      if (!this.embeddedCreateComponent) {
+        const mod = await this.loadEmbedded();
+        this.embeddedCreateComponent = (options) => new mod.EmbeddedHunk(options);
+      }
+      createComponent = this.embeddedCreateComponent;
     }
+
+    // A first-time lazy host import yields before startPromise is installed.
+    // Reconcile a concurrent opener that may have started while this call was
+    // awaiting the factory, just as the entry guard above does.
+    if (this.startPromise) {
+      await this.startPromise;
+      if (
+        this.isLive() &&
+        this.currentArgsKey === argsKey(request.command, request.args, resolve(request.cwd))
+      ) {
+        if (this.state === "hidden") await this.show();
+        return;
+      }
+      if (this.isLive()) await this.close();
+    }
+    if (this.state !== "closed") await this.close();
 
     this.transitionState("starting");
     const gen = ++this.generation;
@@ -393,7 +459,8 @@ export class OverlaySurface {
 
     try {
       const overlay = config.overlay;
-      const geometry = resolveOverlayLayout(overlay.layout);
+      // Takeover always owns the full terminal; ignore split/float geometry.
+      const geometry = resolveOverlayLayout(useTakeover ? "full" : overlay.layout);
       // Fire-and-forget: we deliberately do not use custom()'s promise as the
       // surface lifetime. After mount, done() is unsafe (global hideOverlay).
       void ctx.ui
@@ -408,16 +475,30 @@ export class OverlaySurface {
               };
             }
 
-            try {
-              this.experimentalPiWrap = installExperimentalPiWrap(
-                tui,
-                overlay.layout,
-                overlay.experimentalPiWrap,
-              );
-            } catch (error) {
+            // left/right always wrap Pi into the remaining columns; full/float never.
+            if (hostMode === "exclusive") {
+              try {
+                this.experimentalPiWrap = installExperimentalPiWrap(tui, overlay.layout);
+              } catch (error) {
+                this.experimentalPiWrap = undefined;
+                ctx.ui.notify?.(
+                  `Pi split wrap is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+                  "warning",
+                );
+              }
+            } else {
               this.experimentalPiWrap = undefined;
-              ctx.ui.notify(
-                `Experimental Pi word wrap is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            }
+            // Exclusive region paint is core for left/right when wrap installed.
+            // Incomplete TUI mocks (unit tests) fall back to classic embed without crashing open().
+            try {
+              const exclusiveEligible =
+                hostMode === "exclusive" && this.experimentalPiWrap !== undefined;
+              this.exclusiveFrame = installExclusiveFrame(tui, overlay.layout, exclusiveEligible);
+            } catch (error) {
+              this.exclusiveFrame = undefined;
+              ctx.ui.notify?.(
+                `Exclusive Hunk painting is unavailable: ${error instanceof Error ? error.message : String(error)}`,
                 "warning",
               );
             }
@@ -450,6 +531,7 @@ export class OverlaySurface {
                 return { column, row, width: overlayColumns, height: overlayRows };
               },
               startupFrameDeadlineMs: this.startupFrameDeadlineMs,
+              exclusiveFrame: this.exclusiveFrame,
               // The visible overlay owns keyboard focus, so Pi's shortcut
               // dispatch never sees the dedicated prefix. The component must
               // intercept prefix+h/s and hand control back here.
@@ -498,6 +580,7 @@ export class OverlaySurface {
               },
             });
             this.component = component;
+            this.exclusiveFrame?.setComponent(component);
             const pid = component.pid;
             this.currentPid =
               pid !== undefined && Number.isInteger(pid) && pid > 0 ? pid : undefined;
@@ -522,6 +605,9 @@ export class OverlaySurface {
                 return;
               }
               this.handle = handle;
+              this.exclusiveFrame?.setFocusProbe(
+                () => this.handle === handle && !handle.isHidden() && handle.isFocused(),
+              );
               this.component?.setVisible(true);
               // setHidden(false) auto-focuses when nonCapturing is false.
               if (handle.isHidden()) handle.setHidden(false);
@@ -563,6 +649,7 @@ export class OverlaySurface {
     }
     if (this.state !== "hidden" || !this.handle) return;
     this.experimentalPiWrap?.setVisible(true);
+    this.exclusiveFrame?.setVisible(true);
     this.handle.setHidden(false);
     this.component?.setVisible(true);
     this.transitionState("visible");
@@ -571,6 +658,7 @@ export class OverlaySurface {
 
   async hide(): Promise<void> {
     if (this.state !== "visible" || !this.handle) return;
+    this.exclusiveFrame?.setVisible(false);
     this.component?.setVisible(false);
     this.experimentalPiWrap?.setVisible(false);
     this.handle.setHidden(true);
@@ -618,6 +706,7 @@ export class OverlaySurface {
     const gen = this.generation;
     this.transitionState("closing");
     try {
+      this.exclusiveFrame?.setVisible(false);
       this.component?.setVisible(false);
     } catch {
       // ignore
@@ -800,6 +889,13 @@ export class OverlaySurface {
     this.currentSessionId = undefined;
     this.currentRepoRoot = undefined;
     this.currentFileCount = undefined;
+    const exclusiveFrame = this.exclusiveFrame;
+    this.exclusiveFrame = undefined;
+    try {
+      exclusiveFrame?.dispose();
+    } catch {
+      // Direct-render restoration is best-effort and must not strand close waiters.
+    }
     const experimentalPiWrap = this.experimentalPiWrap;
     this.experimentalPiWrap = undefined;
     try {
