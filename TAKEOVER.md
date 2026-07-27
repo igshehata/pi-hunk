@@ -1,9 +1,9 @@
-# experiment: same-tab takeover
+# same-tab takeover
 
-Branch: experiment/same-tab-takeover
-Worktree: pi-hunk.experiment-same-tab-takeover
+Takeover is the host mode for `overlay.layout: "full"`. It is derived by
+`resolveOverlayHostMode` — not a separate config flag.
 
-Enable: overlay.experimentalTakeover=true or `/hunk config full experimental-takeover`
-Disable: `/hunk config right no-takeover`
+Enable: `/hunk config full`  
+Disable: `/hunk config right` (or left/float)
 
 Behavior: Hunk PTY bytes write to real TTY; Pi requestRender no-op while active; leave restores alt screen + force Pi redraw.

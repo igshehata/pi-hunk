@@ -21,6 +21,7 @@ import {
   hunkArgumentCompletions,
   isReviewPolicy,
   resolveHunkArgs,
+  resolveOverlayHostMode,
   settledAutoOpenAction,
   shouldEarlyOpenOnMutation,
   type HunkConfig,
@@ -744,11 +745,11 @@ async function handleStatus(
   } catch (error) {
     openNotes = `unavailable(${error instanceof Error ? error.message : String(error)})`;
   }
+  const hostMode = resolveOverlayHostMode(config.overlay);
   ctx.ui.notify(
     `Hunk: review=${config.review}, layout=${config.overlay.layout}, ` +
+      `host=${hostMode}, ` +
       `experimental-pi-wrap=${config.overlay.experimentalPiWrap ? "on" : "off"}, ` +
-      `experimental-exclusive-frame=${config.overlay.experimentalExclusiveFrame ? "on" : "off"}, ` +
-      `experimental-takeover=${config.overlay.experimentalTakeover ? "on" : "off"}, ` +
       `active=${active}, command=${config.hunk.command}\n` +
       `open-notes=${openNotes}, last-auto-open=${describeSettledDecision(diagnostics.decision)}` +
       (exclusiveStats

@@ -6,6 +6,7 @@ import {
   isPrefixBinding,
   isHotkeyBinding,
   resolveHunkArgs,
+  resolveOverlayHostMode,
   resolveOverlayLayout,
   splitArgs,
 } from "../extensions/config.ts";
@@ -20,8 +21,6 @@ describe("overlay config", () => {
         overlay: {
           layout: "right",
           experimentalPiWrap: true,
-          experimentalExclusiveFrame: false,
-          experimentalTakeover: false,
         },
         bindings: { prefix: "ctrl+space", toggle: "h", show: "s" },
       }),
@@ -50,8 +49,6 @@ describe("overlay config", () => {
     expect(config.overlay).toEqual({
       layout: "right",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     });
     expect(config.bindings).toEqual({ prefix: "ctrl+x", toggle: "t", show: "l" });
   });
@@ -82,38 +79,26 @@ describe("overlay config", () => {
     expect(project.overlay).toEqual({
       layout: "right",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     });
   });
 
-  it("enables exclusive painting only for a wrapped split", () => {
-    const enabled = applyConfig(cloneConfig(DEFAULT_CONFIG), {
-      overlay: { experimentalExclusiveFrame: true },
-    });
-    expect(enabled.overlay.experimentalExclusiveFrame).toBe(true);
-    expect(
-      applyConfig(enabled, { overlay: { experimentalPiWrap: false } }).overlay
-        .experimentalExclusiveFrame,
-    ).toBe(false);
-    expect(
-      applyConfig(enabled, { overlay: { layout: "float" } }).overlay.experimentalExclusiveFrame,
-    ).toBe(false);
+  it("derives host mode from layout and wrap", () => {
+    expect(resolveOverlayHostMode({ layout: "full", experimentalPiWrap: false })).toBe("takeover");
+    expect(resolveOverlayHostMode({ layout: "right", experimentalPiWrap: true })).toBe("exclusive");
+    expect(resolveOverlayHostMode({ layout: "left", experimentalPiWrap: true })).toBe("exclusive");
+    expect(resolveOverlayHostMode({ layout: "right", experimentalPiWrap: false })).toBe("embed");
+    expect(resolveOverlayHostMode({ layout: "float", experimentalPiWrap: false })).toBe("embed");
   });
 
-  it("enables experimentalTakeover only as full exclusive host", () => {
-    const on = applyConfig(cloneConfig(DEFAULT_CONFIG), {
-      overlay: { experimentalTakeover: true },
+  it("forces wrap off for full and float layouts", () => {
+    const full = applyConfig(cloneConfig(DEFAULT_CONFIG), {
+      overlay: { layout: "full", experimentalPiWrap: true },
     });
-    expect(on.overlay).toEqual({
-      layout: "full",
-      experimentalPiWrap: false,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: true,
+    expect(full.overlay).toEqual({ layout: "full", experimentalPiWrap: false });
+    const float = applyConfig(cloneConfig(DEFAULT_CONFIG), {
+      overlay: { layout: "float", experimentalPiWrap: true },
     });
-    const off = applyConfig(on, { overlay: { experimentalTakeover: false, layout: "right" } });
-    expect(off.overlay.experimentalTakeover).toBe(false);
-    expect(off.overlay.layout).toBe("right");
+    expect(float.overlay).toEqual({ layout: "float", experimentalPiWrap: false });
   });
 
   it("resolves the four named layouts", () => {

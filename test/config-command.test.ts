@@ -102,8 +102,6 @@ describe("interactive /hunk config", () => {
       overlay: {
         layout: "left",
         experimentalPiWrap: false,
-        experimentalExclusiveFrame: false,
-        experimentalTakeover: false,
       },
     });
     expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
@@ -112,7 +110,6 @@ describe("interactive /hunk config", () => {
       overlay: {
         layout: "left",
         experimentalPiWrap: false,
-        experimentalExclusiveFrame: false,
       },
     });
     expect(ctx.ui.select).not.toHaveBeenCalledWith("Save Hunk config", expect.anything());
@@ -256,33 +253,27 @@ describe("direct /hunk config", () => {
       overlay: {
         layout: "left",
         experimentalPiWrap: false,
-        experimentalExclusiveFrame: false,
       },
     });
     expect(store.get().overlay).toEqual({
       layout: "left",
       experimentalPiWrap: false,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     });
   });
 
-  it("enables exclusive painting and its wrapping prerequisite directly", async () => {
+  it("rejects exclusive and takeover tokens as invalid config flags", async () => {
     const { ctx, projectPath } = await testProject([]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
     await handleConfigCommand("right experimental-exclusive", ctx, store, inactiveCoordinator);
+    await handleConfigCommand("full experimental-takeover", ctx, store, inactiveCoordinator);
 
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
-      overlay: { experimentalExclusiveFrame: true },
-    });
-    expect(store.get().overlay).toEqual({
-      layout: "right",
-      experimentalPiWrap: true,
-      experimentalExclusiveFrame: true,
-      experimentalTakeover: false,
-    });
+    await expect(access(projectPath)).rejects.toThrow();
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Usage:"),
+      "warning",
+    );
   });
 
   it("rejects experimental wrapping for non-split layouts instead of discarding it", async () => {
@@ -293,7 +284,7 @@ describe("direct /hunk config", () => {
 
     await expect(access(projectPath)).rejects.toThrow();
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "Experimental Pi wrapping and exclusive painting only apply to left and right layouts.",
+      "Experimental Pi wrapping only applies to left and right layouts.",
       "warning",
     );
   });

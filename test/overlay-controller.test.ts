@@ -1,6 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
+
+const pty = vi.hoisted(() => ({
+  write: vi.fn(),
+  resize: vi.fn(),
+  dispose: vi.fn(),
+  onData: vi.fn(() => ({ dispose: vi.fn() })),
+  onExit: vi.fn(() => ({ dispose: vi.fn() })),
+  pid: 4242,
+}));
+
+vi.mock("../extensions/overlay/pty.ts", () => ({
+  spawnOverlayPty: vi.fn(() => pty),
+}));
+
 import { cloneConfig, DEFAULT_CONFIG } from "../extensions/config.ts";
 import type { EmbeddedOptions } from "../extensions/overlay/embedded.ts";
 import { OverlaySurface, type OverlayComponent } from "../extensions/overlay/surface.ts";
@@ -50,11 +64,27 @@ function createHarness(options: { autoHandle?: boolean; delayedMount?: boolean }
   const pendingMounts: Array<() => void> = [];
   let nextId = 1;
   const tui = {
-    terminal: { columns: 100, rows: 40, write: vi.fn() },
+    terminal: {
+      columns: 100,
+      rows: 40,
+      write: vi.fn(),
+      moveBy: vi.fn(),
+      hideCursor: vi.fn(),
+      showCursor: vi.fn(),
+      clearLine: vi.fn(),
+      clearFromCursor: vi.fn(),
+      clearScreen: vi.fn(),
+    },
     previousWidth: 100,
+    previousHeight: 40,
+    overlayStack: [] as unknown[],
+    renderRequested: false,
+    stopped: false,
     render: vi.fn((width: number) => [`pi:${width}`]),
     invalidate: vi.fn(),
     requestRender: vi.fn(),
+    stop: vi.fn(),
+    addInputListener: vi.fn(() => () => undefined),
   };
 
   const hideTopmost = () => {
@@ -364,8 +394,6 @@ describe("OverlaySurface state machine", () => {
     config.overlay = {
       layout: "right",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     };
 
     await surface.open(harness.ctx, request(), config);
@@ -389,12 +417,12 @@ describe("OverlaySurface state machine", () => {
     config.overlay = {
       layout: "right",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     };
 
+    // Capture before open: exclusive/wrap shims replace tui.requestRender after install.
+    const requestRender = harness.tui.requestRender;
     await surface.open(harness.ctx, request(), config);
-    harness.tui.requestRender.mockImplementation(() => {
+    requestRender.mockImplementation(() => {
       throw new Error("render scheduling failed");
     });
 
@@ -535,8 +563,6 @@ describe("OverlaySurface state machine", () => {
     config.overlay = {
       layout: "right",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     };
 
     await expect(surface.open(harness.ctx, request(), config)).rejects.toThrow("pty spawn failed");

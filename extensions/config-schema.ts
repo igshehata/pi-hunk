@@ -20,13 +20,27 @@ export interface OverlayConfig {
   layout: OverlayLayout;
   /** Experimental: re-render Pi beside left/right overlays at the remaining width. */
   experimentalPiWrap: boolean;
-  /** Experimental: freeze Pi and paint focused Hunk split frames directly. */
-  experimentalExclusiveFrame: boolean;
-  /**
-   * Experimental: same-tab takeover. Hunk owns the real TTY; Pi paint is suspended.
-   * No libghostty/HTML composite. Layout is forced full; Pi wrap is off.
-   */
-  experimentalTakeover: boolean;
+}
+
+/**
+ * Internal host selection — not user config. Derived from layout (+ wrap for exclusive).
+ * - full → same-tab takeover (Hunk owns the TTY)
+ * - left/right + wrap → exclusive region paint
+ * - float / unwrapped split → classic embed composite
+ */
+export type OverlayHostMode = "embed" | "exclusive" | "takeover";
+
+export function resolveOverlayHostMode(
+  overlay: Pick<OverlayConfig, "layout" | "experimentalPiWrap">,
+): OverlayHostMode {
+  if (overlay.layout === "full") return "takeover";
+  if (
+    overlay.experimentalPiWrap &&
+    (overlay.layout === "left" || overlay.layout === "right")
+  ) {
+    return "exclusive";
+  }
+  return "embed";
 }
 
 export interface ResolvedOverlayLayout {
@@ -52,8 +66,6 @@ export interface HunkConfig {
 export const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
   layout: "right",
   experimentalPiWrap: true,
-  experimentalExclusiveFrame: false,
-  experimentalTakeover: false,
 };
 
 const OVERLAY_LAYOUTS: Record<OverlayLayout, ResolvedOverlayLayout> = {
@@ -188,19 +200,9 @@ function applyOverlayConfig(base: OverlayConfig, input: unknown): OverlayConfig 
   if (typeof input.experimentalPiWrap === "boolean") {
     next.experimentalPiWrap = input.experimentalPiWrap;
   }
-  if (typeof input.experimentalExclusiveFrame === "boolean") {
-    next.experimentalExclusiveFrame = input.experimentalExclusiveFrame;
-  }
-  if (typeof input.experimentalTakeover === "boolean") {
-    next.experimentalTakeover = input.experimentalTakeover;
-  }
-  // Takeover is full-screen exclusive: wrap, exclusive-frame, and non-full layouts do not apply.
-  if (next.experimentalTakeover) {
-    next.layout = "full";
+  // full/float never use Pi wrap (same as config-command policy).
+  if (next.layout === "full" || next.layout === "float") {
     next.experimentalPiWrap = false;
-    next.experimentalExclusiveFrame = false;
-  } else if (!next.experimentalPiWrap || (next.layout !== "left" && next.layout !== "right")) {
-    next.experimentalExclusiveFrame = false;
   }
   return next;
 }

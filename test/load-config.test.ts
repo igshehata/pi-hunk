@@ -46,8 +46,6 @@ describe("config loading", () => {
     expect(config.overlay).toEqual({
       layout: "right",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     });
     expect(config.bindings.prefix).toBe("ctrl+x");
   });
@@ -120,7 +118,6 @@ describe("config loading", () => {
         overlay: {
           layout: "diagonal",
           experimentalPiWrap: "yes",
-          experimentalExclusiveFrame: "yes",
         },
       }),
     );
@@ -131,13 +128,38 @@ describe("config loading", () => {
     expect(config.overlay).toEqual({
       layout: "right",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     });
     expect(warnings).toEqual([
       expect.stringContaining("invalid overlay.layout"),
       expect.stringContaining("invalid overlay.experimentalPiWrap"),
-      expect.stringContaining("invalid overlay.experimentalExclusiveFrame"),
+    ]);
+  });
+
+  it("ignores removed exclusive/takeover overlay keys as unknown", async () => {
+    const root = await temporaryDirectory("hunk-overlay-legacy-");
+    const globalPath = join(root, "global.json");
+    process.env.PI_HUNK_CONFIG = globalPath;
+    await writeFile(
+      globalPath,
+      JSON.stringify({
+        overlay: {
+          layout: "right",
+          experimentalPiWrap: true,
+          experimentalExclusiveFrame: true,
+          experimentalTakeover: true,
+        },
+      }),
+    );
+    const warnings: string[] = [];
+
+    const config = await loadConfig(context(root), (warning) => warnings.push(warning));
+
+    expect(config.overlay).toEqual({
+      layout: "right",
+      experimentalPiWrap: true,
+    });
+    expect(warnings).toEqual([
+      expect.stringContaining("overlay.experimentalExclusiveFrame, overlay.experimentalTakeover"),
     ]);
   });
 

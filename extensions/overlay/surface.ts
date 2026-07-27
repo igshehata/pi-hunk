@@ -6,7 +6,11 @@ import { resolve } from "node:path";
 // inside open() via loadEmbedded so a broken native build fails over instead of
 // crashing extension load for every user (see #14).
 import type { EmbeddedOptions, HunkExit } from "./embedded.ts";
-import { resolveOverlayLayout, type HunkConfig } from "../config.ts";
+import {
+  resolveOverlayHostMode,
+  resolveOverlayLayout,
+  type HunkConfig,
+} from "../config.ts";
 import {
   argsKey,
   resolveOverlayRows,
@@ -376,9 +380,10 @@ export class OverlaySurface {
     // a failed import rejects open() with state still "closed" so the
     // coordinator's fallback chain engages cleanly (#14).
     //
-    // Takeover is a separate host path: never reuse a cached embed factory when
-    // experimentalTakeover is on (and vice versa for tests that inject factories).
-    const useTakeover = config.overlay.experimentalTakeover === true;
+    // Host mode is derived from layout (and wrap for exclusive) — not user flags.
+    // full → takeover; left/right+wrap → exclusive embed; else classic embed.
+    const hostMode = resolveOverlayHostMode(config.overlay);
+    const useTakeover = hostMode === "takeover";
     let createComponent: OverlayComponentFactory;
     if (useTakeover) {
       // Never reuse a cached embed factory for takeover (and do not cache takeover).
@@ -467,16 +472,11 @@ export class OverlaySurface {
             } else {
               this.experimentalPiWrap = undefined;
             }
+            // Exclusive region paint is core for left/right when wrap installed.
             try {
               const exclusiveEligible =
-                overlay.experimentalExclusiveFrame && this.experimentalPiWrap !== undefined;
+                hostMode === "exclusive" && this.experimentalPiWrap !== undefined;
               this.exclusiveFrame = installExclusiveFrame(tui, overlay.layout, exclusiveEligible);
-              if (overlay.experimentalExclusiveFrame && !exclusiveEligible) {
-                ctx.ui.notify(
-                  "Exclusive Hunk painting requires experimental Pi wrapping in a left or right split.",
-                  "warning",
-                );
-              }
             } catch (error) {
               this.exclusiveFrame = undefined;
               ctx.ui.notify(

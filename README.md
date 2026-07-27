@@ -181,9 +181,7 @@ A typical sparse project configuration:
   "review": "live",
   "overlay": {
     "layout": "right",
-    "experimentalPiWrap": true,
-    "experimentalExclusiveFrame": false,
-    "experimentalTakeover": false
+    "experimentalPiWrap": true
   },
   "bindings": {
     "prefix": "ctrl+space",
@@ -201,15 +199,15 @@ shipped defaults → ~/.pi/agent/hunk.json → trusted .pi/hunk.json → PI_HUNK
 
 By default, Hunk opens in the right half of the terminal and Pi wraps into the left half. Available
 layouts are `full`, `left`, `right`, and `float`; Pi wrapping can be toggled for left and right
-layouts. `overlay.experimentalTakeover: true` is an experiment that suspends Pi painting and lets
-Hunk own the real TTY (same tab, no libghostty composite). Toggle with
-`/hunk config full experimental-takeover` or `/hunk config right no-takeover`.
+layouts. Host mode is derived from layout (and wrap), not separate flags:
 
-The default-off exclusive-frame experiment freezes Pi after one composed split frame and paints only
-changed Hunk rows while Hunk remains focused. Enable it with
-`/hunk config right experimental-exclusive`; disable it with `/hunk config right no-exclusive`. Any
-foreign render, resize, focus loss, or ownership uncertainty falls back to a forced authoritative Pi
-redraw. `/hunk status` reports its lease and paint counters.
+- `full` → same-tab **takeover** (Hunk owns the TTY; Pi paint suspended)
+- `left`/`right` + wrap → **exclusive** region paint (direct Hunk rectangle writes while focused)
+- `float` or unwrapped split → classic **embed** composite
+
+Toggle with `/hunk config full`, `/hunk config right experimental-wrap`, or `/hunk config right no-wrap`.
+`/hunk status` reports `host=takeover|exclusive|embed` plus exclusive-frame lease counters when active.
+See [HOST_MODES.md](HOST_MODES.md) for paint paths.
 
 Pi-hunk does not own Hunk's theme, transparency, presentation, or keybindings. Configure those in
 Hunk's `~/.config/hunk/config.toml` or repository-local `.hunk/config.toml`.

@@ -15,7 +15,7 @@ vi.mock("../extensions/overlay/pty.ts", () => ({
 }));
 
 import { TakeoverHunk } from "../extensions/overlay/takeover.ts";
-import { applyConfig, cloneConfig, DEFAULT_CONFIG } from "../extensions/config.ts";
+import { resolveOverlayHostMode } from "../extensions/config.ts";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -100,16 +100,10 @@ describe("TakeoverHunk", () => {
   });
 });
 
-describe("experimentalTakeover config", () => {
-  it("forces full layout and disables wrap when enabled", () => {
-    const config = applyConfig(cloneConfig(DEFAULT_CONFIG), {
-      overlay: { layout: "right", experimentalPiWrap: true, experimentalTakeover: true },
-    });
-    expect(config.overlay).toEqual({
-      layout: "full",
-      experimentalPiWrap: false,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: true,
-    });
+describe("resolveOverlayHostMode", () => {
+  it("maps layout and wrap to takeover, exclusive, or embed", () => {
+    expect(resolveOverlayHostMode({ layout: "full", experimentalPiWrap: false })).toBe("takeover");
+    expect(resolveOverlayHostMode({ layout: "right", experimentalPiWrap: true })).toBe("exclusive");
+    expect(resolveOverlayHostMode({ layout: "float", experimentalPiWrap: false })).toBe("embed");
   });
 });

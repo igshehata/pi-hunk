@@ -65,18 +65,10 @@ describe("hunkArgumentCompletions", () => {
   it("offers only layout modifiers, with no persistence scopes", () => {
     expect(values("review live ")).toEqual([]);
     expect(values("config restore ")).toEqual([]);
-    expect(values("config right e")).toEqual([
-      "config right experimental-wrap",
-      "config right experimental-exclusive",
-      "config right experimental-takeover",
-    ]);
+    expect(values("config right e")).toEqual(["config right experimental-wrap"]);
     expect(values("config right ")).toEqual([
       "config right experimental-wrap",
       "config right no-wrap",
-      "config right experimental-exclusive",
-      "config right no-exclusive",
-      "config right experimental-takeover",
-      "config right no-takeover",
     ]);
   });
 
@@ -91,49 +83,32 @@ describe("/hunk config parsing", () => {
     expect(parseConfigCommand("right", false)).toEqual({
       layout: "right",
       experimentalPiWrap: false,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     });
     expect(parseConfigCommand("left experimental-wrap", false)).toEqual({
       layout: "left",
       experimentalPiWrap: true,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
     });
-    expect(parseConfigCommand("right experimental-exclusive", true)).toEqual({
+    expect(parseConfigCommand("right no-wrap", true)).toEqual({
       layout: "right",
-      experimentalPiWrap: true,
-      experimentalExclusiveFrame: true,
-      experimentalTakeover: false,
+      experimentalPiWrap: false,
     });
   });
 
   it("disables inherited wrapping for non-split layouts and rejects explicit wrap intent", () => {
-    expect(parseConfigCommand("float", true, true)).toEqual({
+    expect(parseConfigCommand("float", true)).toEqual({
       layout: "float",
       experimentalPiWrap: false,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: false,
-    });
-    expect(parseConfigCommand("full experimental-takeover", false)).toEqual({
-      layout: "full",
-      experimentalPiWrap: false,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: true,
-    });
-    expect(parseConfigCommand("right takeover", false)).toEqual({
-      layout: "full",
-      experimentalPiWrap: false,
-      experimentalExclusiveFrame: false,
-      experimentalTakeover: true,
     });
     expect(parseConfigCommand("full experimental-wrap", false)).toBeUndefined();
     expect(parseConfigCommand("float wrap", false)).toBeUndefined();
-    expect(parseConfigCommand("float exclusive", true)).toBeUndefined();
-    expect(parseConfigCommand("right no-wrap exclusive", true)).toBeUndefined();
   });
 
-  it("rejects unknown layouts, flags, and removed scopes", () => {
+  it("rejects exclusive/takeover tokens and other unknown flags", () => {
+    expect(parseConfigCommand("right experimental-exclusive", true)).toBeUndefined();
+    expect(parseConfigCommand("full experimental-takeover", false)).toBeUndefined();
+    expect(parseConfigCommand("right takeover", false)).toBeUndefined();
+    expect(parseConfigCommand("float exclusive", true)).toBeUndefined();
+    expect(parseConfigCommand("right no-wrap exclusive", true)).toBeUndefined();
     expect(parseConfigCommand("custom", false)).toBeUndefined();
     expect(parseConfigCommand("right magic", false)).toBeUndefined();
     expect(parseConfigCommand("right session", false)).toBeUndefined();
