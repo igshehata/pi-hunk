@@ -1,9 +1,21 @@
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { navigateHunkSession, runHunk } from "../extensions/hunk-session.ts";
 import { mutationTargetPath, toWorkspaceRelative } from "../extensions/change-detector.ts";
+
+const execFileAsync = promisify(execFile);
+
+async function git(cwd: string, args: string[]): Promise<void> {
+  await execFileAsync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 256 * 1024,
+  });
+}
 
 describe("mutationTargetPath", () => {
   it("reads common path keys from edit/write tools", () => {
@@ -283,6 +295,79 @@ describe("navigateHunkSession", () => {
           managedPid: 707,
           run,
         });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "maps sibling git worktree targets to worktree-relative Hunk paths",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "pi-hunk-follow-worktree-"));
+      const mainRepo = join(root, "main");
+      const featureRepo = join(root, "feature");
+      try {
+        await mkdir(mainRepo, { recursive: true });
+        await git(mainRepo, ["init"]);
+        await git(mainRepo, ["config", "user.email", "pi-hunk@example.com"]);
+        await git(mainRepo, ["config", "user.name", "pi-hunk"]);
+        await writeFile(join(mainRepo, "README.md"), "main\n");
+        await git(mainRepo, ["add", "README.md"]);
+        await git(mainRepo, ["commit", "-m", "init"]);
+        await git(mainRepo, ["worktree", "add", "-b", "feature", featureRepo]);
+        await mkdir(join(featureRepo, "extensions", "overlay"), { recursive: true });
+        await writeFile(join(featureRepo, "extensions", "overlay", "surface.ts"), "export {};\n");
+
+        const run = runner([session({ pid: 909, cwd: mainRepo, repoRoot: mainRepo })], (argv) =>
+          expect(argv[5]).toBe("extensions/overlay/surface.ts"),
+        );
+
+        await navigateHunkSession({
+          cwd: featureRepo,
+          filePath: join(featureRepo, "extensions", "overlay", "surface.ts"),
+          managedPid: 909,
+          run,
+        });
+        expect(run).toHaveBeenCalledTimes(2);
+      } finally {
+        await execFileAsync("git", ["-C", mainRepo, "worktree", "remove", "--force", featureRepo], {
+          encoding: "utf8",
+          timeout: 10_000,
+        }).catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "still rejects targets outside the selected repository and git worktree family",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "pi-hunk-follow-outside-"));
+      const mainRepo = join(root, "main");
+      const otherRepo = join(root, "other");
+      try {
+        for (const repo of [mainRepo, otherRepo]) {
+          await mkdir(repo, { recursive: true });
+          await git(repo, ["init"]);
+          await git(repo, ["config", "user.email", "pi-hunk@example.com"]);
+          await git(repo, ["config", "user.name", "pi-hunk"]);
+          await writeFile(join(repo, "README.md"), `${repo}\n`);
+          await git(repo, ["add", "README.md"]);
+          await git(repo, ["commit", "-m", "init"]);
+        }
+        await writeFile(join(otherRepo, "secret.ts"), "export {};\n");
+
+        const run = runner([session({ pid: 910, cwd: mainRepo, repoRoot: mainRepo })]);
+        await expect(
+          navigateHunkSession({
+            cwd: otherRepo,
+            filePath: join(otherRepo, "secret.ts"),
+            managedPid: 910,
+            run,
+          }),
+        ).rejects.toThrow(/outside selected repository/);
+        expect(run).toHaveBeenCalledTimes(1);
       } finally {
         await rm(root, { recursive: true, force: true });
       }
