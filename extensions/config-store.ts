@@ -6,12 +6,14 @@ import {
   mkdtemp,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
   rmdir,
   unlink,
 } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -84,7 +86,7 @@ async function readConfigLayer(path: string, onWarning?: ConfigWarning): Promise
 }
 
 async function syncDirectory(path: string): Promise<void> {
-  let directory: Awaited<ReturnType<typeof open>> | undefined;
+  let directory: FileHandle | undefined;
   try {
     directory = await open(path, constants.O_RDONLY);
     await directory.sync();
@@ -103,6 +105,7 @@ const CONFIG_LOCK_RETRY_MS = 20;
 const CONFIG_LOCK_TIMEOUT_MS = 5_000;
 const CONFIG_MALFORMED_LOCK_STALE_MS = 30_000;
 const CONFIG_LOCK_MAX_BYTES = 4_096;
+const CONFIG_LOCK_RECOVERY_INFIX = ".recovery-";
 
 type ReleaseConfigLock = () => Promise<void>;
 
@@ -161,7 +164,7 @@ function parseLegacyConfigLockPid(raw: string): number | undefined {
 }
 
 async function readConfigLockSnapshot(lockPath: string): Promise<ConfigLockSnapshot | undefined> {
-  let file: Awaited<ReturnType<typeof open>> | undefined;
+  let file: FileHandle | undefined;
   try {
     file = await open(
       lockPath,
@@ -209,7 +212,7 @@ function sameConfigLockFingerprint(
   );
 }
 
-/** Remove only the exact lock snapshot inspected by this contender. */
+/** Remove an owner-held lock after the protocol has excluded an entering successor. */
 async function removeConfigLockSnapshot(
   lockPath: string,
   expected: ConfigLockSnapshot,
@@ -244,24 +247,130 @@ async function configLockOwnerIsDead(pid: number): Promise<boolean> {
   }
 }
 
+async function configLockSnapshotIsStale(snapshot: ConfigLockSnapshot): Promise<boolean> {
+  const pid = snapshot.owner?.pid ?? snapshot.legacyPid;
+  if (pid !== undefined) return configLockOwnerIsDead(pid);
+  return Date.now() - snapshot.fingerprint.mtimeMs >= CONFIG_MALFORMED_LOCK_STALE_MS;
+}
+
+function configLockRecoveryPrefix(lockPath: string): string {
+  return `${basename(lockPath)}${CONFIG_LOCK_RECOVERY_INFIX}`;
+}
+
+async function configLockRecoveryPaths(lockPath: string): Promise<string[]> {
+  let entries: string[];
+  try {
+    entries = await readdir(dirname(lockPath));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const prefix = configLockRecoveryPrefix(lockPath);
+  return entries
+    .filter((entry) => entry.startsWith(prefix))
+    .map((entry) => join(dirname(lockPath), entry));
+}
+
+/**
+ * Every recovery contender owns a unique gate. Acquisition checks gates before
+ * and after O_EXCL, so no successor can enter while an inspected stale path is
+ * being unlinked. Orphan cleanup is safe because a UUID gate is never reused.
+ */
+async function configLockRecoveryIsActive(lockPath: string): Promise<boolean> {
+  for (const recoveryPath of await configLockRecoveryPaths(lockPath)) {
+    let snapshot: ConfigLockSnapshot | undefined;
+    try {
+      snapshot = await readConfigLockSnapshot(recoveryPath);
+    } catch {
+      return true;
+    }
+    if (!snapshot) continue;
+    if (!(await configLockSnapshotIsStale(snapshot))) return true;
+    try {
+      await unlink(recoveryPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+    }
+  }
+  return false;
+}
+
+async function withConfigLockRecoveryGate<T>(
+  lockPath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const recoveryPath = `${lockPath}${CONFIG_LOCK_RECOVERY_INFIX}${randomUUID()}`;
+  const owner: ConfigLockOwner = {
+    pid: process.pid,
+    token: randomUUID(),
+    createdAt: Date.now(),
+  };
+  let gate: FileHandle | undefined;
+  try {
+    gate = await open(
+      recoveryPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await gate.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+    await gate.sync();
+    await gate.close();
+    gate = undefined;
+  } catch (error) {
+    await gate?.close().catch(() => undefined);
+    await unlink(recoveryPath).catch(() => undefined);
+    throw error;
+  }
+
+  const release = async (): Promise<void> => {
+    try {
+      await unlink(recoveryPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  };
+
+  let result: T;
+  try {
+    result = await operation();
+  } catch (operationError) {
+    try {
+      await release();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [operationError, cleanupError],
+        `Could not recover or release Hunk config lock at ${lockPath}`,
+      );
+    }
+    throw operationError;
+  }
+  await release();
+  return result;
+}
+
 /** Recover only a dead owner or an old lock that never gained valid metadata. */
 async function recoverStaleConfigLock(lockPath: string): Promise<boolean> {
-  let snapshot: ConfigLockSnapshot | undefined;
+  let expected: ConfigLockSnapshot | undefined;
   try {
-    snapshot = await readConfigLockSnapshot(lockPath);
+    expected = await readConfigLockSnapshot(lockPath);
+    if (!expected || !(await configLockSnapshotIsStale(expected))) return expected === undefined;
   } catch {
     return false;
   }
-  if (!snapshot) return true;
 
-  const pid = snapshot.owner?.pid ?? snapshot.legacyPid;
-  if (pid !== undefined) {
-    if (!(await configLockOwnerIsDead(pid))) return false;
-    return removeConfigLockSnapshot(lockPath, snapshot, snapshot.owner?.token).catch(() => false);
-  }
-
-  if (Date.now() - snapshot.fingerprint.mtimeMs < CONFIG_MALFORMED_LOCK_STALE_MS) return false;
-  return removeConfigLockSnapshot(lockPath, snapshot).catch(() => false);
+  return withConfigLockRecoveryGate(lockPath, async () => {
+    const current = await readConfigLockSnapshot(lockPath);
+    if (!current) return true;
+    if (!sameConfigLockFingerprint(current.fingerprint, expected.fingerprint)) return false;
+    if (!(await configLockSnapshotIsStale(current))) return false;
+    try {
+      await unlink(lockPath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    }
+  }).catch(() => false);
 }
 
 /** Serialize read/merge/write across Pi processes so sparse global updates cannot be lost. */
@@ -271,7 +380,17 @@ async function acquireConfigLock(path: string): Promise<ReleaseConfigLock> {
   const deadline = Date.now() + CONFIG_LOCK_TIMEOUT_MS;
 
   while (true) {
-    let lock: Awaited<ReturnType<typeof open>> | undefined;
+    if (await configLockRecoveryIsActive(lockPath)) {
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out waiting to update Hunk config at ${path}. ` +
+            `If no Pi process is updating it, remove ${lockPath} and retry.`,
+        );
+      }
+      await delay(CONFIG_LOCK_RETRY_MS);
+      continue;
+    }
+    let lock: FileHandle | undefined;
     let openedSnapshot: ConfigLockSnapshot | undefined;
     const owner: ConfigLockOwner = {
       pid: process.pid,
@@ -295,6 +414,16 @@ async function acquireConfigLock(path: string): Promise<ReleaseConfigLock> {
       };
       await lock.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
       await lock.sync();
+      if (await configLockRecoveryIsActive(lockPath)) {
+        await lock.close();
+        lock = undefined;
+        const snapshot = await readConfigLockSnapshot(lockPath);
+        if (snapshot?.owner?.token === owner.token) {
+          await removeConfigLockSnapshot(lockPath, snapshot, owner.token);
+        }
+        await delay(CONFIG_LOCK_RETRY_MS);
+        continue;
+      }
 
       let released = false;
       return async () => {
@@ -352,7 +481,7 @@ async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   // this operation created, rather than a preplanted link or shared temp path.
   const temporaryDirectory = await mkdtemp(join(directory, `.${basename(path)}.tmp-`));
   const temporary = join(temporaryDirectory, "config");
-  let file: Awaited<ReturnType<typeof open>> | undefined;
+  let file: FileHandle | undefined;
   try {
     file = await open(
       temporary,

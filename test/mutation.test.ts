@@ -166,6 +166,49 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: "echo hello 2>& 10-" })).toBe(false);
   });
 
+  it("ignores shell syntax inside here-document bodies", () => {
+    expect(
+      isMutation("bash", {
+        command: "python <<'PY'\nprint(1 > 0)\nPY",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<EOF\n1 > 0\nEOF",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<'EOF'\n$(touch ignored.ts)\nEOF",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<EOF\n$(touch generated.ts)\nEOF",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "cat <<-EOF\n\t1 > 0\n\tEOF",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<A <<'B'\n1 > 0\nA\n$(touch ignored.ts)\nB",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<EOF\n1 > 0\nEOF\necho ok > output.txt",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "echo ok # <<EOF\necho ok > output.txt",
+      }),
+    ).toBe(true);
+  });
+
   it("distinguishes shell comparisons and arithmetic from file redirection", () => {
     expect(isMutation("bash", { command: '[[ "$left" > "$right" ]]' })).toBe(false);
     expect(
@@ -179,17 +222,21 @@ describe("isMutation", () => {
     );
     expect(isMutation("bash", { command: "echo $(( value > limit ))" })).toBe(false);
     expect(isMutation("bash", { command: 'echo "$(( value > limit ))"' })).toBe(false);
-    expect(isMutation("bash", { command: 'X=1 [[ "$left" > "$right" ]]' })).toBe(false);
     expect(
       isMutation("bash", {
-        command: '< /dev/null [[ "$left" > "$right" ]]',
+        command: "X=1 [[ x > assignment.out ]] || true",
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       isMutation("bash", {
-        command: '< "/dev/null" [[ "$left" > "$right" ]]',
+        command: "< /dev/null [[ x > leading.out ]] || true",
       }),
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: '< "/dev/null" [[ x > quoted-leading.out ]] || true',
+      }),
+    ).toBe(true);
     expect(
       isMutation("bash", {
         command: 'if ! [[ "$left" > "$right" ]]; then printf "ordered\\n"; fi',

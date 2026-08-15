@@ -29,10 +29,6 @@ const CONDITIONAL_COMMAND_PREFIX_WORDS = new Set([
   "(",
   "{",
 ]);
-const SHELL_REDIRECTION_OPERATOR =
-  /^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<&|<>|>>|>\||>&|<|>)$/;
-const SHELL_REDIRECTION_WITH_TARGET =
-  /^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<&|<>|>>|>\||>&|<|>)\S+$/;
 const GIT_MUTATING_SUBCOMMANDS = new Set(["apply", "checkout", "mv", "restore", "rm"]);
 const GIT_INFO_OPTIONS = new Set([
   "-v",
@@ -85,11 +81,15 @@ function shellCommandLooksMutating(command: string, depth = 0): boolean {
   if (depth > MAX_NESTED_SHELL_DEPTH || command.length > MAX_SHELL_COMMAND_LENGTH) {
     return true;
   }
-  const masked = maskQuotedShellText(command);
+  const hereDocuments = maskHereDocumentBodies(command);
+  const masked = maskQuotedShellText(hereDocuments.command);
   if (MUTATING_SHELL.test(masked) || hasFileOutputRedirection(masked)) return true;
-  if (commandSubstitutionsLookMutating(command, depth)) return true;
+  if (commandSubstitutionsLookMutating(hereDocuments.command, depth)) return true;
+  for (const body of hereDocuments.expandableBodies) {
+    if (commandSubstitutionsLookMutating(body, depth, false)) return true;
+  }
 
-  for (const segment of splitSimpleShellCommands(command)) {
+  for (const segment of splitSimpleShellCommands(hereDocuments.command)) {
     const extracted = extractNestedShellPayload(segment);
     if (extracted === "ambiguous" || extracted === "mutating") return true;
     if (typeof extracted === "string" && shellCommandLooksMutating(extracted, depth + 1)) {
@@ -198,8 +198,8 @@ interface PreviousShellWord {
 
 /**
  * `[[` is conditional grammar only where a command may begin. Walk backward
- * through reserved prefixes, assignments, and leading redirections; an
- * existing command word makes `[[` an ordinary argument.
+ * through reserved grammar prefixes; an assignment, leading redirection, or
+ * existing command word makes `[[` an ordinary command name or argument.
  */
 function isShellCommandPosition(maskedCommand: string, offset: number): boolean {
   let cursor = offset;
@@ -225,15 +225,7 @@ function isShellCommandPosition(maskedCommand: string, offset: number): boolean 
   const word = previousShellWord(maskedCommand, cursor);
   if (!word) return true;
 
-  const beforeWord = previousShellWord(maskedCommand, word.start);
-  if (beforeWord && SHELL_REDIRECTION_OPERATOR.test(beforeWord.value)) {
-    return isShellCommandPosition(maskedCommand, beforeWord.start);
-  }
-  if (isEnvironmentAssignment(word.value) || CONDITIONAL_COMMAND_PREFIX_WORDS.has(word.value)) {
-    return isShellCommandPosition(maskedCommand, word.start);
-  }
-  if (SHELL_REDIRECTION_OPERATOR.test(word.value)) return false;
-  if (isShellRedirectionWithTarget(word.value)) {
+  if (CONDITIONAL_COMMAND_PREFIX_WORDS.has(word.value)) {
     return isShellCommandPosition(maskedCommand, word.start);
   }
   return false;
@@ -268,13 +260,12 @@ function previousShellWord(maskedCommand: string, offset: number): PreviousShell
   return start === end ? undefined : { start, value: maskedCommand.slice(start, end) };
 }
 
-function isShellRedirectionWithTarget(word: string): boolean {
-  if (word.startsWith("<(") || word.startsWith(">(")) return false;
-  return SHELL_REDIRECTION_WITH_TARGET.test(word);
-}
-
 /** Inspect executable command/process substitutions while leaving quoted prose masked. */
-function commandSubstitutionsLookMutating(command: string, depth: number): boolean {
+function commandSubstitutionsLookMutating(
+  command: string,
+  depth: number,
+  quotesAreSyntax = true,
+): boolean {
   let quote: "'" | '"' | undefined;
   let escaping = false;
 
@@ -284,19 +275,19 @@ function commandSubstitutionsLookMutating(command: string, depth: number): boole
       escaping = false;
       continue;
     }
-    if (char === "\\" && quote !== "'") {
+    if (char === "\\" && (!quotesAreSyntax || quote !== "'")) {
       escaping = true;
       continue;
     }
-    if (char === "'" && quote !== '"') {
+    if (quotesAreSyntax && char === "'" && quote !== '"') {
       quote = quote === "'" ? undefined : "'";
       continue;
     }
-    if (char === '"' && quote !== "'") {
+    if (quotesAreSyntax && char === '"' && quote !== "'") {
       quote = quote === '"' ? undefined : '"';
       continue;
     }
-    if (quote === "'") continue;
+    if (quotesAreSyntax && quote === "'") continue;
 
     // Arithmetic expansion is not command substitution. Continue scanning its
     // contents so a real nested `$(...)` mutation is still inspected below.
@@ -364,6 +355,230 @@ function readParenthesizedShell(
     }
   }
   return "ambiguous";
+}
+
+interface HereDocumentDelimiter {
+  value: string;
+  quoted: boolean;
+  stripTabs: boolean;
+}
+
+interface HereDocumentMask {
+  command: string;
+  expandableBodies: string[];
+}
+
+interface TextRange {
+  start: number;
+  end: number;
+}
+
+/** Remove here-document data from shell syntax while retaining executable unquoted expansions. */
+function maskHereDocumentBodies(command: string): HereDocumentMask {
+  const syntax = maskQuotedShellText(command);
+  const pending: HereDocumentDelimiter[] = [];
+  const maskedRanges: TextRange[] = [];
+  const expandableBodies: string[] = [];
+  let inConditional = false;
+  let arithmeticDepth = 0;
+
+  for (let i = 0; i < syntax.length; i += 1) {
+    const char = syntax[i]!;
+
+    if (char === "\n" && pending.length > 0 && !isEscapedShellNewline(command, i)) {
+      let bodyStart = i + 1;
+      for (const hereDocument of pending.splice(0, pending.length)) {
+        const body = findHereDocumentBody(command, bodyStart, hereDocument);
+        if (!hereDocument.quoted) {
+          expandableBodies.push(command.slice(bodyStart, body.contentEnd));
+        }
+        maskedRanges.push({ start: bodyStart, end: body.rangeEnd });
+        bodyStart = body.rangeEnd;
+      }
+      i = bodyStart - 1;
+      continue;
+    }
+
+    if (char === "#" && isShellCommentStart(syntax, i)) {
+      const newline = syntax.indexOf("\n", i + 1);
+      if (newline < 0) break;
+      i = newline - 1;
+      continue;
+    }
+
+    if (inConditional) {
+      if (char === "]" && syntax[i + 1] === "]" && isShellTokenBoundary(syntax[i + 2])) {
+        inConditional = false;
+        i += 1;
+      }
+      continue;
+    }
+
+    if (arithmeticDepth > 0) {
+      if (char === "(") arithmeticDepth += 1;
+      else if (char === ")") arithmeticDepth -= 1;
+      continue;
+    }
+
+    if (
+      char === "[" &&
+      syntax[i + 1] === "[" &&
+      isShellTokenBoundary(syntax[i - 1]) &&
+      isShellTokenBoundary(syntax[i + 2]) &&
+      isShellCommandPosition(syntax, i)
+    ) {
+      inConditional = true;
+      i += 1;
+      continue;
+    }
+
+    if (char === "(" && syntax[i + 1] === "(") {
+      arithmeticDepth = 2;
+      i += 1;
+      continue;
+    }
+
+    if (char !== "<" || syntax[i + 1] !== "<" || syntax[i + 2] === "<") continue;
+
+    let delimiterStart = i + 2;
+    let stripTabs = false;
+    if (syntax[delimiterStart] === "-") {
+      stripTabs = true;
+      delimiterStart += 1;
+    }
+    while (syntax[delimiterStart] === " " || syntax[delimiterStart] === "\t") {
+      delimiterStart += 1;
+    }
+
+    const delimiter = readHereDocumentDelimiter(command, delimiterStart);
+    if (!delimiter) continue;
+    pending.push({ value: delimiter.value, quoted: delimiter.quoted, stripTabs });
+    maskedRanges.push({ start: delimiterStart, end: delimiter.end });
+    i = delimiter.end - 1;
+  }
+
+  return {
+    command: maskShellRanges(command, maskedRanges),
+    expandableBodies,
+  };
+}
+
+function readHereDocumentDelimiter(
+  command: string,
+  start: number,
+): { value: string; quoted: boolean; end: number } | undefined {
+  let cursor = start;
+  let value = "";
+  let quote: "'" | '"' | undefined;
+  let quoted = false;
+  let consumed = false;
+
+  while (cursor < command.length) {
+    const char = command[cursor]!;
+    if (quote === "'") {
+      consumed = true;
+      if (char === "'") quote = undefined;
+      else value += char;
+      cursor += 1;
+      continue;
+    }
+    if (quote === '"') {
+      consumed = true;
+      if (char === '"') {
+        quote = undefined;
+        cursor += 1;
+        continue;
+      }
+      if (char === "\\") {
+        const next = command[cursor + 1];
+        if (next !== undefined && '$`"\\\n'.includes(next)) {
+          quoted = true;
+          if (next !== "\n") value += next;
+          cursor += 2;
+          continue;
+        }
+      }
+      value += char;
+      cursor += 1;
+      continue;
+    }
+
+    if (/[\s;&|()<>]/.test(char)) break;
+    consumed = true;
+    if (char === "\\") {
+      quoted = true;
+      const next = command[cursor + 1];
+      if (next === undefined) return undefined;
+      if (next !== "\n") value += next;
+      cursor += 2;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quoted = true;
+      if (value.endsWith("$") && command[cursor - 1] === "$") {
+        value = value.slice(0, -1);
+      }
+      quote = char;
+      cursor += 1;
+      continue;
+    }
+    value += char;
+    cursor += 1;
+  }
+
+  if (!consumed || quote) return undefined;
+  return { value, quoted, end: cursor };
+}
+
+function findHereDocumentBody(
+  command: string,
+  start: number,
+  hereDocument: HereDocumentDelimiter,
+): { contentEnd: number; rangeEnd: number } {
+  let cursor = start;
+  while (cursor <= command.length) {
+    const newline = command.indexOf("\n", cursor);
+    const lineEnd = newline < 0 ? command.length : newline;
+    const contentEnd = command[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
+    let delimiterStart = cursor;
+    if (hereDocument.stripTabs) {
+      while (command[delimiterStart] === "\t") delimiterStart += 1;
+    }
+    if (command.slice(delimiterStart, contentEnd) === hereDocument.value) {
+      return {
+        contentEnd: cursor,
+        rangeEnd: newline < 0 ? lineEnd : lineEnd + 1,
+      };
+    }
+    if (newline < 0) break;
+    cursor = newline + 1;
+  }
+  return { contentEnd: command.length, rangeEnd: command.length };
+}
+
+function isEscapedShellNewline(command: string, index: number): boolean {
+  let backslashes = 0;
+  for (let cursor = index - 1; command[cursor] === "\\"; cursor -= 1) backslashes += 1;
+  return backslashes % 2 === 1;
+}
+
+function isShellCommentStart(command: string, index: number): boolean {
+  return index === 0 || /[\s;&|()]/.test(command[index - 1]!);
+}
+
+function maskShellRanges(command: string, ranges: TextRange[]): string {
+  if (ranges.length === 0) return command;
+  ranges.sort((left, right) => left.start - right.start);
+  let result = "";
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.end <= cursor) continue;
+    const start = Math.max(cursor, range.start);
+    result += command.slice(cursor, start);
+    result += command.slice(start, range.end).replace(/[^\n]/g, " ");
+    cursor = range.end;
+  }
+  return result + command.slice(cursor);
 }
 
 /** Preserve syntax and token boundaries while replacing quoted data with inert placeholders. */

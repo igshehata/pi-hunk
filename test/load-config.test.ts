@@ -358,11 +358,15 @@ describe("config loading", () => {
     await expect(access(`${globalPath}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("serializes sparse updates from truly separate Node processes", async () => {
-    const root = await temporaryDirectory("hunk-multiprocess-persist-");
+  it("serializes separate processes racing to recover the same stale lock", async () => {
+    const root = await temporaryDirectory("hunk-multiprocess-recovery-");
     const globalPath = join(root, "global.json");
     const worker = fileURLToPath(new URL("./fixtures/config-persist-worker.mjs", import.meta.url));
-
+    const { pid } = await runNode(["-e", "void 0"]);
+    await writeFile(
+      `${globalPath}.lock`,
+      JSON.stringify({ pid, token: "shared-stale-owner", createdAt: Date.now() - 1_000 }),
+    );
     await Promise.all(
       Array.from({ length: 8 }, (_, index) =>
         runNode([worker, globalPath, `process-${index}`, JSON.stringify(index)]),
@@ -374,6 +378,7 @@ describe("config loading", () => {
       expect(persisted[`process-${index}`]).toBe(index);
     }
     await expect(access(`${globalPath}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await readdir(root)).filter((name) => name.includes(".lock.recovery-"))).toEqual([]);
   }, 15_000);
 
   it("recovers a stale owner-token lock after its process exits", async () => {
@@ -390,6 +395,24 @@ describe("config loading", () => {
 
     expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({ review: "live" });
     await expect(access(`${globalPath}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cleans an orphaned recovery gate before acquiring a successor lock", async () => {
+    const root = await temporaryDirectory("hunk-orphaned-recovery-");
+    const globalPath = join(root, "global.json");
+    const lockPath = `${globalPath}.lock`;
+    process.env.PI_HUNK_CONFIG = globalPath;
+    const { pid } = await runNode(["-e", "void 0"]);
+    await writeFile(
+      `${lockPath}.recovery-abandoned`,
+      JSON.stringify({ pid, token: "dead-recovery-owner", createdAt: Date.now() - 1_000 }),
+    );
+
+    await new ConfigStore().persist(context(root, false), "global", { review: "after-run" });
+
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({ review: "after-run" });
+    expect((await readdir(root)).filter((name) => name.includes(".lock.recovery-"))).toEqual([]);
+    await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("recovers an aged malformed lock", async () => {
