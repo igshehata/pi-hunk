@@ -34,11 +34,12 @@ async function testProject(
   selections: string[],
   keySequences: string[][] = [],
   trusted = true,
-): Promise<{ ctx: ExtensionCommandContext; root: string; projectPath: string }> {
+): Promise<{ ctx: ExtensionCommandContext; root: string; globalPath: string }> {
   const root = await mkdtemp(join(tmpdir(), "hunk-config-command-"));
   temporaryDirectories.push(root);
   // Isolate config loading from the developer's real global configuration.
-  process.env.PI_HUNK_CONFIG = join(root, "global-hunk.json");
+  const globalPath = join(root, "global-hunk.json");
+  process.env.PI_HUNK_CONFIG = globalPath;
   const ctx = {
     cwd: root,
     mode: "tui",
@@ -69,7 +70,7 @@ async function testProject(
       notify: vi.fn(),
     },
   } as unknown as ExtensionCommandContext;
-  return { ctx, root, projectPath: join(root, ".pi", "hunk.json") };
+  return { ctx, root, globalPath };
 }
 
 const inactiveCoordinator = { hasLiveSurface: () => false } as ReviewCoordinator;
@@ -110,9 +111,9 @@ describe("config persistence", () => {
 });
 
 describe("interactive /hunk config", () => {
-  it("auto-saves every changed setting to the trusted project without a Save step", async () => {
-    const { ctx, projectPath } = await testProject([
-      "Review behavior: after-run",
+  it("auto-saves every changed setting to the global config without a Save step", async () => {
+    const { ctx, globalPath } = await testProject([
+      "Review behavior: off",
       "live",
       "Follow edits: on",
       "off",
@@ -132,7 +133,7 @@ describe("interactive /hunk config", () => {
         layout: "left",
       },
     });
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({
       review: "live",
       followEdits: false,
       overlay: {
@@ -144,33 +145,33 @@ describe("interactive /hunk config", () => {
 
   it("persists an interactive review choice while reporting the environment-effective policy", async () => {
     process.env.PI_HUNK_REVIEW = "off";
-    const { ctx, projectPath } = await testProject(["Review behavior: off", "live", "Done"]);
+    const { ctx, globalPath } = await testProject(["Review behavior: off", "live", "Done"]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({ review: "live" });
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({ review: "live" });
     expect(store.get().review).toBe("off");
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "Hunk review=live was saved to .pi/hunk.json, but PI_HUNK_REVIEW keeps review=off.",
+      `Hunk review=live was saved to ${globalPath}, but PI_HUNK_REVIEW keeps review=off.`,
       "warning",
     );
   });
 
   it("closes without writing when nothing changed", async () => {
-    const { ctx, projectPath } = await testProject(["Done"]);
+    const { ctx, globalPath } = await testProject(["Done"]);
     const store = new ConfigStore();
 
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
     expect(store.get()).toEqual(DEFAULT_CONFIG);
-    await expect(access(projectPath)).rejects.toThrow();
+    await expect(access(globalPath)).rejects.toThrow();
     expect(ctx.ui.notify).not.toHaveBeenCalled();
   });
 
   it("rejects unsafe shortcuts and leaves the inherited binding intact", async () => {
-    const { ctx, projectPath } = await testProject(
+    const { ctx, globalPath } = await testProject(
       ["Hunk prefix: ctrl+space", "Done"],
       [["h", "\x1b"]],
     );
@@ -179,18 +180,18 @@ describe("interactive /hunk config", () => {
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
     expect(store.get().bindings.prefix).toBe("ctrl+space");
-    await expect(access(projectPath)).rejects.toThrow();
+    await expect(access(globalPath)).rejects.toThrow();
     expect(ctx.ui.custom).toHaveBeenCalledOnce();
   });
 
   it("auto-saves the dedicated prefix from raw keyboard input", async () => {
-    const { ctx, projectPath } = await testProject(["Hunk prefix: ctrl+space", "Done"], [["\x18"]]);
+    const { ctx, globalPath } = await testProject(["Hunk prefix: ctrl+space", "Done"], [["\x18"]]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({
       bindings: { prefix: "ctrl+x" },
     });
     expect(store.get().bindings.prefix).toBe("ctrl+space");
@@ -198,13 +199,13 @@ describe("interactive /hunk config", () => {
   });
 
   it("auto-saves a bare action hotkey and combines it with the prefix", async () => {
-    const { ctx, projectPath } = await testProject(["Toggle hotkey: h", "Done"], [["t"]]);
+    const { ctx, globalPath } = await testProject(["Toggle hotkey: h", "Done"], [["t"]]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({
       bindings: { toggle: "t" },
     });
     expect(store.get().bindings.toggle).toBe("h");
@@ -215,19 +216,19 @@ describe("interactive /hunk config", () => {
   });
 
   it("rejects an action hotkey that collides with the prefix", async () => {
-    const { ctx, projectPath } = await testProject(["Toggle hotkey: h", "Done"], [["\x00", "t"]]);
+    const { ctx, globalPath } = await testProject(["Toggle hotkey: h", "Done"], [["\x00", "t"]]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({
       bindings: { toggle: "t" },
     });
   });
 
-  it("auto-saves a shortcut to the project but keeps the runtime key until reload", async () => {
-    const { ctx, projectPath } = await testProject(
+  it("auto-saves a shortcut to the global config but keeps the runtime key until reload", async () => {
+    const { ctx, globalPath } = await testProject(
       ["Hunk prefix: ctrl+space", "Hunk prefix: ctrl+x", "Follow edits: on", "off", "Done"],
       [["\x18"]],
     );
@@ -237,62 +238,80 @@ describe("interactive /hunk config", () => {
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
     expect(store.get().bindings.prefix).toBe("ctrl+space");
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({
       bindings: { prefix: "ctrl+x" },
       followEdits: false,
     });
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Run /reload"), "info");
   });
 
-  it("restores defaults by removing project overrides after confirmation", async () => {
-    const { ctx, projectPath } = await testProject([
+  it("restores defaults by removing global overrides after confirmation", async () => {
+    const { ctx, globalPath } = await testProject([
       "Restore defaults…",
-      "Restore — remove project overrides",
+      "Restore — remove global overrides",
       "Done",
     ]);
     const store = new ConfigStore();
-    await store.persist(ctx, "project", {
+    await store.persist(ctx, "global", {
       review: "live",
       bindings: { prefix: "ctrl+x" },
     });
 
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
-    await expect(access(projectPath)).rejects.toThrow();
+    await expect(access(globalPath)).rejects.toThrow();
     expect(store.get()).toMatchObject({
-      review: "after-run",
+      review: "off",
       bindings: { prefix: "ctrl+x" },
     });
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("settings restored"),
+      expect.stringContaining(`Global Hunk overrides removed from ${globalPath}`),
       "info",
     );
   });
 
-  it("refuses to expose temporary fallback behavior in an untrusted project", async () => {
-    const { ctx, projectPath } = await testProject([], [], false);
+  it("reports interactive persistence failure without claiming the change was saved", async () => {
+    const { ctx, globalPath } = await testProject(["Review behavior: off", "live", "Done"]);
+    await rm(globalPath, { force: true });
+    await writeFile(globalPath, "not a directory");
+    process.env.PI_HUNK_CONFIG = join(globalPath, "hunk.json");
     const store = new ConfigStore();
 
     await handleConfigCommand("", ctx, store, inactiveCoordinator);
 
-    expect(ctx.ui.select).not.toHaveBeenCalled();
-    await expect(access(projectPath)).rejects.toThrow();
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("trusted project"),
-      "warning",
+      expect.stringContaining("Could not update global Hunk config"),
+      "error",
     );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.any(String), "info");
+    expect(store.get().review).toBe("off");
+  });
+
+  it("still works when the project is untrusted because config is global", async () => {
+    const { ctx, globalPath } = await testProject(
+      ["Review behavior: off", "live", "Done"],
+      [],
+      false,
+    );
+    const store = new ConfigStore();
+    await store.reload(ctx);
+
+    await handleConfigCommand("", ctx, store, inactiveCoordinator);
+
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({ review: "live" });
+    expect(store.get().review).toBe("live");
   });
 });
 
 describe("direct /hunk config", () => {
-  it("persists a changed layout directly to the project with no scope argument", async () => {
-    const { ctx, projectPath } = await testProject([]);
+  it("persists a changed layout directly to the global config with no scope argument", async () => {
+    const { ctx, globalPath } = await testProject([]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
     await handleConfigCommand("left", ctx, store, inactiveCoordinator);
 
-    expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(globalPath, "utf8"))).toEqual({
       overlay: {
         layout: "left",
       },
@@ -303,7 +322,7 @@ describe("direct /hunk config", () => {
   });
 
   it("rejects exclusive, takeover, and wrap tokens as invalid config flags", async () => {
-    const { ctx, projectPath } = await testProject([]);
+    const { ctx, globalPath } = await testProject([]);
     const store = new ConfigStore();
     await store.reload(ctx);
 
@@ -312,30 +331,58 @@ describe("direct /hunk config", () => {
     await handleConfigCommand("right experimental-wrap", ctx, store, inactiveCoordinator);
     await handleConfigCommand("left no-wrap", ctx, store, inactiveCoordinator);
 
-    await expect(access(projectPath)).rejects.toThrow();
+    await expect(access(globalPath)).rejects.toThrow();
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Usage:"), "warning");
   });
 
-  it("supports direct project reset and restores inherited global settings", async () => {
-    const { ctx, root, projectPath } = await testProject([]);
-    await writeFile(join(root, "global-hunk.json"), JSON.stringify({ review: "off" }));
+  it("reports direct persistence failure and leaves runtime layout unchanged", async () => {
+    const { ctx, globalPath } = await testProject([]);
+    await writeFile(globalPath, "not a directory");
+    process.env.PI_HUNK_CONFIG = join(globalPath, "hunk.json");
     const store = new ConfigStore();
-    await store.persist(ctx, "project", { review: "live" });
+
+    await handleConfigCommand("left", ctx, store, inactiveCoordinator);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Could not update global Hunk config"),
+      "error",
+    );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.any(String), "info");
+    expect(store.get().overlay.layout).toBe("full");
+  });
+
+  it("warns a live surface that a changed layout applies after reopen", async () => {
+    const { ctx } = await testProject([]);
+    const store = new ConfigStore();
+    const liveCoordinator = { hasLiveSurface: () => true } as ReviewCoordinator;
+
+    await handleConfigCommand("left", ctx, store, liveCoordinator);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Close and reopen the current Hunk review"),
+      "info",
+    );
+  });
+
+  it("supports direct global reset and restores built-in defaults", async () => {
+    const { ctx, globalPath } = await testProject([]);
+    const store = new ConfigStore();
+    await store.persist(ctx, "global", { review: "live" });
 
     await handleConfigCommand("restore", ctx, store, inactiveCoordinator);
 
-    await expect(access(projectPath)).rejects.toThrow();
-    expect(store.get()).toEqual({ ...DEFAULT_CONFIG, review: "off" });
+    await expect(access(globalPath)).rejects.toThrow();
+    expect(store.get()).toEqual(DEFAULT_CONFIG);
   });
 
   it("rejects the removed session and global scope modifiers", async () => {
-    const { ctx, projectPath } = await testProject([]);
+    const { ctx, globalPath } = await testProject([]);
     const store = new ConfigStore();
 
     await handleConfigCommand("right session", ctx, store, inactiveCoordinator);
     await handleConfigCommand("right persist", ctx, store, inactiveCoordinator);
 
-    await expect(access(projectPath)).rejects.toThrow();
+    await expect(access(globalPath)).rejects.toThrow();
     expect(ctx.ui.notify).toHaveBeenCalledTimes(2);
     expect(ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Usage:"), "warning");
   });

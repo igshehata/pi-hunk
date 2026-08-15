@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -19,6 +19,7 @@ interface ConfigInteraction {
 
 afterEach(async () => {
   delete process.env.PI_HUNK_CONFIG;
+  vi.restoreAllMocks();
   await Promise.all(
     temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -40,6 +41,7 @@ async function setup(
   const overlay = new OverlaySurface((options): OverlayComponent => {
     mounts.push(options);
     return {
+      pid: 101,
       render: () => ["hunk"],
       invalidate: () => undefined,
       setVisible: () => undefined,
@@ -82,11 +84,33 @@ async function setup(
   } as unknown as ExtensionAPI;
 
   const store = new ConfigStore();
+  const managedSession = {
+    sessionId: "extension-test",
+    pid: 101,
+    cwd: root,
+    repoRoot: root,
+    launchedAt: "2026-01-01T00:00:00.000Z",
+    fileCount: 1,
+    files: [{ path: "src/a.ts" }],
+  };
   hunkExtension(pi, {
     store,
     coordinator,
-    reviewRun: async () => ({ stdout: '{"sessions":[]}', stderr: "", code: 0 }),
-    reviewWaitForSession: async () => ({ status: "not-found" }),
+    reviewRun: async (argv) => {
+      const command = argv.slice(1).join(" ");
+      if (command === "session list --json") {
+        return {
+          stdout: JSON.stringify({ sessions: [managedSession] }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (/^session comment list \S+ --type user --json$/.test(command)) {
+        return { stdout: JSON.stringify({ comments: [] }), stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: `unexpected argv: ${argv.join(" ")}`, code: 1 };
+    },
+    reviewWaitForSession: async () => ({ status: "reviewable", session: managedSession }),
   });
 
   const ctx = createContext(root, trusted, prefixAction, configInteraction);
@@ -158,11 +182,50 @@ function createContext(
   } as unknown as ExtensionCommandContext;
 }
 
+function productionHarness() {
+  const handlers = new Map<
+    string,
+    Array<(event: unknown, ctx: ExtensionCommandContext) => unknown>
+  >();
+  const registerCommand = vi.fn();
+  const registerShortcut = vi.fn();
+  const addHandler = (
+    name: string,
+    handler: (event: unknown, ctx: ExtensionCommandContext) => unknown,
+  ): void => {
+    const list = handlers.get(name) ?? [];
+    list.push(handler);
+    handlers.set(name, list);
+  };
+  const pi = {
+    on: addHandler,
+    registerCommand,
+    registerShortcut,
+    sendUserMessage: vi.fn(),
+  } as unknown as ExtensionAPI;
+
+  return {
+    pi,
+    handlers,
+    registerCommand,
+    async start(ctx: ExtensionCommandContext): Promise<void> {
+      for (const handler of handlers.get("session_start") ?? []) {
+        await handler({ type: "session_start" }, ctx);
+      }
+    },
+    async shutdown(ctx: ExtensionCommandContext): Promise<void> {
+      for (const handler of handlers.get("session_shutdown") ?? []) {
+        await handler({ type: "session_shutdown" }, ctx);
+      }
+    },
+  };
+}
+
 describe("extension overlay integration", () => {
   it("restores a hidden overlay with prefix+h", async () => {
     const { ctx, coordinator, mounts, shortcuts } = await setup("ctrl+space", false, "h");
 
-    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("hunk", "hunk: after-run");
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("hunk", undefined);
     expect([...shortcuts.keys()]).toEqual(["ctrl+space"]);
     await shortcuts.get("ctrl+space")?.(ctx);
     expect(mounts).toHaveLength(1);
@@ -306,15 +369,156 @@ describe("extension overlay integration", () => {
     expect(mounts[0]?.args).toEqual(["show", "mine()"]);
   });
 
-  it("writes /hunk review changes directly to trusted project config", async () => {
-    const { ctx, commands } = await setup("ctrl+space", true);
+  it("reloads config for each distinct production session without reregistering globals", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-production-restart-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "live" }));
+    const runtime = productionHarness();
+    const first = createContext(root, false, "h");
+    const second = createContext(root, false, "h");
+
+    hunkExtension(runtime.pi);
+    await runtime.start(first);
+    expect(first.ui.setStatus).toHaveBeenLastCalledWith("hunk", "hunk: live");
+
+    await runtime.shutdown(first);
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+    await runtime.start(second);
+
+    expect(second.ui.setStatus).toHaveBeenLastCalledWith("hunk", "hunk: after-run");
+    expect(runtime.registerCommand).toHaveBeenCalledOnce();
+    expect(runtime.handlers.get("session_start")).toHaveLength(1);
+    for (const event of [
+      "session_shutdown",
+      "agent_start",
+      "agent_settled",
+      "tool_call",
+      "tool_execution_start",
+      "tool_execution_end",
+    ]) {
+      expect(runtime.handlers.get(event)).toHaveLength(1);
+    }
+  });
+
+  it("coalesces concurrent production starts for the same context", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-production-concurrent-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    const runtime = productionHarness();
+    const ctx = createContext(root, false, "h");
+
+    hunkExtension(runtime.pi);
+    await Promise.all([runtime.start(ctx), runtime.start(ctx)]);
+
+    expect(runtime.registerCommand).toHaveBeenCalledOnce();
+    expect(runtime.pi.registerShortcut).toHaveBeenCalledOnce();
+    expect(ctx.ui.setStatus).toHaveBeenCalledOnce();
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith("hunk", undefined);
+  });
+
+  it("does not let a stale production shutdown tear down the newer context", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-production-stale-shutdown-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "live" }));
+    const shutdown = vi.spyOn(ReviewCoordinator.prototype, "shutdown").mockResolvedValue();
+    const runtime = productionHarness();
+    const first = createContext(root, false, "h");
+    const second = createContext(root, false, "h");
+
+    hunkExtension(runtime.pi);
+    await runtime.start(first);
+    await runtime.start(second);
+    await runtime.shutdown(first);
+
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(first.ui.setStatus).not.toHaveBeenCalledWith("hunk", undefined);
+
+    await runtime.shutdown(second);
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(second.ui.setStatus).toHaveBeenLastCalledWith("hunk", undefined);
+  });
+
+  it("uses safe config for a new production context when its reload fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-production-config-failure-"));
+    temporaryDirectories.push(root);
+    const configPath = join(root, "hunk.json");
+    process.env.PI_HUNK_CONFIG = configPath;
+    await writeFile(configPath, JSON.stringify({ review: "live" }));
+    const runtime = productionHarness();
+    const first = createContext(root, false, "h");
+    const second = createContext(root, false, "h");
+
+    hunkExtension(runtime.pi);
+    await runtime.start(first);
+    await runtime.shutdown(first);
+    await rm(configPath);
+    await mkdir(configPath);
+    await runtime.start(second);
+
+    expect(second.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Could not read Hunk config"),
+      "warning",
+    );
+    expect(second.ui.setStatus).toHaveBeenLastCalledWith("hunk", undefined);
+    expect(second.ui.setStatus).not.toHaveBeenCalledWith("hunk", "hunk: live");
+  });
+
+  it("writes /hunk review changes directly to global config", async () => {
+    const { ctx, commands } = await setup("ctrl+space", false);
 
     await commands.get("hunk")?.("review live", ctx);
 
-    expect(JSON.parse(await readFile(join(ctx.cwd, ".pi", "hunk.json"), "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(process.env.PI_HUNK_CONFIG!, "utf8"))).toMatchObject({
       review: "live",
     });
-    expect(ctx.ui.notify).toHaveBeenCalledWith("Hunk review set to live in .pi/hunk.json.", "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      `Hunk review set to live in ${process.env.PI_HUNK_CONFIG}.`,
+      "info",
+    );
+  });
+
+  it("reports /hunk review persistence failure without changing runtime policy", async () => {
+    const { ctx, commands, store } = await setup("ctrl+space", false);
+    const blockedParent = process.env.PI_HUNK_CONFIG!;
+    await writeFile(blockedParent, "not a directory");
+    process.env.PI_HUNK_CONFIG = join(blockedParent, "hunk.json");
+
+    await commands.get("hunk")?.("review live", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Could not update global Hunk config"),
+      "error",
+    );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("review set"), "info");
+    expect(store.get().review).toBe("off");
+  });
+
+  it("keeps runtime bindings active when /hunk review discovers an external binding edit", async () => {
+    const originalBindings = { prefix: "ctrl+space", toggle: "h", show: "s" } as const;
+    const externalBindings = { prefix: "ctrl+x", toggle: "j", show: "k" } as const;
+    const { ctx, commands, shortcuts, store } = await setup(
+      originalBindings.prefix,
+      false,
+      "h",
+      originalBindings,
+    );
+    await writeFile(
+      process.env.PI_HUNK_CONFIG!,
+      JSON.stringify({ bindings: externalBindings, followEdits: false }),
+    );
+
+    await commands.get("hunk")?.("review live", ctx);
+
+    expect(store.get()).toMatchObject({ review: "live", bindings: originalBindings });
+    expect(store.getLoaded()).toMatchObject({ review: "live", bindings: externalBindings });
+    expect(JSON.parse(await readFile(process.env.PI_HUNK_CONFIG!, "utf8"))).toEqual({
+      bindings: externalBindings,
+      followEdits: false,
+      review: "live",
+    });
+    expect([...shortcuts.keys()]).toEqual([originalBindings.prefix]);
   });
 
   it("keeps the entire pending chord inactive across file reloads and /hunk review until session start", async () => {
@@ -342,7 +546,7 @@ describe("extension overlay integration", () => {
 
     expect(store.get()).toMatchObject({ review: "live", bindings: originalBindings });
     expect(store.getLoaded()).toMatchObject({ review: "live", bindings: pendingBindings });
-    expect(JSON.parse(await readFile(join(ctx.cwd, ".pi", "hunk.json"), "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(process.env.PI_HUNK_CONFIG!, "utf8"))).toMatchObject({
       bindings: pendingBindings,
       review: "live",
     });

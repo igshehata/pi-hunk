@@ -15,7 +15,7 @@ describe("overlay config", () => {
   it("ships a full-screen takeover overlay by default", () => {
     expect(DEFAULT_CONFIG).toEqual(
       expect.objectContaining({
-        review: "after-run",
+        review: "off",
         followEdits: true,
         hunk: { command: "hunk", args: ["diff", "--watch"] },
         overlay: {
@@ -68,6 +68,8 @@ describe("overlay config", () => {
     { prefix: "ctrl+x", toggle: "ctrl+x", show: "s" },
     { prefix: "ctrl+x", toggle: "h", show: "ctrl+x" },
     { prefix: "ctrl+x", toggle: "j", show: "j" },
+    { prefix: "ctrl+shift+x", toggle: "shift+ctrl+x", show: "s" },
+    { prefix: "ctrl+x", toggle: "enter", show: "return" },
   ])("rejects every colliding Hunk chord atomically: %j", (bindings) => {
     const config = applyConfig(cloneConfig(DEFAULT_CONFIG), { bindings });
     expect(config.bindings).toEqual(DEFAULT_CONFIG.bindings);
@@ -120,6 +122,9 @@ describe("overlay config", () => {
     expect(isHotkeyBinding("h")).toBe(true);
     expect(isHotkeyBinding("left")).toBe(true);
     expect(isHotkeyBinding("escape")).toBe(false);
+    expect(isHotkeyBinding("shift+escape")).toBe(false);
+    expect(isHotkeyBinding("ctrl+esc")).toBe(false);
+    expect(isPrefixBinding("ctrl+escape")).toBe(false);
   });
 
   it("rejects Hunk entrypoints that require external terminal integration", () => {

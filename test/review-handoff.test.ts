@@ -1,7 +1,9 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../extensions/config.ts";
 import type { ReviewCoordinator } from "../extensions/coordinator.ts";
@@ -14,6 +16,15 @@ import {
 import { hunkTestLayer } from "./support/hunk-runner.ts";
 
 const baseLaunchedAt = "2026-01-01T00:00:00.000Z";
+const execFileAsync = promisify(execFile);
+
+async function git(cwd: string, args: string[]): Promise<void> {
+  await execFileAsync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 256 * 1024,
+  });
+}
 
 function session(overrides: Record<string, unknown> = {}) {
   return {
@@ -146,6 +157,7 @@ function setup(
     sessions?: unknown[] | (() => unknown[]);
     expectedSessionId?: string;
     pid?: number;
+    waitForSession?: ConstructorParameters<typeof ReviewHandoffGate>[3];
   } = {},
 ) {
   const coordinator = new FakeCoordinator();
@@ -155,6 +167,7 @@ function setup(
     coordinator as unknown as ReviewCoordinator,
     () => DEFAULT_CONFIG,
     run,
+    options.waitForSession,
   );
   const ctx = { cwd: "/repo", mode: "tui" } as ExtensionContext;
   return { coordinator, run, gate, ctx };
@@ -276,6 +289,19 @@ describe("fresh Hunk review parsing", () => {
     expect(run).toHaveBeenCalledTimes(2);
   });
 
+  it("never repository-falls back during a strict managed-PID lookup", async () => {
+    const run = runner([], [session({ sessionId: "wrapper-child", pid: 202 })]);
+    await expect(
+      waitForManagedHunkSession({
+        cwd: "/repo",
+        managedPid: 101,
+        run,
+        retryDelaysMs: [0],
+      }),
+    ).resolves.toEqual({ status: "not-found" });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
   it("gates comment list on a live repo session", async () => {
     const run = runner([], []);
     await expect(readHunkReview({ cwd: "/repo", run })).resolves.toMatchObject({
@@ -362,6 +388,75 @@ describe("fresh Hunk review parsing", () => {
     });
   });
 
+  it.runIf(process.platform !== "win32")(
+    "matches a unique repository through a canonical-equivalent symlink cwd",
+    async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-session-symlink-")));
+      const repo = join(root, "repo");
+      const linkedRepo = join(root, "linked-repo");
+      try {
+        await mkdir(join(repo, "packages", "app"), { recursive: true });
+        await symlink(repo, linkedRepo, "dir");
+        const sessions = [session({ sessionId: "canonical", pid: 222, cwd: repo, repoRoot: repo })];
+        await expect(
+          readHunkReview({
+            cwd: join(linkedRepo, "packages", "app"),
+            managedPid: 999,
+            run: runner([note()], sessions, "canonical"),
+          }),
+        ).resolves.toMatchObject({ status: "live", sessionId: "canonical" });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "ignores an exact stale PID from a sibling worktree and uses the unique same-worktree wrapper session",
+    async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "pi-hunk-session-worktree-")));
+      const mainRepo = join(root, "main");
+      const featureRepo = join(root, "feature");
+      try {
+        await mkdir(mainRepo);
+        await git(mainRepo, ["init"]);
+        await git(mainRepo, ["config", "user.email", "pi-hunk@example.com"]);
+        await git(mainRepo, ["config", "user.name", "pi-hunk"]);
+        await writeFile(join(mainRepo, "README.md"), "main\n");
+        await git(mainRepo, ["add", "README.md"]);
+        await git(mainRepo, ["commit", "-m", "init"]);
+        await git(mainRepo, ["worktree", "add", "-b", "feature", featureRepo]);
+
+        const sessions = [
+          session({ sessionId: "stale-main", pid: 999, cwd: mainRepo, repoRoot: mainRepo }),
+          session({
+            sessionId: "feature-wrapper",
+            pid: 222,
+            cwd: featureRepo,
+            repoRoot: featureRepo,
+          }),
+        ];
+        await expect(
+          readHunkReview({
+            cwd: featureRepo,
+            managedPid: 999,
+            run: runner([note()], sessions, "feature-wrapper"),
+          }),
+        ).resolves.toMatchObject({
+          status: "live",
+          sessionId: "feature-wrapper",
+          pid: 222,
+        });
+      } finally {
+        await execFileAsync("git", ["-C", mainRepo, "worktree", "remove", "--force", featureRepo], {
+          encoding: "utf8",
+          timeout: 10_000,
+        }).catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("treats dot-dot-prefixed path names as inside the repository", async () => {
     const sessions = [session({ sessionId: "dot-config", pid: 222, repoRoot: "/repo/project" })];
     const run = runner([note()], sessions, "dot-config");
@@ -397,19 +492,21 @@ describe("fresh Hunk review parsing", () => {
     });
   });
 
-  it("honors a pinned session id even when another matching session has the managed PID", async () => {
+  it("requires a supplied session id and managed PID to identify the same session", async () => {
     const sessions = [
       session({ sessionId: "pinned", pid: 111, launchedAt: "2026-01-01T00:00:00.000Z" }),
       session({ sessionId: "exact-pid", pid: 222, launchedAt: "2026-01-02T00:00:00.000Z" }),
     ];
+    const run = runner([], sessions, "pinned");
     await expect(
       readHunkReview({
         cwd: "/repo",
         sessionId: "pinned",
         managedPid: 222,
-        run: runner([], sessions, "pinned"),
+        run,
       }),
-    ).resolves.toMatchObject({ status: "live", sessionId: "pinned", notes: [] });
+    ).resolves.toMatchObject({ status: "no-live-session", notes: [] });
+    expect(run).toHaveBeenCalledOnce();
   });
 
   it("treats comment-list ranges as inclusive positive endpoints", async () => {
@@ -616,6 +713,165 @@ describe("asynchronous Hunk comment handoff", () => {
 
     expect(delivery).not.toHaveBeenCalled();
     expect(coordinator.state).toBe("hidden");
+  });
+
+  it("serializes close preservation behind an in-flight hide inspection without duplicate delivery", async () => {
+    let finishHide!: (value: { status: "reviewable"; session: ReturnType<typeof session> }) => void;
+    let lookup = 0;
+    const waitForSession = vi.fn(() => {
+      lookup += 1;
+      if (lookup === 1) {
+        return new Promise<{ status: "reviewable"; session: ReturnType<typeof session> }>(
+          (resolve) => {
+            finishHide = resolve;
+          },
+        );
+      }
+      return Promise.resolve({ status: "reviewable" as const, session: session() });
+    });
+    const { gate, coordinator } = setup([note("Preserve before close")], { waitForSession });
+    const delivery = vi.fn(acceptedDelivery);
+    gate.onLateSubmission(delivery);
+
+    coordinator.transition("visible");
+    coordinator.transition("hidden");
+    await vi.waitFor(() => expect(finishHide).toBeTypeOf("function"));
+    const barrier = gate.beforeDestructiveTransition("close");
+    expect(waitForSession).toHaveBeenCalledOnce();
+
+    finishHide({ status: "reviewable", session: session() });
+    await expect(barrier).resolves.toMatchObject({ status: "ready", transition: "close" });
+    expect(waitForSession).toHaveBeenCalledTimes(2);
+    expect(delivery).toHaveBeenCalledOnce();
+    expect(delivery.mock.calls[0]?.[0]).toEqual([
+      expect.objectContaining({ noteId: "user:1", summary: "Preserve before close" }),
+    ]);
+  });
+
+  it("runs a fresh exact-session barrier probe for notes added shortly after hide", async () => {
+    let comments: unknown[] = [];
+    const { gate, coordinator, run } = setup(() => comments);
+    const delivery = vi.fn(acceptedDelivery);
+    gate.onLateSubmission(delivery);
+
+    coordinator.transition("visible");
+    coordinator.transition("hidden");
+    await vi.waitFor(() =>
+      expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(1),
+    );
+    expect(delivery).not.toHaveBeenCalled();
+
+    comments = [note("Arrived after hide")];
+    await expect(gate.beforeDestructiveTransition("close")).resolves.toMatchObject({
+      status: "ready",
+      notes: [expect.objectContaining({ summary: "Arrived after hide" })],
+    });
+    expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(2);
+    expect(delivery).toHaveBeenCalledOnce();
+  });
+
+  it("rechecks once for a note persisted shortly after the surface is hidden", async () => {
+    vi.useFakeTimers();
+    try {
+      let comments: unknown[] = [];
+      const { gate, coordinator, run } = setup(() => comments, {
+        waitForSession: async () => ({ status: "reviewable", session: session() }),
+      });
+      const delivery = vi.fn(acceptedDelivery);
+      gate.onLateSubmission(delivery);
+
+      coordinator.transition("visible");
+      coordinator.transition("hidden");
+      for (let index = 0; index < 5; index += 1) await Promise.resolve();
+      expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(1);
+
+      comments = [note("Persisted just after hide")];
+      await vi.advanceTimersByTimeAsync(150);
+      await vi.waitFor(() => expect(delivery).toHaveBeenCalledOnce());
+      expect(delivery.mock.calls[0]?.[0]).toEqual([
+        expect.objectContaining({ summary: "Persisted just after hide" }),
+      ]);
+      expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("performs a fresh probe when a hidden review is restored before its debounce", async () => {
+    let comments: unknown[] = [];
+    const { gate, coordinator, run } = setup(() => comments);
+    const delivery = vi.fn(acceptedDelivery);
+    gate.onLateSubmission(delivery);
+
+    coordinator.transition("visible");
+    coordinator.transition("hidden");
+    await vi.waitFor(() =>
+      expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(1),
+    );
+
+    comments = [note("Persisted before restore")];
+    coordinator.transition("visible");
+    await vi.waitFor(() => expect(delivery).toHaveBeenCalledOnce());
+    expect(delivery.mock.calls[0]?.[0]).toEqual([
+      expect.objectContaining({ summary: "Persisted before restore" }),
+    ]);
+    expect(run.mock.calls.filter(([argv]) => argv.includes("comment"))).toHaveLength(2);
+  });
+
+  it("lets /hunk feedback wait behind a queued hide inspection without deadlocking or resending", async () => {
+    let finishHide!: (value: { status: "reviewable"; session: ReturnType<typeof session> }) => void;
+    let lookup = 0;
+    const waitForSession = vi.fn(() => {
+      lookup += 1;
+      if (lookup === 1) {
+        return new Promise<{ status: "reviewable"; session: ReturnType<typeof session> }>(
+          (resolve) => {
+            finishHide = resolve;
+          },
+        );
+      }
+      return Promise.resolve({ status: "reviewable" as const, session: session() });
+    });
+    const { gate, coordinator, ctx } = setup([note("Queued hide note")], { waitForSession });
+    const delivery = vi.fn(acceptedDelivery);
+    gate.onLateSubmission(delivery);
+
+    coordinator.transition("visible");
+    coordinator.transition("hidden");
+    await vi.waitFor(() => expect(finishHide).toBeTypeOf("function"));
+    const feedback = gate.submit(ctx);
+    finishHide({ status: "reviewable", session: session() });
+
+    await expect(feedback).resolves.toMatchObject({ status: "pending" });
+    expect(waitForSession).toHaveBeenCalledTimes(2);
+    expect(delivery).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed for user destruction but warns and continues for lifecycle teardown", async () => {
+    const { gate, coordinator, run } = setup([note("Unreachable")]);
+    const implementation = run.getMockImplementation()!;
+    run.mockImplementation(async (argv) => {
+      if (argv.includes("comment")) throw new Error("comment service unavailable");
+      return implementation(argv);
+    });
+    const warnings = vi.fn();
+    gate.onLateProbeWarning(warnings);
+    coordinator.transition("visible");
+
+    await expect(gate.beforeDestructiveTransition("close")).resolves.toMatchObject({
+      status: "unavailable",
+      behavior: "block",
+      reason: "comment-probe-failed",
+    });
+    expect(warnings).not.toHaveBeenCalled();
+
+    await expect(gate.beforeDestructiveTransition("shutdown")).resolves.toMatchObject({
+      status: "unavailable",
+      behavior: "continue-best-effort",
+      reason: "comment-probe-failed",
+    });
+    expect(warnings).toHaveBeenCalledOnce();
+    expect(warnings).toHaveBeenCalledWith(expect.stringContaining("teardown will continue"));
   });
 
   it("lets /hunk feedback retry a failed automatic delivery", async () => {

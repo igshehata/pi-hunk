@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MouseInputTranslator,
+  PtyInputEncoder,
   toPtyInput,
   translateMouseInput,
 } from "../extensions/overlay/input.ts";
@@ -128,6 +129,17 @@ describe("toPtyInput", () => {
 
     const floating = { column: 12, row: 5, width: 75, height: 30 };
     expect(translateMouseInput("\x1b[<35;20;10M", floating)).toBe("\x1b[<35;8;5M");
+  });
+});
+
+describe("PtyInputEncoder", () => {
+  it("reassembles ordinary non-BMP input split into UTF-16 callbacks", () => {
+    const encoder = new PtyInputEncoder();
+    const emoji = "😀";
+
+    expect(encoder.translate(emoji[0]!)).toBe("");
+    expect(encoder.translate(emoji[1]!)).toBe(emoji);
+    expect(encoder.translate(emoji)).toBe(emoji);
   });
 });
 

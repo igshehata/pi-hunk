@@ -8,6 +8,20 @@ import type { ExclusiveFrameStats } from "./overlay/exclusive-frame.ts";
 import { OverlaySurface } from "./overlay/surface.ts";
 import type { LaunchSource, OpenRequest, SurfaceSessionInfo } from "./overlay/types.ts";
 
+export type DestructiveSurfaceTransition =
+  | "close"
+  | "replace"
+  | "release"
+  | "automatic-release"
+  | "shutdown"
+  | "activate"
+  | "natural-exit";
+
+export type DestructiveTransitionGuard = (
+  transition: DestructiveSurfaceTransition,
+  surface: SurfaceSessionInfo,
+) => Promise<void>;
+
 export interface CoordinatorDeps {
   overlay?: OverlaySurface;
   navigateHunk?: typeof navigateHunkSession;
@@ -140,6 +154,7 @@ export class ReviewCoordinator {
   private runState = initialRunState();
   private lifecycle: CoordinatorLifecycleState = { phase: "active", revision: 0 };
   private readonly stateListeners = new Set<() => void>();
+  private destructiveTransitionGuard: DestructiveTransitionGuard | null = null;
 
   constructor(deps: CoordinatorDeps = {}) {
     this.overlay = deps.overlay ?? new OverlaySurface();
@@ -152,11 +167,22 @@ export class ReviewCoordinator {
       this.transitionRun({ type: "early-surface", event: "adopt" });
       return this.exclusive(operation);
     });
+    this.overlay.setReplacementGuard?.(() => this.guardDestructiveTransition("replace"));
   }
 
   onStateChange(listener: () => void): () => void {
     this.stateListeners.add(listener);
     return () => this.stateListeners.delete(listener);
+  }
+
+  /**
+   * Install the one comment-preservation barrier for every transition that can
+   * destroy or replace the active PTY. The guard runs while the coordinator's
+   * transition queue owns the exact surface, except for natural exit where the
+   * surface itself is already in `closing` and waits for the returned promise.
+   */
+  setDestructiveTransitionGuard(guard: DestructiveTransitionGuard | null): void {
+    this.destructiveTransitionGuard = guard;
   }
 
   private notifyStateChange(): void {
@@ -269,7 +295,8 @@ export class ReviewCoordinator {
         source === "shortcut" && hadLiveSurface
           ? (this.active?.getInfo()?.launchCwd ?? launchCwd)
           : launchCwd;
-      await this.overlay.ensure(ctx, this.buildRequest(config, args, source, requestCwd), config);
+      const request = this.buildRequest(config, args, source, requestCwd);
+      await this.overlay.ensure(ctx, request, config);
       if (!this.overlay.isLive()) {
         this.cancelPendingFollow();
         if (this.overlay.getState() === "closed") return;
@@ -372,8 +399,9 @@ export class ReviewCoordinator {
   }
 
   async closeActive(): Promise<boolean> {
-    this.suppressAutoOpenForRun("dismissed");
     const closed = await this.exclusive(async () => {
+      await this.guardDestructiveTransition("close");
+      this.suppressAutoOpenForRun("dismissed");
       this.cancelPendingFollow();
       return this.closeActiveUnlocked();
     });
@@ -384,6 +412,7 @@ export class ReviewCoordinator {
   /** Internal queue transition: close without dismissal/cancellation semantics. */
   async releaseSurfaceForRouting(): Promise<boolean> {
     const closed = await this.exclusive(async () => {
+      await this.guardDestructiveTransition("release");
       this.cancelPendingFollow();
       const surface = this.active;
       if (!surface || (!surface.isLive() && surface.getState() === "closed")) {
@@ -401,6 +430,7 @@ export class ReviewCoordinator {
   async closeEarlySurfaceOpenedForRun(): Promise<boolean> {
     const closed = await this.exclusive(async () => {
       if (this.runState.earlySurface !== "owned") return false;
+      await this.guardDestructiveTransition("automatic-release");
       this.cancelPendingFollow();
       const surface = this.active;
       if (!surface || (!surface.isLive() && surface.getState() === "closed")) {
@@ -496,7 +526,7 @@ export class ReviewCoordinator {
   async shutdown(): Promise<void> {
     // Close admission immediately so already-queued opens fail when they run.
     const revision = this.requestLifecycle("shutdown");
-    await this.exclusive(() => this.cleanupAll());
+    await this.exclusive(() => this.cleanupAll("shutdown"));
     this.completeLifecycle(revision, "shutting-down", "shutdown");
     this.notifyStateChange();
   }
@@ -504,7 +534,7 @@ export class ReviewCoordinator {
   async activateSession(): Promise<void> {
     const revision = this.requestLifecycle("activate");
     await this.exclusive(async () => {
-      if (this.overlay.getState() !== "closed" || this.active) await this.cleanupAll();
+      if (this.overlay.getState() !== "closed" || this.active) await this.cleanupAll("activate");
       this.generation += 1;
       this.active = null;
       this.naturalClosePending = false;
@@ -523,7 +553,8 @@ export class ReviewCoordinator {
     await this.activateSession();
   }
 
-  private async cleanupAll(): Promise<void> {
+  private async cleanupAll(transition: "shutdown" | "activate"): Promise<void> {
+    await this.guardDestructiveTransition(transition);
     this.generation += 1;
     this.cancelPendingFollow();
     this.transitionRun({ type: "reset" });
@@ -626,12 +657,29 @@ export class ReviewCoordinator {
     this.notifyStateChange();
   }
 
-  private onChildExit(result: HunkExit): void {
+  private async onChildExit(result: HunkExit): Promise<void> {
     this.cancelPendingFollow();
     this.naturalClosePending = this.active === this.overlay;
+    try {
+      await this.guardDestructiveTransition("natural-exit");
+    } catch {
+      // The child has already exited, so the surface cannot remain alive on a
+      // failed probe. The handoff gate reports the explicit best-effort warning.
+    }
     if (result.exitCode === 0 && (result.signal ?? 0) === 0) {
       this.suppressAutoOpenForRun("dismissed");
     }
+  }
+
+  private async guardDestructiveTransition(
+    transition: DestructiveSurfaceTransition,
+  ): Promise<void> {
+    const guard = this.destructiveTransitionGuard;
+    const info = this.active?.getInfo();
+    if (!guard || !info) return;
+    // Copy the identity: adoption during the probe may enrich the live surface,
+    // but it must never retarget this transition to a replacement.
+    await guard(transition, { ...info });
   }
 
   private buildRequest(

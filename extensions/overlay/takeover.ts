@@ -1,19 +1,42 @@
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import type { Component, Focusable, KeyId, TUI } from "@earendil-works/pi-tui";
-import { MouseInputTranslator, toPtyInput, type MouseViewport } from "./input.ts";
+import { MouseInputTranslator, PtyInputEncoder, type MouseViewport } from "./input.ts";
 import { type OverlayPty, type PtySubscription, spawnOverlayPty } from "./pty.ts";
 import type { HunkExit } from "./embedded.ts";
-import { TakeoverStartupGate } from "./takeover-startup.ts";
+import { TakeoverStartupGate, TakeoverStartupInput } from "./takeover-startup.ts";
 
 // Mirror Hunk's mouse reporting onto Pi's real terminal while takeover owns focus.
 const ENABLE_MOUSE = "\x1b[?1003h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 // Best-effort restore when leaving takeover so Pi's next full paint is not dirty.
 // Mouse reporting is restored separately through setMouseEnabled(false).
-const RESTORE_TERMINAL = "\x1b[0m\x1b]8;;\x07\x1b[?2026l\x1b[?6l\x1b[?7h\x1b[?25h";
+const RESTORE_TERMINAL =
+  "\x1b[0m\x1b]8;;\x07" +
+  // Hunk/OpenTUI 0.17.6 enables these input/notification modes directly on
+  // the physical terminal. TUI.stop() cannot account for child-owned state,
+  // so return to a neutral baseline before TUI.start() reasserts Pi's modes.
+  "\x1b[?1004l\x1b[?2027l\x1b[?2031l\x1b[>4;0m" +
+  // TUI.stop() pops Hunk's keyboard-protocol push, not Pi's underlying push.
+  // Pop that original level before TUI.start() installs one fresh Pi level.
+  // Kitty defines pop on an empty stack as inert, so this also covers children
+  // that never pushed keyboard flags.
+  "\x1b[<u" +
+  "\x1b[?2026l\x1b[?6l\x1b[?7h\x1b[?25h";
 const STARTUP_FRAME_FALLBACK_MS = 1_000;
 const DEFAULT_STARTUP_FRAME_DEADLINE_MS = 12_000;
 const STARTUP_TIMEOUT_EXIT_CODE = 124;
+const RESUME_FRAME_SETTLE_MS = 100;
+const RESUME_REFRESH_FALLBACK_MS = 1_000;
+const SYNCHRONIZED_FRAME_START = "\x1b[?2026h";
+const SYNCHRONIZED_FRAME_END = "\x1b[?2026l";
+
+function retainedMarkerPrefix(source: string, marker: string): string {
+  const maximum = Math.min(marker.length - 1, source.length);
+  for (let length = maximum; length > 0; length -= 1) {
+    if (marker.startsWith(source.slice(-length))) return source.slice(-length);
+  }
+  return "";
+}
 
 type LifecycleState = "running" | "completed" | "disposed";
 type PresentationState = "active" | "suspended";
@@ -86,7 +109,17 @@ export class TakeoverHunk implements Component, Focusable {
   private readonly runtime: TuiPaintRuntime;
   private readonly originalRequestRender: TUI["requestRender"];
   private readonly mouseInput = new MouseInputTranslator();
+  private readonly ptyInput = new PtyInputEncoder();
+  private readonly startupInput: TakeoverStartupInput;
   private readonly startupGate: TakeoverStartupGate;
+  /** Also registered verbatim with TUI.addInputListener. */
+  private readonly inputListener = (data: string): { consume?: boolean } | undefined => {
+    if (this.lifecycle !== "running" || this.presentation !== "active") {
+      return undefined;
+    }
+    this.handleInput(data);
+    return { consume: true };
+  };
 
   private lifecycle: LifecycleState = "running";
   private ptyDecoder = new TextDecoder();
@@ -99,6 +132,11 @@ export class TakeoverHunk implements Component, Focusable {
   private sawOutput = false;
   private startupDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private startupFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  private resumeRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private resumeSettleTimer: ReturnType<typeof setTimeout> | undefined;
+  private resumeRefreshPending = false;
+  private resumeFrameStarted = false;
+  private resumeFrameTail = "";
   private removeInputListener: (() => void) | undefined;
   private releaseRawInput: (() => void) | undefined;
   private paintSuspended = false;
@@ -133,6 +171,25 @@ export class TakeoverHunk implements Component, Focusable {
       options.startupFrameDeadlineMs ?? DEFAULT_STARTUP_FRAME_DEADLINE_MS,
     );
     this.rawInputSource = options.rawInputSource;
+    this.startupInput = new TakeoverStartupInput(
+      (data) => {
+        // Raw startup stdin bypasses ProcessTerminal/StdinBuffer, but it must not
+        // bypass takeover semantics. Dispatch through the same listener object
+        // registered below so prefix+h/s can never leak into the child PTY.
+        this.inputListener(data);
+      },
+      (reply) => {
+        if (this.lifecycle !== "running" || this.presentation !== "active") return;
+        try {
+          // Structured terminal replies are not key events. Preserve arbitrary
+          // payload text byte-for-byte instead of running isKeyRelease/CSI-u
+          // translation over it.
+          this.pty.write(reply);
+        } catch {
+          // The child may close between terminal reply delivery and this write.
+        }
+      },
+    );
     this.startupGate = new TakeoverStartupGate(
       (query) => {
         if (this.presentation === "active" && this.lifecycle === "running") this.writeRaw(query);
@@ -197,13 +254,7 @@ export class TakeoverHunk implements Component, Focusable {
         }
       ).addInputListener;
       if (typeof addInputListener === "function") {
-        this.removeInputListener = addInputListener.call(this.tui, (data) => {
-          if (this.lifecycle !== "running" || this.presentation !== "active") {
-            return undefined;
-          }
-          this.handleInput(data);
-          return { consume: true };
-        });
+        this.removeInputListener = addInputListener.call(this.tui, this.inputListener);
       }
 
       this.armStartupDeadline();
@@ -220,7 +271,10 @@ export class TakeoverHunk implements Component, Focusable {
    * show re-enters takeover and forces Hunk to repaint the cleared alternate screen.
    */
   setVisible(visible: boolean): void {
-    if (!visible) this.mouseInput.reset();
+    if (!visible) {
+      this.mouseInput.reset();
+      this.ptyInput.reset();
+    }
     if (this.lifecycle !== "running") return;
     if (visible && this.presentation === "suspended") {
       this.presentation = "active";
@@ -236,6 +290,10 @@ export class TakeoverHunk implements Component, Focusable {
     }
     if (!visible && this.presentation === "active") {
       this.presentation = "suspended";
+      // If hide races the acknowledged resize bounce, restore the real PTY
+      // geometry before hidden output starts being discarded. Otherwise the
+      // next show could repeat the temporary size and receive no SIGWINCH.
+      this.finishResumeRefresh();
       // A byte sequence or startup frame split across visibility cannot be
       // resumed because output received while hidden is intentionally discarded.
       this.resetPtyDecoder();
@@ -258,6 +316,7 @@ export class TakeoverHunk implements Component, Focusable {
 
     if (!isKeyRelease(data) && this.prefixKey && matchesKey(data, this.prefixKey)) {
       this.prefixPending = true;
+      this.ptyInput.reset();
       return;
     }
     if (!isKeyRelease(data) && this.prefixPending) {
@@ -274,7 +333,7 @@ export class TakeoverHunk implements Component, Focusable {
       return;
     }
 
-    let translated = toPtyInput(data);
+    let translated = this.ptyInput.translate(data);
     if (translated && this.resolveMouseViewport) {
       const viewport = this.resolveMouseViewport(
         this.tui.terminal.columns,
@@ -320,9 +379,12 @@ export class TakeoverHunk implements Component, Focusable {
 
   dispose(): void {
     if (this.lifecycle === "disposed") return;
+    this.cancelResumeRefresh();
     this.flushPtyDecoder(this.lifecycle === "running" && this.presentation === "active");
     this.lifecycle = "disposed";
     this.mouseInput.reset();
+    this.ptyInput.reset();
+    this.startupInput.reset();
     this.generation += 1;
     this.clearStartupTimers();
     this.leaveTakeover({ restorePi: true });
@@ -370,6 +432,7 @@ export class TakeoverHunk implements Component, Focusable {
     this.releaseStartupRawInput();
     this.setMouseEnabled(false);
     this.prefixPending = false;
+    this.ptyInput.reset();
 
     // Stop while the child alternate screen is still selected, then return to
     // Pi's screen. Restarting through TUI is the authoritative way to restore
@@ -440,22 +503,129 @@ export class TakeoverHunk implements Component, Focusable {
     if (!changed && !forceRefresh) return;
 
     if (forceRefresh && !changed) {
-      // Re-entry clears the real alternate screen, but an unchanged resize is
-      // not required to signal the child. Bounce through another valid size so
-      // Hunk receives a genuine resize and repaints at the final geometry.
-      const refreshRows = rows === 1 ? 2 : rows - 1;
-      try {
-        this.pty.resize(columns, refreshRows);
-      } catch {
-        // Always attempt to restore the real geometry below.
-      }
+      this.beginResumeRefresh(columns, rows);
+      return;
     }
 
+    // A real terminal resize supersedes any temporary resume geometry. Its
+    // changed dimensions already force Hunk to produce a complete repaint.
+    this.cancelResumeRefresh();
     try {
       this.pty.resize(columns, rows);
     } catch {
       // Child may have exited during a terminal resize or resume.
     }
+  }
+
+  /**
+   * Clear-on-resume needs a full child repaint. Two resize calls in one stack
+   * can collapse into one SIGWINCH at the unchanged final geometry, leaving
+   * only "Restoring Hunk…" on screen. Hold the temporary geometry until Hunk
+   * acknowledges it with a complete synchronized frame, then restore the real
+   * geometry. The timer is only a bounded fallback for non-DEC renderers.
+   */
+  private beginResumeRefresh(columns: number, rows: number): void {
+    this.cancelResumeRefresh();
+    this.resumeRefreshPending = true;
+    this.resumeFrameStarted = false;
+    this.resumeFrameTail = "";
+    this.resumeRefreshTimer = setTimeout(() => {
+      this.resumeRefreshTimer = undefined;
+      if (
+        !this.resumeRefreshPending ||
+        this.lifecycle !== "running" ||
+        this.presentation !== "active"
+      ) {
+        this.cancelResumeRefresh();
+        return;
+      }
+      this.finishResumeRefresh();
+    }, RESUME_REFRESH_FALLBACK_MS);
+    this.resumeRefreshTimer.unref?.();
+
+    const refreshRows = rows === 1 ? 2 : rows - 1;
+    try {
+      this.pty.resize(columns, refreshRows);
+    } catch {
+      // A failed temporary resize must not strand a stale pending lease or
+      // prevent the final physical geometry from being restored.
+      this.cancelResumeRefresh();
+      try {
+        this.pty.resize(columns, rows);
+      } catch {
+        // Child may have exited during resume.
+      }
+    }
+  }
+
+  private observeResumeRefresh(text: string): void {
+    if (!this.resumeRefreshPending || !text) return;
+
+    const marker = this.resumeFrameStarted ? SYNCHRONIZED_FRAME_END : SYNCHRONIZED_FRAME_START;
+    const source = this.resumeFrameTail + text;
+    const markerIndex = source.indexOf(marker);
+    if (markerIndex < 0) {
+      this.resumeFrameTail = retainedMarkerPrefix(source, marker);
+      return;
+    }
+
+    if (!this.resumeFrameStarted) {
+      this.resumeFrameStarted = true;
+      const trailing = source.slice(markerIndex + SYNCHRONIZED_FRAME_START.length);
+      if (!trailing.includes(SYNCHRONIZED_FRAME_END)) {
+        this.resumeFrameTail = retainedMarkerPrefix(trailing, SYNCHRONIZED_FRAME_END);
+        return;
+      }
+    }
+
+    // A complete transaction can have been queued while Hunk was hidden. Wait
+    // for a short quiet interval before restoring final geometry: the actual
+    // temporary-size repaint supersedes a stale differential frame and rearms
+    // this timer. The hard fallback still bounds continuously updating output.
+    this.resumeFrameStarted = false;
+    this.resumeFrameTail = "";
+    if (this.resumeSettleTimer) clearTimeout(this.resumeSettleTimer);
+    this.resumeSettleTimer = setTimeout(() => {
+      this.resumeSettleTimer = undefined;
+      if (
+        !this.resumeRefreshPending ||
+        this.lifecycle !== "running" ||
+        this.presentation !== "active"
+      ) {
+        this.cancelResumeRefresh();
+        return;
+      }
+      // Clear pending state before resize: test backends and buffered PTYs may
+      // synchronously emit the final frame from inside resize().
+      this.finishResumeRefresh();
+    }, RESUME_FRAME_SETTLE_MS);
+    this.resumeSettleTimer.unref?.();
+  }
+
+  private finishResumeRefresh(): void {
+    if (!this.resumeRefreshPending) return;
+    this.cancelResumeRefresh();
+    if (this.lifecycle !== "running") return;
+
+    const columns = Math.max(1, this.tui.terminal.columns);
+    const rows = Math.max(1, this.tui.terminal.rows);
+    this.columns = columns;
+    this.rows = rows;
+    try {
+      this.pty.resize(columns, rows);
+    } catch {
+      // Child may have exited while its temporary frame was being published.
+    }
+  }
+
+  private cancelResumeRefresh(): void {
+    if (this.resumeRefreshTimer) clearTimeout(this.resumeRefreshTimer);
+    if (this.resumeSettleTimer) clearTimeout(this.resumeSettleTimer);
+    this.resumeRefreshTimer = undefined;
+    this.resumeSettleTimer = undefined;
+    this.resumeRefreshPending = false;
+    this.resumeFrameStarted = false;
+    this.resumeFrameTail = "";
   }
 
   private writePtyData(data: string | Uint8Array): void {
@@ -473,12 +643,15 @@ export class TakeoverHunk implements Component, Focusable {
   private processPtyText(text: string): void {
     if (this.startupGate.ready) {
       this.writeRaw(text);
-      return;
+    } else {
+      const event = this.startupGate.push(text);
+      if (event.frameStarted) this.clearStartupFallback();
+      else if (event.fallbackEligible) this.armStartupFallback();
+      if (event.ready) this.markStartupReady();
     }
-    const event = this.startupGate.push(text);
-    if (event.frameStarted) this.clearStartupFallback();
-    else if (event.fallbackEligible) this.armStartupFallback();
-    if (event.ready) this.markStartupReady();
+    // Observe only after publishing this chunk so the temporary complete frame
+    // reaches the physical terminal before its final-geometry resize can emit.
+    this.observeResumeRefresh(text);
   }
 
   private flushPtyDecoder(write: boolean): void {
@@ -498,6 +671,7 @@ export class TakeoverHunk implements Component, Focusable {
    */
   private acquireStartupRawInput(): void {
     if (this.startupGate.ready || this.releaseRawInput) return;
+    this.startupInput.reset();
     const forward = (data: string | Uint8Array): void => {
       if (
         this.lifecycle !== "running" ||
@@ -506,14 +680,9 @@ export class TakeoverHunk implements Component, Focusable {
       ) {
         return;
       }
-      const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
-      try {
-        // Negotiation owns the terminal, so both complete terminal replies and
-        // ordinary keys go to Hunk byte-for-byte. Pi never parses this stream.
-        this.pty.write(text);
-      } catch {
-        // The child may close between stdin delivery and the PTY write.
-      }
+      // Split raw chunks into complete terminal events. The splitter preserves
+      // capability replies while dispatching ordinary keys through inputListener.
+      this.startupInput.push(data);
     };
 
     if (this.rawInputSource) {
@@ -648,13 +817,17 @@ export class TakeoverHunk implements Component, Focusable {
 
   private complete(result: HunkExit, options: { disposePty?: boolean } = {}): void {
     if (this.lifecycle !== "running") return;
+    this.cancelResumeRefresh();
     this.lifecycle = "completed";
     this.mouseInput.reset();
+    this.ptyInput.reset();
     this.clearStartupTimers();
     this.flushPtyDecoder(this.presentation === "active");
+    const detail = result.detail ?? this.startupGate.exitDetail();
+    const settled = detail && !result.detail ? { ...result, detail } : result;
     this.leaveTakeover({ restorePi: true });
     try {
-      this.done(result);
+      this.done(settled);
     } finally {
       if (options.disposePty) this.dispose();
     }

@@ -1,10 +1,24 @@
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, mkdtemp, open, readFile, rename, rm, rmdir, unlink } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+  unlink,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { CONFIG_DIR_NAME, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { basename, dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   applyConfig,
+  bindingIdentity,
   cloneConfig,
   DEFAULT_BINDINGS_CONFIG,
   DEFAULT_CONFIG,
@@ -18,13 +32,19 @@ import {
 
 /**
  * Config loading and persistence. Precedence (low → high): shipped defaults →
- * global file → trusted-project file → PI_HUNK_REVIEW override → session
- * patches held by ConfigStore. Validation and merge semantics live in
- * config-schema.ts; this module only decides WHERE config comes from and goes.
+ * global file → PI_HUNK_REVIEW override → session patches held by ConfigStore.
+ * Project-local files are diagnosed but never loaded: Pi-hunk configuration is
+ * global. Validation and merge semantics live in config-schema.ts; this module
+ * only decides WHERE config comes from and goes.
  */
 
 /** Callback for non-fatal config problems (invalid values that fell back). */
 export type ConfigWarning = (message: string) => void;
+
+interface ConfigContext {
+  cwd: string;
+  isProjectTrusted?: () => boolean;
+}
 
 type JsonReadResult =
   | { status: "missing" }
@@ -79,6 +99,250 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
+const CONFIG_LOCK_RETRY_MS = 20;
+const CONFIG_LOCK_TIMEOUT_MS = 5_000;
+const CONFIG_MALFORMED_LOCK_STALE_MS = 30_000;
+const CONFIG_LOCK_MAX_BYTES = 4_096;
+
+type ReleaseConfigLock = () => Promise<void>;
+
+interface ConfigLockOwner {
+  pid: number;
+  token: string;
+  createdAt: number;
+}
+
+interface ConfigLockFingerprint {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+}
+
+interface ConfigLockSnapshot {
+  raw?: string;
+  owner?: ConfigLockOwner;
+  /** PID-only lock written by pi-hunk versions before owner tokens. */
+  legacyPid?: number;
+  fingerprint: ConfigLockFingerprint;
+}
+
+function parseConfigLockOwner(raw: string | undefined): ConfigLockOwner | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (
+      !isRecord(value) ||
+      !Number.isSafeInteger(value.pid) ||
+      (value.pid as number) <= 0 ||
+      typeof value.token !== "string" ||
+      value.token.length === 0 ||
+      value.token.length > 200 ||
+      typeof value.createdAt !== "number" ||
+      !Number.isFinite(value.createdAt) ||
+      value.createdAt <= 0
+    ) {
+      return undefined;
+    }
+    return {
+      pid: value.pid as number,
+      token: value.token,
+      createdAt: value.createdAt,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function parseLegacyConfigLockPid(raw: string): number | undefined {
+  if (!/^[1-9]\d*\s*$/.test(raw)) return undefined;
+  const pid = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(pid) ? pid : undefined;
+}
+
+async function readConfigLockSnapshot(lockPath: string): Promise<ConfigLockSnapshot | undefined> {
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    file = await open(
+      lockPath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+
+  try {
+    const stats = await file.stat();
+    const fingerprint = {
+      dev: stats.dev,
+      ino: stats.ino,
+      size: stats.size,
+      mtimeMs: stats.mtimeMs,
+    };
+    if (!stats.isFile() || stats.size > CONFIG_LOCK_MAX_BYTES) return { fingerprint };
+
+    const buffer = Buffer.alloc(CONFIG_LOCK_MAX_BYTES + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > CONFIG_LOCK_MAX_BYTES) return { fingerprint };
+    const raw = buffer.toString("utf8", 0, bytesRead);
+    return {
+      raw,
+      owner: parseConfigLockOwner(raw),
+      legacyPid: parseLegacyConfigLockPid(raw),
+      fingerprint,
+    };
+  } finally {
+    await file.close().catch(() => undefined);
+  }
+}
+
+function sameConfigLockFingerprint(
+  left: ConfigLockFingerprint,
+  right: ConfigLockFingerprint,
+): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs
+  );
+}
+
+/** Remove only the exact lock snapshot inspected by this contender. */
+async function removeConfigLockSnapshot(
+  lockPath: string,
+  expected: ConfigLockSnapshot,
+  ownerToken?: string,
+): Promise<boolean> {
+  const current = await readConfigLockSnapshot(lockPath);
+  if (!current) return true;
+  if (
+    !sameConfigLockFingerprint(current.fingerprint, expected.fingerprint) ||
+    (ownerToken !== undefined && current.owner?.token !== ownerToken)
+  ) {
+    return false;
+  }
+  try {
+    await unlink(lockPath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+async function configLockOwnerIsDead(pid: number): Promise<boolean> {
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // EPERM means a process exists but cannot be signalled. Unknown platform
+    // errors are also treated as live: ESRCH is the only positive dead signal.
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+/** Recover only a dead owner or an old lock that never gained valid metadata. */
+async function recoverStaleConfigLock(lockPath: string): Promise<boolean> {
+  let snapshot: ConfigLockSnapshot | undefined;
+  try {
+    snapshot = await readConfigLockSnapshot(lockPath);
+  } catch {
+    return false;
+  }
+  if (!snapshot) return true;
+
+  const pid = snapshot.owner?.pid ?? snapshot.legacyPid;
+  if (pid !== undefined) {
+    if (!(await configLockOwnerIsDead(pid))) return false;
+    return removeConfigLockSnapshot(lockPath, snapshot, snapshot.owner?.token).catch(() => false);
+  }
+
+  if (Date.now() - snapshot.fingerprint.mtimeMs < CONFIG_MALFORMED_LOCK_STALE_MS) return false;
+  return removeConfigLockSnapshot(lockPath, snapshot).catch(() => false);
+}
+
+/** Serialize read/merge/write across Pi processes so sparse global updates cannot be lost. */
+async function acquireConfigLock(path: string): Promise<ReleaseConfigLock> {
+  const lockPath = `${path}.lock`;
+  await mkdir(dirname(path), { recursive: true });
+  const deadline = Date.now() + CONFIG_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    let lock: Awaited<ReturnType<typeof open>> | undefined;
+    let openedSnapshot: ConfigLockSnapshot | undefined;
+    const owner: ConfigLockOwner = {
+      pid: process.pid,
+      token: randomUUID(),
+      createdAt: Date.now(),
+    };
+    try {
+      lock = await open(
+        lockPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      const openedStats = await lock.stat();
+      openedSnapshot = {
+        fingerprint: {
+          dev: openedStats.dev,
+          ino: openedStats.ino,
+          size: openedStats.size,
+          mtimeMs: openedStats.mtimeMs,
+        },
+      };
+      await lock.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+      await lock.sync();
+
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        await lock?.close().catch(() => undefined);
+        const snapshot = await readConfigLockSnapshot(lockPath);
+        if (!snapshot || snapshot.owner?.token !== owner.token) return;
+        await removeConfigLockSnapshot(lockPath, snapshot, owner.token);
+      };
+    } catch (error) {
+      await lock?.close().catch(() => undefined);
+      if (lock) {
+        // If setup failed after O_EXCL succeeded, clean up only that inode. A
+        // replacement lock must survive this failed contender.
+        const current = await readConfigLockSnapshot(lockPath).catch(() => undefined);
+        if (
+          current &&
+          openedSnapshot &&
+          current.fingerprint.dev === openedSnapshot.fingerprint.dev &&
+          current.fingerprint.ino === openedSnapshot.fingerprint.ino
+        ) {
+          await unlink(lockPath).catch(() => undefined);
+        }
+        throw error;
+      }
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await recoverStaleConfigLock(lockPath)) continue;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out waiting to update Hunk config at ${path}. ` +
+            `If no Pi process is updating it, remove ${lockPath} and retry.`,
+        );
+      }
+      await delay(CONFIG_LOCK_RETRY_MS);
+    }
+  }
+}
+
+async function withConfigLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  const release = await acquireConfigLock(path);
+  try {
+    return await operation();
+  } finally {
+    await release();
+  }
+}
+
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true });
@@ -117,11 +381,33 @@ async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
 }
 
 export function globalConfigPath(): string {
-  return process.env.PI_HUNK_CONFIG ?? join(homedir(), ".pi", "agent", "hunk.json");
+  return process.env.PI_HUNK_CONFIG ?? join(getAgentDir(), "hunk.json");
 }
 
 export function projectConfigPath(cwd: string): string {
   return join(cwd, CONFIG_DIR_NAME, "hunk.json");
+}
+
+function legacyGlobalConfigPath(): string {
+  // Before 0.2.1 pi-hunk ignored PI_CODING_AGENT_DIR and always used this path.
+  // Prefer HOME explicitly because os.homedir() may cache its first lookup.
+  return join(process.env.HOME ?? homedir(), ".pi", "agent", "hunk.json");
+}
+
+async function comparableConfigPath(path: string): Promise<string> {
+  let canonical: string;
+  try {
+    canonical = await realpath(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    try {
+      canonical = join(await realpath(dirname(path)), basename(path));
+    } catch (parentError) {
+      if ((parentError as NodeJS.ErrnoException).code !== "ENOENT") throw parentError;
+      canonical = resolve(path);
+    }
+  }
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
 /** Warn for invalid public values handled by config-schema's fallback merge. */
@@ -170,7 +456,11 @@ function warnInvalidBindings(
   inherited: HunkConfig["bindings"],
   onWarning?: ConfigWarning,
 ): void {
-  if (!onWarning || !isRecord(raw) || !isRecord(raw.bindings)) return;
+  if (!onWarning || !isRecord(raw) || raw.bindings === undefined) return;
+  if (!isRecord(raw.bindings)) {
+    onWarning(`Ignoring invalid bindings configuration in ${path}; expected an object.`);
+    return;
+  }
   const validators = {
     prefix: isPrefixBinding,
     toggle: isHotkeyBinding,
@@ -190,7 +480,8 @@ function warnInvalidBindings(
     toggle: isHotkeyBinding(raw.bindings.toggle) ? raw.bindings.toggle : inherited.toggle,
     show: isHotkeyBinding(raw.bindings.show) ? raw.bindings.show : inherited.show,
   };
-  if (new Set(Object.values(bindings)).size !== 3) {
+  const identities = Object.values(bindings).map(bindingIdentity);
+  if (new Set(identities).size !== 3) {
     onWarning(
       `Ignoring colliding Hunk bindings in ${path}; prefix, toggle, and show must use distinct keys.`,
     );
@@ -198,7 +489,11 @@ function warnInvalidBindings(
 }
 
 function warnInvalidOverlayConfig(raw: unknown, path: string, onWarning?: ConfigWarning): void {
-  if (!onWarning || !isRecord(raw) || !isRecord(raw.overlay)) return;
+  if (!onWarning || !isRecord(raw) || raw.overlay === undefined) return;
+  if (!isRecord(raw.overlay)) {
+    onWarning(`Ignoring invalid overlay configuration in ${path}; expected an object.`);
+    return;
+  }
   const { layout } = raw.overlay;
   if (layout !== undefined && !isOverlayLayout(layout)) {
     onWarning(
@@ -249,7 +544,7 @@ function applyConfigLayer(
 }
 
 export async function loadConfig(
-  ctx: ExtensionContext,
+  ctx: ConfigContext,
   onWarning?: ConfigWarning,
 ): Promise<HunkConfig> {
   let config = cloneConfig(DEFAULT_CONFIG);
@@ -257,10 +552,45 @@ export async function loadConfig(
   const globalRaw = await readConfigLayer(globalPath, onWarning);
   config = applyConfigLayer(config, globalRaw, globalPath, onWarning);
 
-  if (ctx.isProjectTrusted()) {
+  if (!process.env.PI_HUNK_CONFIG) {
+    const legacyPath = legacyGlobalConfigPath();
+    try {
+      if ((await comparableConfigPath(legacyPath)) !== (await comparableConfigPath(globalPath))) {
+        await access(legacyPath, constants.F_OK);
+        onWarning?.(
+          `Ignoring legacy Hunk config at ${legacyPath}; Pi's global agent directory is ${globalPath}. ` +
+            `Move audited settings to the new path and remove the legacy file.`,
+        );
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        // Legacy discovery is advisory. Symlink loops and permission errors on
+        // this obsolete optional path must not block the active global config.
+        onWarning?.(
+          `Could not inspect legacy Hunk config at ${legacyPath}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
+  if (ctx.isProjectTrusted?.()) {
     const projectPath = projectConfigPath(ctx.cwd);
-    const projectRaw = await readConfigLayer(projectPath, onWarning);
-    config = applyConfigLayer(config, projectRaw, projectPath, onWarning);
+    try {
+      await access(projectPath, constants.F_OK);
+      onWarning?.(
+        `Ignoring project-local Hunk config at ${projectPath}; Pi-hunk configuration is global. ` +
+          `Reapply user-facing settings with /hunk config, do not copy a project-relative ` +
+          `hunk.command into global config, and remove the project file.`,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        onWarning?.(
+          `Could not inspect obsolete project-local Hunk config at ${projectPath}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   }
 
   const reviewOverride = process.env.PI_HUNK_REVIEW;
@@ -275,7 +605,7 @@ export async function loadConfig(
   return config;
 }
 
-export type ConfigScope = "session" | "global" | "project";
+export type ConfigScope = "session" | "global";
 
 /**
  * Deep-merge only the keys present in `patch` onto `base`. Nested plain objects
@@ -324,46 +654,43 @@ export class ConfigStore {
     return this.get();
   }
 
-  async reload(ctx: ExtensionContext, onWarning?: ConfigWarning): Promise<HunkConfig> {
+  async reload(ctx: ConfigContext, onWarning?: ConfigWarning): Promise<HunkConfig> {
     this.loadedConfig = await loadConfig(ctx, onWarning);
     this.config = applyConfig(this.loadedConfig, this.sessionOverrides);
     return this.get();
   }
 
   /** Start a fresh Pi runtime, discarding overrides retained by the prior session. */
-  async startSession(ctx: ExtensionContext, onWarning?: ConfigWarning): Promise<HunkConfig> {
+  async startSession(ctx: ConfigContext, onWarning?: ConfigWarning): Promise<HunkConfig> {
+    // Clear every value derived from the ending session before I/O. If loading
+    // fails, callers see safe defaults rather than old overrides or file data.
     this.sessionOverrides = {};
+    this.loadedConfig = cloneConfig(DEFAULT_CONFIG);
+    this.config = cloneConfig(DEFAULT_CONFIG);
     return this.reload(ctx, onWarning);
   }
 
-  /**
-   * Persist a partial update to global or trusted project config, then reload files
-   * beneath the retained runtime session overrides. Project scope requires trust.
-   */
-  async resetProject(ctx: ExtensionContext): Promise<HunkConfig> {
-    if (!ctx.isProjectTrusted()) throw new Error("Project config requires a trusted project.");
-    await rm(projectConfigPath(ctx.cwd), { force: true });
+  /** Remove global Hunk overrides and reload defaults plus environment overrides. */
+  async resetGlobal(ctx: ConfigContext): Promise<HunkConfig> {
+    const path = globalConfigPath();
+    await withConfigLock(path, () => rm(path, { force: true }));
     return this.reload(ctx);
   }
 
-  async persist(
-    ctx: ExtensionContext,
-    scope: "global" | "project",
-    partial: unknown,
-  ): Promise<HunkConfig> {
-    if (scope === "project" && !ctx.isProjectTrusted()) {
-      throw new Error("Project config requires a trusted project.");
-    }
-    const path = scope === "global" ? globalConfigPath() : projectConfigPath(ctx.cwd);
-    // Repair policy: valid JSON remains a sparse deep merge; a malformed target
-    // is atomically replaced by this trusted command's sparse patch. Missing and
-    // malformed files both use an empty raw base, while genuine read/permission
-    // failures still reject without touching the destination.
-    const existing = await readJson(path);
-    const base = existing.status === "valid" && isRecord(existing.value) ? existing.value : {};
-    const patch = isRecord(partial) ? partial : {};
-    const merged = deepMergeRecords(base, patch);
-    await writeJsonAtomic(path, merged);
+  /** Persist a sparse update to Pi's global config directory, then reload it. */
+  async persist(ctx: ConfigContext, _scope: "global", partial: unknown): Promise<HunkConfig> {
+    const path = globalConfigPath();
+    await withConfigLock(path, async () => {
+      // Repair policy: valid JSON remains a sparse deep merge; a malformed target
+      // is atomically replaced by this command's sparse patch. Missing and
+      // malformed files both use an empty raw base, while genuine read/permission
+      // failures still reject without touching the destination.
+      const existing = await readJson(path);
+      const base = existing.status === "valid" && isRecord(existing.value) ? existing.value : {};
+      const patch = isRecord(partial) ? partial : {};
+      const merged = deepMergeRecords(base, patch);
+      await writeJsonAtomic(path, merged);
+    });
     return this.reload(ctx);
   }
 }

@@ -1,7 +1,9 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
+import { EmbeddedHunk, type HunkExit } from "../extensions/overlay/embedded.ts";
 import {
   __captureOwnedPosixProcessGroupFromProbe,
   spawnOverlayPty,
@@ -24,6 +26,33 @@ function fakeBackend(overrides: Record<string, unknown> = {}) {
     pty,
     backend: { hasNative: true, spawn: vi.fn(() => pty), ...overrides },
   };
+}
+
+async function waitForFileContent(path: string, timeoutMs = 5000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return await readFile(path, "utf8");
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw new Error(`file ${path} was not created by PTY child`);
+}
+
+async function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = 5000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function waitForProcessExit(pid: number, timeoutMs = 5000): Promise<void> {
@@ -104,6 +133,19 @@ describe("zigpty overlay adapter", () => {
       expect(isAlive).toHaveBeenCalledWith(pid);
       expect(pause).toHaveBeenCalledOnce();
       expect(pause).toHaveBeenCalledWith(5);
+    });
+
+    it("refuses blind group authorization when a fast leader exits before the first probe", () => {
+      const probe = vi.fn(() => undefined);
+      const pause = vi.fn();
+      const isAlive = vi.fn(() => false);
+
+      expect(
+        __captureOwnedPosixProcessGroupFromProbe(pid, parentProcessId, probe, pause, isAlive),
+      ).toBeUndefined();
+      expect(probe).toHaveBeenCalledOnce();
+      expect(isAlive).toHaveBeenCalledWith(pid);
+      expect(pause).not.toHaveBeenCalled();
     });
 
     it("stops without authorization when the owned child disappears during retry", () => {
@@ -336,7 +378,7 @@ describe("zigpty overlay adapter", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(pty.kill).toHaveBeenCalledTimes(2);
       expect(pty.kill).toHaveBeenLastCalledWith("SIGKILL");
-      expect(pty.close).toHaveBeenCalledOnce();
+      expect(pty.close).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -443,6 +485,70 @@ describe.runIf(process.platform === "darwin" || process.platform === "linux")(
         }
       } finally {
         await rm(barrierDirectory, { recursive: true, force: true });
+      }
+    }, 10_000);
+
+    it("cleans a TERM/HUP-immune descendant after EmbeddedHunk's leader exits naturally", async () => {
+      const root = await mkdtemp(join(tmpdir(), "pi-hunk-natural-leader-exit-"));
+      const childPidFile = join(root, "child-pid");
+      const childReadyFile = join(root, "child-ready");
+      const leaderExitBarrier = join(root, "leader-exit");
+      const originalPath = process.env.PATH;
+      let component: EmbeddedHunk | undefined;
+      let leaderPid: number | undefined;
+      let childPid: number | undefined;
+      try {
+        // Ownership capture must not depend on PATH lookup for ps. Linux uses
+        // /proc directly; supported non-Linux POSIX targets use /bin/ps.
+        process.env.PATH = "";
+        const completed = new Promise<HunkExit>((resolve) => {
+          const tui = {
+            terminal: { columns: 80, rows: 24, write: vi.fn() },
+            requestRender: vi.fn(),
+          } as unknown as TUI;
+          component = new EmbeddedHunk({
+            command: "/bin/sh",
+            args: [
+              "-c",
+              'trap "" TERM HUP; ' +
+                '/bin/sh -c \'trap "" TERM HUP; printf "%s\\n" "$$" > "$1"; : > "$2"; while :; do /bin/sleep 1; done\' descendant "$1" "$2" & ' +
+                'while [ ! -f "$2" ]; do /bin/sleep 0.01; done; ' +
+                'while [ ! -f "$3" ]; do /bin/sleep 0.01; done; exit 0',
+              "pi-hunk-natural-exit",
+              childPidFile,
+              childReadyFile,
+              leaderExitBarrier,
+            ],
+            cwd: root,
+            tui,
+            done: resolve,
+            startupFrameDeadlineMs: 10_000,
+          });
+        });
+        leaderPid = component!.pid;
+        childPid = Number((await waitForFileContent(childPidFile)).trim());
+        expect(leaderPid).toBeGreaterThan(0);
+        expect(childPid).toBeGreaterThan(0);
+
+        await writeFile(leaderExitBarrier, "");
+        const event = await withTimeout(completed, "natural PTY leader exit timed out");
+        expect(event.exitCode).toBe(0);
+        await Promise.all([waitForProcessExit(leaderPid!), waitForProcessExit(childPid!)]);
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+        component?.dispose();
+        // Keep failure cleanup bounded without ever group-signalling an
+        // unverified pid: these are exact pids created and observed by the test.
+        for (const pid of [childPid, leaderPid]) {
+          if (!pid) continue;
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // Already gone.
+          }
+        }
+        await rm(root, { recursive: true, force: true });
       }
     }, 10_000);
 

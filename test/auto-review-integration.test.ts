@@ -111,7 +111,11 @@ function harness(
 
 function reviewableRun(cwd: string) {
   return async (argv: string[]) => {
-    if (argv.slice(1).join(" ") !== "session list --json") {
+    const command = argv.slice(1).join(" ");
+    if (/^session comment list \S+ --type user --json$/.test(command)) {
+      return { code: 0, stderr: "", stdout: JSON.stringify({ comments: [] }) };
+    }
+    if (command !== "session list --json") {
       return { code: 1, stderr: `unexpected argv: ${argv.join(" ")}`, stdout: "" };
     }
     return {
@@ -1204,6 +1208,206 @@ describe("automatic review policies in action", () => {
     expect(runtime.ctx.ui.notify).not.toHaveBeenCalledWith(
       expect.stringMatching(/^Sent .*Hunk feedback/),
       "info",
+    );
+  });
+
+  it("preserves visible comments before /hunk close disposes the exact surface", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-close-feedback-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+    const comments = [
+      {
+        noteId: "close:1",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [3, 3],
+        body: "Collect before close",
+      },
+    ];
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      coordinator: runtime.coordinator,
+      reviewRun: commentReviewRun(root, () => comments),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.commands.get("hunk")?.("", runtime.ctx);
+
+    await runtime.commands.get("hunk")?.("close", runtime.ctx);
+
+    expect(runtime.sendUserMessage).toHaveBeenCalledOnce();
+    expect(runtime.sendUserMessage.mock.calls[0]?.[0]).toContain('"noteId": "close:1"');
+    expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalledOnce();
+    expect(runtime.sendUserMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.mounts[0]!.component.dispose!).mock.invocationCallOrder[0]!,
+    );
+    expect(runtime.coordinator.getActiveInfo()).toBeNull();
+  });
+
+  it("keeps /hunk close fail-closed when the final exact-session probe fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-close-probe-failure-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+    const baseRun = reviewableRun(root);
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      coordinator: runtime.coordinator,
+      reviewRun: async (argv) => {
+        if (argv.includes("comment")) throw new Error("final comment probe failed");
+        return baseRun(argv);
+      },
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.commands.get("hunk")?.("", runtime.ctx);
+
+    await runtime.commands.get("hunk")?.("close", runtime.ctx);
+
+    expect(runtime.coordinator.getActiveInfo()?.state).toBe("visible");
+    expect(runtime.mounts[0]!.component.dispose).not.toHaveBeenCalled();
+    expect(runtime.ctx.ui.notify).toHaveBeenLastCalledWith(
+      expect.stringContaining("close was blocked"),
+      "error",
+    );
+  });
+
+  it("preserves comments before direct manual diff-to-show replacement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-replace-feedback-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+    const comments = [
+      {
+        noteId: "replace:1",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [6, 6],
+        body: "Collect before replacement",
+      },
+    ];
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      coordinator: runtime.coordinator,
+      reviewRun: commentReviewRun(root, () => comments),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.commands.get("hunk")?.("", runtime.ctx);
+
+    await runtime.commands.get("hunk")?.("show", runtime.ctx);
+
+    expect(runtime.mounts).toHaveLength(2);
+    expect(runtime.mounts[1]!.options.args).toEqual(["show"]);
+    expect(runtime.sendUserMessage).toHaveBeenCalledOnce();
+    expect(runtime.sendUserMessage.mock.calls[0]?.[0]).toContain('"noteId": "replace:1"');
+    expect(runtime.sendUserMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.mounts[0]!.component.dispose!).mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("preserves comments before a focused diff-to-show replacement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-focused-replace-feedback-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+    const comments = [
+      {
+        noteId: "focused-replace:1",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [7, 7],
+        body: "Collect before focused replacement",
+      },
+    ];
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      coordinator: runtime.coordinator,
+      reviewRun: commentReviewRun(root, () => comments),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.commands.get("hunk")?.("", runtime.ctx);
+
+    runtime.mounts[0]!.options.onShowRequest?.();
+    await vi.waitFor(() => expect(runtime.mounts).toHaveLength(2));
+
+    expect(runtime.sendUserMessage).toHaveBeenCalledOnce();
+    expect(runtime.sendUserMessage.mock.calls[0]?.[0]).toContain('"noteId": "focused-replace:1"');
+    expect(runtime.sendUserMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.mounts[0]!.component.dispose!).mock.invocationCallOrder[0]!,
+    );
+    expect(runtime.mounts[1]!.options.args).toEqual(["show"]);
+  });
+
+  it.each(["session_shutdown", "session_start"] as const)(
+    "preserves comments before %s tears down a surviving surface",
+    async (eventName) => {
+      const root = await mkdtemp(join(tmpdir(), `pi-hunk-${eventName}-feedback-`));
+      temporaryDirectories.push(root);
+      process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+      await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+      const comments = [
+        {
+          noteId: `${eventName}:1`,
+          source: "user",
+          filePath: "src/a.ts",
+          newRange: [8, 8],
+          body: `Collect before ${eventName}`,
+        },
+      ];
+      const runtime = harness(root);
+      hunkExtension(runtime.pi, {
+        store: new ConfigStore(),
+        coordinator: runtime.coordinator,
+        reviewRun: commentReviewRun(root, () => comments),
+      });
+      await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+      await runtime.commands.get("hunk")?.("", runtime.ctx);
+
+      await runtime.events.get(eventName)?.({ type: eventName }, runtime.ctx);
+
+      expect(runtime.sendUserMessage).toHaveBeenCalledOnce();
+      expect(runtime.sendUserMessage.mock.calls[0]?.[0]).toContain(`"noteId": "${eventName}:1"`);
+      expect(runtime.mounts[0]!.component.dispose).toHaveBeenCalledOnce();
+      expect(runtime.sendUserMessage.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(runtime.mounts[0]!.component.dispose!).mock.invocationCallOrder[0]!,
+      );
+      expect(runtime.coordinator.getActiveInfo()).toBeNull();
+    },
+  );
+
+  it("best-effort preserves comments during natural child exit before owned removal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-hunk-natural-exit-feedback-"));
+    temporaryDirectories.push(root);
+    process.env.PI_HUNK_CONFIG = join(root, "hunk.json");
+    await writeFile(process.env.PI_HUNK_CONFIG, JSON.stringify({ review: "after-run" }));
+    const comments = [
+      {
+        noteId: "exit:1",
+        source: "user",
+        filePath: "src/a.ts",
+        newRange: [9, 9],
+        body: "Collect after child exit",
+      },
+    ];
+    const runtime = harness(root);
+    hunkExtension(runtime.pi, {
+      store: new ConfigStore(),
+      coordinator: runtime.coordinator,
+      reviewRun: commentReviewRun(root, () => comments),
+    });
+    await runtime.events.get("session_start")?.({ type: "session_start" }, runtime.ctx);
+    await runtime.commands.get("hunk")?.("", runtime.ctx);
+
+    runtime.mounts[0]!.options.done({ exitCode: 0 });
+    await vi.waitFor(() => expect(runtime.coordinator.getActiveInfo()).toBeNull());
+
+    expect(runtime.sendUserMessage).toHaveBeenCalledOnce();
+    expect(runtime.sendUserMessage.mock.calls[0]?.[0]).toContain('"noteId": "exit:1"');
+    expect(runtime.sendUserMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.mounts[0]!.component.dispose!).mock.invocationCallOrder[0]!,
     );
   });
 

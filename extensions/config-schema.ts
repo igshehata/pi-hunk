@@ -81,7 +81,8 @@ export const DEFAULT_BINDINGS_CONFIG: BindingsConfig = {
 };
 
 export const DEFAULT_CONFIG: HunkConfig = {
-  review: "after-run",
+  // Manual review only until the user opts into automatic open.
+  review: "off",
   followEdits: true,
   hunk: {
     command: "hunk",
@@ -99,7 +100,8 @@ export function isReviewPolicy(value: string): value is ReviewPolicy {
   return value === "off" || value === "after-run" || value === "live";
 }
 
-const BINDING_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
+const BINDING_MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"] as const;
+const BINDING_MODIFIERS = new Set<string>(BINDING_MODIFIER_ORDER);
 const BINDING_SPECIAL_KEYS = new Set([
   "escape",
   "esc",
@@ -133,7 +135,9 @@ const BINDING_SYMBOL_KEYS = new Set("`-=[]\\;',./!@#$%^&*()_+|~{}:<>?");
  * be swallowed by the focused Hunk overlay. Function keys, insert, and clear
  * may be bare; everything else needs ctrl, alt, or super.
  */
-function parseBinding(value: unknown): { base: string; modifiers: string[] } | undefined {
+function parseBinding(
+  value: unknown,
+): { base: string; modifiers: string[]; identity: string } | undefined {
   if (typeof value !== "string" || value.length === 0) return undefined;
 
   let base: string;
@@ -154,7 +158,26 @@ function parseBinding(value: unknown): { base: string; modifiers: string[] } | u
   if (new Set(modifiers).size !== modifiers.length) return undefined;
   const printable = /^[a-z0-9]$/.test(base) || BINDING_SYMBOL_KEYS.has(base);
   if (!printable && !BINDING_SPECIAL_KEYS.has(base)) return undefined;
-  return { base, modifiers };
+
+  // pi-tui treats modifier order as irrelevant and exposes two names for
+  // Escape and Enter. Use one identity for collision checks without rewriting
+  // the user's valid spelling in persisted config.
+  if (base === "esc") base = "escape";
+  else if (base === "return") base = "enter";
+  if (base === "escape" && modifiers.length > 0) return undefined;
+  modifiers = BINDING_MODIFIER_ORDER.filter((modifier) => modifiers.includes(modifier));
+  const identity = modifiers.length > 0 ? `${modifiers.join("+")}+${base}` : base;
+  return { base, modifiers, identity };
+}
+
+/** Canonical terminal-key identity used for safe Hunk chord comparisons. */
+export function bindingIdentity(value: unknown): string | undefined {
+  return parseBinding(value)?.identity;
+}
+
+function bindingsAreDistinct(bindings: BindingsConfig): boolean {
+  const identities = Object.values(bindings).map(bindingIdentity);
+  return identities.every((identity) => identity !== undefined) && new Set(identities).size === 3;
 }
 
 export function isPrefixBinding(value: unknown): value is KeyId {
@@ -210,7 +233,7 @@ export function applyConfig(base: HunkConfig, input: unknown): HunkConfig {
       const value = input.bindings[action];
       if (isHotkeyBinding(value)) next.bindings[action] = value as KeyId;
     }
-    if (new Set(Object.values(next.bindings)).size !== 3) {
+    if (!bindingsAreDistinct(next.bindings)) {
       next.bindings = { ...base.bindings };
     }
   }

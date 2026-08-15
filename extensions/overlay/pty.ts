@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { accessSync, constants as fsConstants, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync, statSync } from "node:fs";
 import { delimiter, extname, isAbsolute, resolve } from "node:path";
 import { hasNative, spawn } from "zigpty";
 
@@ -52,7 +52,7 @@ interface ZigPtyBackend {
 const backend: ZigPtyBackend = { hasNative, spawn };
 const DEFAULT_SHUTDOWN_GRACE_MS = 500;
 // forkpty children briefly inherit the parent's group before setsid/login_tty.
-// Keep the window short, but wide enough for loaded CI hosts and slow `ps`.
+// Keep the window short, but wide enough for loaded CI hosts and process probes.
 const PROCESS_GROUP_CAPTURE_ATTEMPTS = 8;
 const PROCESS_GROUP_CAPTURE_RETRY_MS = 5;
 const PROCESS_GROUP_PROBE_TIMEOUT_MS = 100;
@@ -200,9 +200,54 @@ function preflightOverlaySpawn(options: SpawnPtyOptions): void {
   throw startupFailure(`command ${JSON.stringify(command)} was not found on child PATH.`);
 }
 
-function observePosixProcess(pid: number): PosixProcessObservation | undefined {
+function validPosixProcessObservation(
+  parentProcessId: number,
+  processGroupId: number,
+): PosixProcessObservation | undefined {
+  if (
+    !Number.isInteger(parentProcessId) ||
+    parentProcessId <= 0 ||
+    !Number.isInteger(processGroupId) ||
+    processGroupId <= 0
+  ) {
+    return undefined;
+  }
+  return { parentProcessId, processGroupId };
+}
+
+/**
+ * Linux exposes ppid/pgrp without an external executable. Besides working in
+ * minimal images without ps, this avoids process-spawn latency for leaders that
+ * exit soon after forkpty returns. The final `)` is the only stable separator:
+ * Linux comm values may contain spaces and closing parentheses.
+ */
+function observeLinuxProcProcess(pid: number): PosixProcessObservation | undefined {
   try {
-    const result = spawnSync("ps", ["-o", "ppid=,pgid=", "-p", String(pid)], {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return undefined;
+    // Fields after comm are: state (3), ppid (4), pgrp (5), ...
+    const fields = stat
+      .slice(commandEnd + 1)
+      .trim()
+      .split(/\s+/);
+    if (fields.length < 3) return undefined;
+    return validPosixProcessObservation(Number(fields[1]), Number(fields[2]));
+  } catch {
+    return undefined;
+  }
+}
+
+function observePosixProcess(pid: number): PosixProcessObservation | undefined {
+  if (process.platform === "linux") {
+    const procObservation = observeLinuxProcProcess(pid);
+    if (procObservation) return procObservation;
+  }
+
+  try {
+    // Supported targets install ps at /bin/ps. Do not depend on Pi's PATH:
+    // child launch configuration or minimal parent environments may omit it.
+    const result = spawnSync("/bin/ps", ["-o", "ppid=,pgid=", "-p", String(pid)], {
       encoding: "utf8",
       timeout: PROCESS_GROUP_PROBE_TIMEOUT_MS,
       killSignal: "SIGKILL",
@@ -210,17 +255,7 @@ function observePosixProcess(pid: number): PosixProcessObservation | undefined {
     if (result.status !== 0) return undefined;
     const fields = result.stdout.trim().split(/\s+/);
     if (fields.length !== 2) return undefined;
-    const parentProcessId = Number(fields[0]);
-    const processGroupId = Number(fields[1]);
-    if (
-      !Number.isInteger(parentProcessId) ||
-      parentProcessId <= 0 ||
-      !Number.isInteger(processGroupId) ||
-      processGroupId <= 0
-    ) {
-      return undefined;
-    }
-    return { parentProcessId, processGroupId };
+    return validPosixProcessObservation(Number(fields[0]), Number(fields[1]));
   } catch {
     return undefined;
   }
@@ -267,8 +302,9 @@ export function __captureOwnedPosixProcessGroupFromProbe(
       if (observation.processGroupId === pid) return pid;
       // Still our child, but still in the inherited group: retry.
     } else if (!isAlive(pid)) {
-      // Probe failure with a dead pid: stop. A live pid with a failed probe is
-      // treated as retryable (loaded hosts can time out `ps` transiently).
+      // Probe failure with a dead pid: stop. Inferring pgid === pid after the
+      // leader disappeared would authorize an unsafe blind negative-PID signal;
+      // there is no longer a parent/group observation that proves ownership.
       return undefined;
     }
 
@@ -452,11 +488,11 @@ export function spawnOverlayPty(
         // Process may have exited between the liveness check and the signal.
       }
     }
-    try {
-      pty.close?.();
-    } catch {
-      // Backend may already be closed.
-    }
+    // Do not call close() after signalling. zigpty's Unix exit callback destroys
+    // its ReadStream (which owns/closes the master fd) without setting the
+    // backend's private `_closed` flag; a later closeSync on that same fd emits
+    // a process warning and can race fd reuse. SIGKILL guarantees the owned
+    // leader/group exit callback will perform backend descriptor cleanup.
   };
 
   const armEscalation = () => {

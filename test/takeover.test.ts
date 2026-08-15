@@ -19,8 +19,11 @@ import { resolveOverlayHostMode } from "../extensions/config.ts";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  pty.onData.mockReturnValue({ dispose: vi.fn() });
-  pty.onExit.mockReturnValue({ dispose: vi.fn() });
+  pty.write.mockReset();
+  pty.resize.mockReset();
+  pty.dispose.mockReset();
+  pty.onData.mockReset().mockReturnValue({ dispose: vi.fn() });
+  pty.onExit.mockReset().mockReturnValue({ dispose: vi.fn() });
 });
 
 const HOST_STOP_MODES = "\x1b[?2004l\x1b[<u";
@@ -114,6 +117,40 @@ function countOutput(terminalWrite: ReturnType<typeof vi.fn>, sequence: string):
   return terminalWrite.mock.calls.flat().join("").split(sequence).length - 1;
 }
 
+function makeTerminalModeModel() {
+  const state = {
+    focus: false,
+    unicode: false,
+    colorNotifications: false,
+    modifyOtherKeys: 0,
+    keyboardStack: [] as number[],
+  };
+  return {
+    state,
+    observe(output: string): void {
+      const escape = String.fromCharCode(27);
+      const tokens = new RegExp(
+        `${escape}\\[\\?(1004|2027|2031)([hl])|${escape}\\[>4;(\\d+)m|${escape}\\[>(\\d+)u|${escape}\\[<u`,
+        "g",
+      );
+      for (const match of output.matchAll(tokens)) {
+        if (match[1]) {
+          const enabled = match[2] === "h";
+          if (match[1] === "1004") state.focus = enabled;
+          else if (match[1] === "2027") state.unicode = enabled;
+          else state.colorNotifications = enabled;
+        } else if (match[3]) {
+          state.modifyOtherKeys = Number.parseInt(match[3], 10);
+        } else if (match[4]) {
+          state.keyboardStack.push(Number.parseInt(match[4], 10));
+        } else {
+          state.keyboardStack.pop();
+        }
+      }
+    },
+  };
+}
+
 describe("TakeoverHunk", () => {
   it("publishes the first complete synchronized PTY frame and does not request Pi paints", () => {
     const { tui, terminalWrite, requestRender } = makeTui();
@@ -172,39 +209,155 @@ describe("TakeoverHunk", () => {
     component.dispose();
   });
 
-  it("forces a real resize transition and redraw when an unchanged takeover resumes", () => {
-    const { tui, terminalWrite } = makeTui();
-    const component = new TakeoverHunk({
-      command: "hunk",
-      args: ["diff"],
-      cwd: "/repo",
-      tui,
-      done: vi.fn(),
-    });
-    const onData = (
-      pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
-    )[0]![0];
+  it("holds the resize bounce until a complete Hunk frame redraws an unchanged resume", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui, terminalWrite } = makeTui();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done: vi.fn(),
+      });
+      const onData = (
+        pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+      )[0]![0];
 
-    onData(syncFrame("initial-frame"));
-    component.setVisible(false);
-    onData("discarded-while-hidden");
-    terminalWrite.mockClear();
-    pty.resize.mockClear();
-    pty.resize
-      .mockImplementationOnce(() => undefined)
-      .mockImplementationOnce(() => onData("fresh-frame"));
+      onData(syncFrame("initial-frame"));
+      component.setVisible(false);
+      onData("discarded-while-hidden");
+      terminalWrite.mockClear();
+      pty.resize.mockClear();
 
-    component.setVisible(true);
+      // Exact user regression: on -> off -> on. The old implementation issued
+      // both calls synchronously, allowing SIGWINCH to collapse at 80x24.
+      component.setVisible(true);
+      expect(pty.resize.mock.calls).toEqual([[80, 23]]);
+      expect(terminalWrite.mock.calls.flat().join("")).toContain("Restoring Hunk…");
 
-    expect(pty.resize.mock.calls).toEqual([
-      [80, 23],
-      [80, 24],
-    ]);
-    const resumedOutput = terminalWrite.mock.calls.flat().join("");
-    expect(resumedOutput).toContain("Restoring Hunk…");
-    expect(resumedOutput).toContain("fresh-frame");
-    expect(resumedOutput).not.toContain("discarded-while-hidden");
-    component.dispose();
+      // A complete frame queued while hidden must not immediately acknowledge
+      // the resize. The causal temporary-size frame supersedes it during the
+      // settle interval, including when DEC markers cross PTY chunks.
+      onData(syncFrame("stale-differential"));
+      vi.advanceTimersByTime(50);
+      expect(pty.resize.mock.calls).toEqual([[80, 23]]);
+      onData("\x1b[?2026hfresh-");
+      onData("frame\x1b[?2026l");
+      vi.advanceTimersByTime(99);
+      expect(pty.resize.mock.calls).toEqual([[80, 23]]);
+      vi.advanceTimersByTime(1);
+
+      expect(pty.resize.mock.calls).toEqual([
+        [80, 23],
+        [80, 24],
+      ]);
+      const resumedOutput = terminalWrite.mock.calls.flat().join("");
+      expect(resumedOutput).toContain("fresh-frame");
+      expect(resumedOutput).not.toContain("discarded-while-hidden");
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restores final geometry after a bounded fallback when no synchronized frame arrives", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui } = makeTui();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done: vi.fn(),
+      });
+      const onData = (
+        pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+      )[0]![0];
+      onData(syncFrame("initial-frame"));
+      component.setVisible(false);
+      pty.resize.mockClear();
+
+      component.setVisible(true);
+      expect(pty.resize.mock.calls).toEqual([[80, 23]]);
+      vi.advanceTimersByTime(999);
+      expect(pty.resize.mock.calls).toEqual([[80, 23]]);
+      vi.advanceTimersByTime(1);
+      expect(pty.resize.mock.calls).toEqual([
+        [80, 23],
+        [80, 24],
+      ]);
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restores temporary geometry when resume is hidden again before its redraw", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui } = makeTui();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done: vi.fn(),
+      });
+      const onData = (
+        pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+      )[0]![0];
+      onData(syncFrame("initial-frame"));
+      component.setVisible(false);
+      pty.resize.mockClear();
+
+      component.setVisible(true);
+      component.setVisible(false);
+      expect(pty.resize.mock.calls).toEqual([
+        [80, 23],
+        [80, 24],
+      ]);
+      vi.advanceTimersByTime(1_000);
+      expect(pty.resize).toHaveBeenCalledTimes(2);
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets a real terminal resize supersede a pending resume bounce", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui, terminal } = makeTui();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done: vi.fn(),
+      });
+      const onData = (
+        pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+      )[0]![0];
+      onData(syncFrame("initial-frame"));
+      component.setVisible(false);
+      pty.resize.mockClear();
+      component.setVisible(true);
+
+      terminal.columns = 100;
+      terminal.rows = 30;
+      tui.requestRender();
+      expect(pty.resize.mock.calls).toEqual([
+        [80, 23],
+        [100, 30],
+      ]);
+      vi.advanceTimersByTime(1_000);
+      expect(pty.resize).toHaveBeenCalledTimes(2);
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("restores final PTY geometry even if the temporary refresh resize fails", () => {
@@ -341,7 +494,9 @@ describe("TakeoverHunk", () => {
     // Replies can only be generated after the physical terminal receives the
     // corresponding requests, and must bypass Pi's parsed input path.
     raw.dispatch(replies);
-    expect(pty.write).toHaveBeenCalledWith(replies);
+    // Raw stdin is split into complete terminal events, but its byte stream is
+    // preserved exactly for Hunk.
+    expect(pty.write.mock.calls.map(([data]) => data).join("")).toBe(replies);
 
     onData(frame.slice(0, 6));
     expect(terminalWrite.mock.calls.flat().join("")).not.toContain("probe-echo-must-not-paint");
@@ -517,6 +672,167 @@ describe("TakeoverHunk", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("dispatches startup prefix+h/s through its real TUI listener without PTY leakage", () => {
+    const { tui, terminalWrite, listeners } = makeTui();
+    const raw = makeRawInputSource();
+    const onToggleRequest = vi.fn();
+    const onShowRequest = vi.fn();
+    const component = new TakeoverHunk({
+      command: "hunk",
+      args: ["diff"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+      rawInputSource: raw.source,
+      prefixKey: "ctrl+space",
+      toggleKey: "h",
+      onToggleRequest,
+      showKey: "s",
+      onShowRequest,
+    });
+    const onData = (
+      pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+    )[0]![0];
+    terminalWrite.mockClear();
+
+    const probes = "\x1b[>0q\x1b]1337;Capabilities\x1b\\";
+    onData(probes.slice(0, 5));
+    onData(probes.slice(5));
+    expect(terminalWrite.mock.calls.flat().join("")).toBe(probes);
+
+    // `:3F` resembles Pi TUI's Kitty-release heuristic; a structured reply
+    // must bypass key translation and remain intact.
+    const versionReply = "\x1bP>|Hunk-test:3F-terminal\x1b\\";
+    const capabilitiesReply = "\x1b]1337;Capabilities=unicode-placeholder\x1b\\";
+    raw.dispatch(versionReply + "\x00h");
+    raw.dispatch(capabilitiesReply + "\x1b[32;5us");
+
+    expect(listeners.size).toBe(1);
+    expect(onToggleRequest).toHaveBeenCalledOnce();
+    expect(onShowRequest).toHaveBeenCalledOnce();
+
+    // The post-negotiation TUI path uses the same listener and semantics.
+    onData(syncFrame("ready"));
+    const [listener] = [...listeners];
+    listener!("\x00");
+    listener!("h");
+    listener!("\x1b[32;5u");
+    listener!("s");
+    expect(onToggleRequest).toHaveBeenCalledTimes(2);
+    expect(onShowRequest).toHaveBeenCalledTimes(2);
+
+    const childInput = pty.write.mock.calls.map(([data]) => data).join("");
+    expect(childInput).toBe(versionReply + capabilitiesReply);
+    expect(childInput).not.toContain("\x00");
+    expect(childInput).not.toContain("\x1b[32;5u");
+    component.dispose();
+  });
+
+  it("reassembles non-BMP text split by Pi's real input-listener path", () => {
+    const { tui, listeners } = makeTui();
+    const component = new TakeoverHunk({
+      command: "hunk",
+      args: ["diff"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+    });
+    const [listener] = [...listeners];
+    const emoji = "😀";
+
+    listener!(emoji[0]!);
+    expect(pty.write).not.toHaveBeenCalled();
+    listener!(emoji[1]!);
+
+    expect(pty.write).toHaveBeenCalledOnce();
+    expect(pty.write).toHaveBeenCalledWith(emoji);
+    component.dispose();
+  });
+
+  it("passes bounded pre-frame child stderr/output as exit detail", () => {
+    const { tui } = makeTui();
+    const done = vi.fn();
+    const component = new TakeoverHunk({
+      command: "hunk",
+      args: ["diff"],
+      cwd: "/repo",
+      tui,
+      done,
+    });
+    const onData = (
+      pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+    )[0]![0];
+
+    onData("\x1b]10;?\x07fatal: repository unavailable\r\nretry with --repo /repo\r\n");
+    exitListener()({ exitCode: 2, signal: 0 });
+
+    expect(done).toHaveBeenCalledWith({
+      exitCode: 2,
+      signal: 0,
+      detail: "fatal: repository unavailable\nretry with --repo /repo",
+    });
+    component.dispose();
+  });
+
+  it("restores child keyboard/focus modes after hide, show, and close", () => {
+    const { tui, terminalWrite } = makeTui();
+    const modes = makeTerminalModeModel();
+    modes.observe(HOST_START_MODES);
+    let observedLength = 0;
+    const observeWrites = (): void => {
+      const output = terminalWrite.mock.calls.flat().join("");
+      modes.observe(output.slice(observedLength));
+      observedLength = output.length;
+    };
+    const component = new TakeoverHunk({
+      command: "hunk",
+      args: ["diff"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+    });
+    const onData = (
+      pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+    )[0]![0];
+    const childModes = "\x1b[?1004h\x1b[?2027h\x1b[?2031h\x1b[>4;1m\x1b[>5u";
+
+    onData(syncFrame(childModes + "ready"));
+    observeWrites();
+    expect(modes.state).toMatchObject({
+      focus: true,
+      unicode: true,
+      colorNotifications: true,
+      modifyOtherKeys: 1,
+      keyboardStack: [7, 5],
+    });
+
+    component.setVisible(false);
+    observeWrites();
+    expect(modes.state).toEqual({
+      focus: false,
+      unicode: false,
+      colorNotifications: false,
+      modifyOtherKeys: 0,
+      keyboardStack: [7],
+    });
+
+    component.setVisible(true);
+    onData(syncFrame(childModes + "resumed"));
+    observeWrites();
+    expect(modes.state.focus).toBe(true);
+    expect(modes.state.modifyOtherKeys).toBe(1);
+
+    component.dispose();
+    observeWrites();
+    expect(modes.state).toEqual({
+      focus: false,
+      unicode: false,
+      colorNotifications: false,
+      modifyOtherKeys: 0,
+      keyboardStack: [7],
+    });
   });
 
   it("captures outside mouse release per takeover lease and resets it when suspended", () => {

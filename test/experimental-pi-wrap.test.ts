@@ -64,7 +64,7 @@ function fakeTui() {
 describe("experimental Pi split wrapping", () => {
   it("narrows Pi beside a right split without recursively invalidating the TUI", () => {
     const { tui, render, invalidate, requestRender } = fakeTui();
-    const controller = installExperimentalPiWrap(tui, "right", true)!;
+    const controller = installExperimentalPiWrap(tui, "right")!;
 
     expect(tui.render(100)).toEqual(["pi:50"]);
     expect(render).toHaveBeenLastCalledWith(50);
@@ -89,11 +89,26 @@ describe("experimental Pi split wrapping", () => {
 
   it("pads narrowed Pi to the right of a left split", () => {
     const { tui } = fakeTui();
-    const controller = installExperimentalPiWrap(tui, "left", true)!;
+    const controller = installExperimentalPiWrap(tui, "left")!;
 
     expect(tui.render(100)).toEqual([`${" ".repeat(50)}pi:50`]);
     controller.dispose();
     expect(tui.render(100)).toEqual(["pi:100"]);
+  });
+
+  it("does not overwrite a renderer wrapper installed after Pi-hunk", () => {
+    const { tui } = fakeTui();
+    const controller = installExperimentalPiWrap(tui, "right")!;
+    const hunkRender = tui.render;
+    const laterWrapper: TUI["render"] = function laterRender(width: number): string[] {
+      return hunkRender.call(tui, width).map((line) => `later:${line}`);
+    };
+    tui.render = laterWrapper;
+
+    controller.dispose();
+
+    expect(tui.render).toBe(laterWrapper);
+    expect(tui.render(100)).toEqual(["later:pi:100"]);
   });
 
   it("reflows and redraws through the real Pi TUI overlay pipeline", async () => {
@@ -110,7 +125,7 @@ describe("experimental Pi split wrapping", () => {
 
     const redrawsBeforeSplit = tui.fullRedraws;
     terminal.clearWrites();
-    const controller = installExperimentalPiWrap(tui, "right", true)!;
+    const controller = installExperimentalPiWrap(tui, "right")!;
     await waitForRender();
     expect(base.widths.at(-1)).toBe(40);
     expect(overlay.widths.at(-1)).toBe(40);
@@ -159,18 +174,26 @@ describe("experimental Pi split wrapping", () => {
       throw new Error("render scheduling failed");
     });
 
-    expect(() => installExperimentalPiWrap(tui, "right", true)).toThrow("render scheduling failed");
+    expect(() => installExperimentalPiWrap(tui, "right")).toThrow("render scheduling failed");
     expect(tui.render).toBe(originalRender);
     expect(tui.render(100)).toEqual(["pi:100"]);
   });
 
-  it("does nothing for non-split layouts or when disabled", () => {
-    const { tui } = fakeTui();
-    const originalRender = tui.render;
+  it("derives wrapping strictly from layout", () => {
+    for (const layout of ["full", "float"] as const) {
+      const { tui } = fakeTui();
+      const originalRender = tui.render;
+      expect(installExperimentalPiWrap(tui, layout)).toBeUndefined();
+      expect(tui.render).toBe(originalRender);
+    }
 
-    expect(installExperimentalPiWrap(tui, "full")).toBeUndefined();
-    expect(installExperimentalPiWrap(tui, "float")).toBeUndefined();
-    expect(installExperimentalPiWrap(tui, "right", false)).toBeUndefined();
-    expect(tui.render).toBe(originalRender);
+    for (const layout of ["left", "right"] as const) {
+      const { tui } = fakeTui();
+      const originalRender = tui.render;
+      const controller = installExperimentalPiWrap(tui, layout);
+      expect(controller).toBeDefined();
+      expect(tui.render).not.toBe(originalRender);
+      controller?.dispose();
+    }
   });
 });

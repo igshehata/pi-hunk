@@ -12,7 +12,9 @@ const MUTATING_SHELL =
   /(?:^|[;&|\n])\s*(?:apply_patch\b|git\s+apply\b|jj\s+(?:abandon|commit|describe|duplicate|edit|new|rebase|restore|squash|undo)\b|sl\s+(?:amend|commit|goto|rebase|revert)\b|sed\s+-i\b|perl\s+-pi\b|tee\b|mv\b|cp\b|rm\b|touch\b|mkdir\b|truncate\b|npm\s+(?:install|uninstall|update)\b|(?:cat|echo|printf)\b[^;&|]*>)/i;
 const PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
 /** Recognized interactive/login shells whose `-c` payload may hide mutations. */
-const NESTED_SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash"]);
+const NESTED_SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh"]);
+const COMMAND_PREFIX_WORDS = new Set(["!", "(", "{", "then", "do", "else", "elif"]);
+const SIMPLE_COMMAND_WRAPPERS = new Set(["command", "exec", "nohup", "setsid"]);
 /** Bound pathological nesting / command-substitution style chains. */
 const MAX_NESTED_SHELL_DEPTH = 4;
 const MAX_ENV_SPLIT_EXPANSIONS = 4;
@@ -42,7 +44,9 @@ function shellCommandLooksMutating(command: string, depth = 0): boolean {
   if (depth > MAX_NESTED_SHELL_DEPTH || command.length > MAX_SHELL_COMMAND_LENGTH) {
     return true;
   }
-  if (MUTATING_SHELL.test(maskQuotedShellText(command))) return true;
+  const masked = maskQuotedShellText(command);
+  if (MUTATING_SHELL.test(masked) || hasFileOutputRedirection(masked)) return true;
+  if (commandSubstitutionsLookMutating(command, depth)) return true;
 
   for (const segment of splitSimpleShellCommands(command)) {
     const extracted = extractNestedShellPayload(segment);
@@ -52,6 +56,114 @@ function shellCommandLooksMutating(command: string, depth = 0): boolean {
     }
   }
   return false;
+}
+
+/** Any non-FD output redirection can create or truncate a filesystem entry. */
+function hasFileOutputRedirection(maskedCommand: string): boolean {
+  for (let i = 0; i < maskedCommand.length; i += 1) {
+    if (maskedCommand[i] !== ">") continue;
+    const previous = maskedCommand[i - 1];
+    if (previous === "<" || previous === ">") continue;
+
+    let end = i + 1;
+    if (maskedCommand[end] === ">" || maskedCommand[end] === "|") end += 1;
+    while (maskedCommand[end] === " " || maskedCommand[end] === "\t") end += 1;
+    // `2>&1` duplicates descriptors and `>(...)` is process substitution;
+    // neither names an output file at this grammar level.
+    if (maskedCommand[end] === "&" || maskedCommand[end] === "(") continue;
+    return true;
+  }
+  return false;
+}
+
+/** Inspect executable command/process substitutions while leaving quoted prose masked. */
+function commandSubstitutionsLookMutating(command: string, depth: number): boolean {
+  let quote: "'" | '"' | undefined;
+  let escaping = false;
+
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i]!;
+    if (escaping) {
+      escaping = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if (char === "'" && quote !== '"') {
+      quote = quote === "'" ? undefined : "'";
+      continue;
+    }
+    if (char === '"' && quote !== "'") {
+      quote = quote === '"' ? undefined : '"';
+      continue;
+    }
+    if (quote === "'") continue;
+
+    if ((char === "$" || char === "<" || char === ">") && command[i + 1] === "(") {
+      const substitution = readParenthesizedShell(command, i + 2);
+      if (substitution === "ambiguous") return true;
+      if (shellCommandLooksMutating(substitution.value, depth + 1)) return true;
+      i = substitution.end;
+      continue;
+    }
+    if (char === "`") {
+      let end = i + 1;
+      let backtickEscape = false;
+      for (; end < command.length; end += 1) {
+        const nested = command[end]!;
+        if (backtickEscape) {
+          backtickEscape = false;
+          continue;
+        }
+        if (nested === "\\") {
+          backtickEscape = true;
+          continue;
+        }
+        if (nested === "`") break;
+      }
+      if (end >= command.length) return true;
+      if (shellCommandLooksMutating(command.slice(i + 1, end), depth + 1)) return true;
+      i = end;
+    }
+  }
+  return false;
+}
+
+function readParenthesizedShell(
+  command: string,
+  start: number,
+): { value: string; end: number } | "ambiguous" {
+  let nesting = 1;
+  let quote: "'" | '"' | undefined;
+  let escaping = false;
+  for (let i = start; i < command.length; i += 1) {
+    const char = command[i]!;
+    if (escaping) {
+      escaping = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if (char === "'" && quote !== '"') {
+      quote = quote === "'" ? undefined : "'";
+      continue;
+    }
+    if (char === '"' && quote !== "'") {
+      quote = quote === '"' ? undefined : '"';
+      continue;
+    }
+    if (quote) continue;
+    if (char === "(") nesting += 1;
+    else if (char === ")") {
+      nesting -= 1;
+      if (nesting === 0) return { value: command.slice(start, i), end: i };
+    }
+  }
+  return "ambiguous";
 }
 
 /** Preserve shell operators and command names while removing quoted data. */
@@ -261,23 +373,47 @@ function isEnvironmentAssignment(word: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
 }
 
-function directCommandLooksMutating(words: ShellWord[], commandIndex: number): boolean {
-  const command = commandBasename(words[commandIndex]!.value);
+function directCommandLooksMutating(
+  words: ShellWord[],
+  commandIndex: number,
+  wrapperDepth = 0,
+): boolean | "ambiguous" {
+  if (wrapperDepth > MAX_NESTED_SHELL_DEPTH || commandIndex >= words.length) return "ambiguous";
+
+  while (COMMAND_PREFIX_WORDS.has(words[commandIndex]?.value ?? "")) commandIndex += 1;
+  if (commandIndex >= words.length) return false;
+
+  const rawCommand = words[commandIndex]!.value.replace(/^[({!]+/, "");
+  if (!rawCommand) return "ambiguous";
+  if (/[$`]/.test(rawCommand)) return "ambiguous";
+  const command = commandBasename(rawCommand);
   const args = words.slice(commandIndex + 1).map((word) => word.value);
+
+  if (isNestedShellName(rawCommand)) {
+    return nestedShellWordsLookMutating(words, commandIndex + 1, wrapperDepth);
+  }
 
   if (
     command === "apply_patch" ||
+    command === "patch" ||
     command === "tee" ||
     command === "mv" ||
     command === "cp" ||
     command === "rm" ||
     command === "touch" ||
     command === "mkdir" ||
-    command === "truncate"
+    command === "truncate" ||
+    command === "install" ||
+    command === "ln" ||
+    command === "chmod" ||
+    command === "chown" ||
+    command === "chgrp"
   ) {
     return true;
   }
-  if (command === "git") return args[0] === "apply";
+  if (command === "git") {
+    return new Set(["apply", "checkout", "mv", "restore", "rm"]).has(args[0] ?? "");
+  }
   if (command === "jj") {
     return new Set([
       "abandon",
@@ -298,7 +434,245 @@ function directCommandLooksMutating(words: ShellWord[], commandIndex: number): b
   if (command === "sed") return args[0] === "-i" || args[0]?.startsWith("-i") === true;
   if (command === "perl") return args[0]?.startsWith("-pi") === true;
   if (command === "npm") return ["install", "uninstall", "update"].includes(args[0] ?? "");
+
+  if (command === "eval") {
+    if (args.length === 0) return false;
+    const payload = args.join(" ");
+    return /[$`]/.test(payload) || shellCommandLooksMutating(payload, wrapperDepth + 1);
+  }
+  if (command === "source" || command === ".") return "ambiguous";
+
+  if (SIMPLE_COMMAND_WRAPPERS.has(command)) {
+    let nested = commandIndex + 1;
+    if (command === "command" && ["-v", "-V"].includes(words[nested]?.value ?? "")) return false;
+    while (nested < words.length && words[nested]!.value.startsWith("-")) {
+      const option = words[nested]!.value;
+      nested += 1;
+      if (command === "exec" && option === "-a") {
+        if (nested >= words.length) return "ambiguous";
+        nested += 1;
+      }
+      if (option === "--") break;
+    }
+    return directCommandLooksMutating(words, nested, wrapperDepth + 1);
+  }
+
+  if (command === "sudo" || command === "doas") {
+    const nested = commandAfterPrivilegeWrapper(words, commandIndex + 1, command);
+    return nested === "ambiguous"
+      ? "ambiguous"
+      : directCommandLooksMutating(words, nested, wrapperDepth + 1);
+  }
+
+  if (command === "nice") {
+    let nested = commandIndex + 1;
+    if (words[nested]?.value === "-n" || words[nested]?.value === "--adjustment") nested += 2;
+    else if (/^(?:-[0-9]+|--adjustment=)/.test(words[nested]?.value ?? "")) nested += 1;
+    return directCommandLooksMutating(words, nested, wrapperDepth + 1);
+  }
+
+  if (command === "timeout") {
+    let nested = commandIndex + 1;
+    while (nested < words.length && words[nested]!.value.startsWith("-")) {
+      const option = words[nested]!.value;
+      nested += 1;
+      if (["-k", "--kill-after", "-s", "--signal"].includes(option)) nested += 1;
+      if (nested > words.length) return "ambiguous";
+    }
+    // The first positional argument is timeout's duration.
+    if (nested >= words.length) return "ambiguous";
+    return directCommandLooksMutating(words, nested + 1, wrapperDepth + 1);
+  }
+
+  if (command === "xargs") {
+    const nested = commandAfterXargsOptions(words, commandIndex + 1);
+    // xargs defaults to `echo` when no command is supplied.
+    return nested === undefined
+      ? false
+      : nested === "ambiguous"
+        ? "ambiguous"
+        : directCommandLooksMutating(words, nested, wrapperDepth + 1);
+  }
+
+  if (command === "find") {
+    if (args.includes("-delete")) return true;
+    const execIndex = words.findIndex(
+      (word, index) =>
+        index > commandIndex && ["-exec", "-execdir", "-ok", "-okdir"].includes(word.value),
+    );
+    return execIndex === -1
+      ? false
+      : directCommandLooksMutating(words, execIndex + 1, wrapperDepth + 1);
+  }
+
+  if (command === "dd") return args.some((arg) => arg.startsWith("of="));
+
   return false;
+}
+
+function nestedShellWordsLookMutating(
+  words: ShellWord[],
+  start: number,
+  depth: number,
+): boolean | "ambiguous" {
+  let i = start;
+  while (i < words.length) {
+    const word = words[i]!.value;
+    if (word === "--") return false;
+    if (!word.startsWith("-") || word === "-") return false;
+    if (word.startsWith("--")) {
+      const [flag] = word.split("=", 1);
+      i += 1;
+      if (SHELL_VALUE_LONG_FLAGS.has(flag!) && !word.includes("=")) {
+        if (i >= words.length) return "ambiguous";
+        i += 1;
+      }
+      continue;
+    }
+    const flags = word.slice(1);
+    if (flags.includes("c")) {
+      i += 1;
+      if (i >= words.length) return "ambiguous";
+      const payload = words[i]!.value;
+      // A runtime-generated command string cannot be classified from argv.
+      if (/^\s*(?:\$|`)/.test(payload)) return "ambiguous";
+      return shellCommandLooksMutating(payload, depth + 1);
+    }
+    const valueFlagIndex = [...flags].findIndex((flag) => flag === "o" || flag === "O");
+    i += 1;
+    if (valueFlagIndex >= 0 && valueFlagIndex === flags.length - 1) {
+      if (i >= words.length) return "ambiguous";
+      i += 1;
+    }
+  }
+  return false;
+}
+
+function commandAfterPrivilegeWrapper(
+  words: ShellWord[],
+  start: number,
+  wrapper: "sudo" | "doas",
+): number | "ambiguous" {
+  const valueOptions =
+    wrapper === "sudo"
+      ? new Set([
+          "-C",
+          "-D",
+          "-R",
+          "-T",
+          "-g",
+          "-h",
+          "-p",
+          "-r",
+          "-t",
+          "-u",
+          "--chdir",
+          "--chroot",
+          "--close-from",
+          "--command-timeout",
+          "--group",
+          "--host",
+          "--other-user",
+          "--prompt",
+          "--role",
+          "--type",
+          "--user",
+        ])
+      : new Set(["-C", "-u"]);
+  const noValueOptions =
+    wrapper === "sudo"
+      ? new Set([
+          "-A",
+          "-E",
+          "-H",
+          "-K",
+          "-S",
+          "-V",
+          "-b",
+          "-e",
+          "-k",
+          "-l",
+          "-n",
+          "-s",
+          "-v",
+          "--askpass",
+          "--background",
+          "--edit",
+          "--help",
+          "--list",
+          "--login",
+          "--non-interactive",
+          "--preserve-env",
+          "--remove-timestamp",
+          "--reset-timestamp",
+          "--set-home",
+          "--shell",
+          "--stdin",
+          "--validate",
+          "--version",
+        ])
+      : new Set(["-L", "-n", "-s"]);
+  let i = start;
+  while (i < words.length) {
+    const word = words[i]!.value;
+    if (word === "--") return i + 1;
+    if (isEnvironmentAssignment(word)) {
+      i += 1;
+      continue;
+    }
+    if (!word.startsWith("-") || word === "-") return i;
+    const option = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
+    if (valueOptions.has(option)) {
+      i += word.includes("=") ? 1 : 2;
+      if (i > words.length) return "ambiguous";
+      continue;
+    }
+    if (noValueOptions.has(option)) {
+      i += 1;
+      continue;
+    }
+    // Unknown options can change which following word is the utility.
+    return "ambiguous";
+  }
+  return "ambiguous";
+}
+
+function commandAfterXargsOptions(
+  words: ShellWord[],
+  start: number,
+): number | "ambiguous" | undefined {
+  const valueOptions = new Set([
+    "-a",
+    "--arg-file",
+    "-d",
+    "--delimiter",
+    "-E",
+    "--eof",
+    "-I",
+    "--replace",
+    "-L",
+    "--max-lines",
+    "-n",
+    "--max-args",
+    "-P",
+    "--max-procs",
+    "-s",
+    "--max-chars",
+  ]);
+  let i = start;
+  while (i < words.length) {
+    const word = words[i]!.value;
+    if (word === "--") return i + 1 < words.length ? i + 1 : undefined;
+    if (!word.startsWith("-") || word === "-") return i;
+    const equals = word.indexOf("=");
+    const option = equals === -1 ? word : word.slice(0, equals);
+    i += 1;
+    if (valueOptions.has(option) && equals === -1) {
+      if (i >= words.length) return "ambiguous";
+      i += 1;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -315,7 +689,6 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
 
   let i = 0;
   let envSplitExpansions = 0;
-  let hadEnvSplit = false;
   while (i < words.length && isEnvironmentAssignment(words[i]!.value)) i += 1;
 
   // Peel one or more `env` prefixes and their assignments/flags. GNU env's
@@ -348,7 +721,6 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
           const value = consumesNextWord ? words[i + 1]!.value : word.slice(equalsIndex + 1);
           const split = tokenizeEnvSplitString(value);
           envSplitExpansions += 1;
-          hadEnvSplit = true;
           if (
             split === "ambiguous" ||
             envSplitExpansions > MAX_ENV_SPLIT_EXPANSIONS ||
@@ -379,7 +751,6 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
           const value = consumesNextWord ? words[i + 1]!.value : attachedValue;
           const split = tokenizeEnvSplitString(value);
           envSplitExpansions += 1;
-          hadEnvSplit = true;
           if (
             split === "ambiguous" ||
             envSplitExpansions > MAX_ENV_SPLIT_EXPANSIONS ||
@@ -405,8 +776,14 @@ function extractNestedShellPayload(segment: string): string | "ambiguous" | "mut
   }
 
   if (i >= words.length) return undefined;
+  while (i < words.length && COMMAND_PREFIX_WORDS.has(words[i]!.value)) i += 1;
+  if (i >= words.length) return undefined;
+
+  const direct = directCommandLooksMutating(words, i);
+  if (direct === "ambiguous") return "ambiguous";
+  if (direct) return "mutating";
+
   if (!isNestedShellName(words[i]!.value)) {
-    if (hadEnvSplit && directCommandLooksMutating(words, i)) return "mutating";
     const start = words[i]!.start;
     const peeled = start >= 0 ? segment.slice(start) : "";
     return MUTATING_SHELL.test(maskQuotedShellText(peeled)) ? "mutating" : undefined;
@@ -471,6 +848,11 @@ export function mutationTargetPaths(args: unknown, cwd?: string): string[] {
   const paths: string[] = [];
   const seen = new Set<string>();
   for (const rawPath of rawPaths) {
+    if (rawPath.length === 0)
+      throw new Error("Invalid mutation target: the path must not be empty.");
+    if (rawPath.includes("\0")) {
+      throw new Error("Invalid mutation target: NUL bytes are not allowed.");
+    }
     const path = cwd === undefined ? rawPath : normalizeCandidatePath(rawPath, cwd);
     const key = cwd === undefined ? path : resolve(path);
     if (seen.has(key)) continue;
@@ -496,7 +878,9 @@ export function toWorkspaceRelative(path: string, cwd: string): string {
 function collectPaths(record: Record<string, unknown>, paths: string[]): void {
   for (const key of PATH_KEYS) {
     const value = record[key];
-    if (typeof value === "string" && value.trim()) paths.push(value.trim());
+    // Whitespace is legal in a filesystem name, including at both boundaries.
+    // Empty strings and NUL bytes are rejected by the normalization pass.
+    if (typeof value === "string") paths.push(value);
   }
 }
 

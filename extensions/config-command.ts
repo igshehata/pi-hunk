@@ -1,7 +1,9 @@
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, parseKey, truncateToWidth, type KeyId } from "@earendil-works/pi-tui";
 import {
+  bindingIdentity,
   cloneConfig,
+  globalConfigPath,
   isOverlayLayout,
   isPrefixBinding,
   isHotkeyBinding,
@@ -39,14 +41,16 @@ export function reportPersistedReviewPolicy(
   savedReview: HunkConfig["review"],
 ): void {
   const effective = store.get().review;
+  const path = globalConfigPath();
   if (effective !== savedReview) {
+    const source = process.env.PI_HUNK_REVIEW ? "PI_HUNK_REVIEW" : "a session override";
     ctx.ui.notify(
-      `Hunk review=${savedReview} was saved to .pi/hunk.json, but PI_HUNK_REVIEW keeps review=${effective}.`,
+      `Hunk review=${savedReview} was saved to ${path}, but ${source} keeps review=${effective}.`,
       "warning",
     );
     return;
   }
-  ctx.ui.notify(`Hunk review set to ${savedReview} in .pi/hunk.json.`, "info");
+  ctx.ui.notify(`Hunk review set to ${savedReview} in ${path}.`, "info");
 }
 
 /** Convert one raw terminal keypress into a safe Pi shortcut identifier. */
@@ -92,12 +96,15 @@ async function captureBinding(
         }
         const binding =
           kind === "prefix" ? prefixBindingFromInput(data) : hotkeyBindingFromInput(data);
-        if (binding && !unavailable.includes(binding)) {
+        const collides =
+          binding !== undefined &&
+          unavailable.some((candidate) => bindingIdentity(candidate) === bindingIdentity(binding));
+        if (binding && !collides) {
           done(binding);
           return;
         }
         warning =
-          binding && unavailable.includes(binding)
+          binding && collides
             ? `That key is already assigned in the Hunk chord (${binding}).`
             : kind === "prefix"
               ? "That key would interfere with normal typing. Press a modified shortcut or a function key."
@@ -132,8 +139,8 @@ function buildPatch(before: HunkConfig, after: HunkConfig): Record<string, unkno
   return patch;
 }
 
-/** Persist one UI change immediately. Configuration UI is project-only for now. */
-async function persistProjectChange(
+/** Persist one UI change immediately to the global Pi config directory. */
+async function persistGlobalChange(
   ctx: ExtensionCommandContext,
   store: ConfigStore,
   coordinator: ReviewCoordinator,
@@ -147,11 +154,11 @@ async function persistProjectChange(
 
   let saved: HunkConfig;
   try {
-    await store.persist(ctx, "project", patch);
+    await store.persist(ctx, "global", patch);
     saved = store.getLoaded();
   } catch (error) {
     ctx.ui.notify(
-      `Could not update project Hunk config: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not update global Hunk config: ${error instanceof Error ? error.message : String(error)}`,
       "error",
     );
     return undefined;
@@ -173,7 +180,7 @@ async function persistProjectChange(
 
   const overlayChanged = before.overlay.layout !== saved.overlay.layout;
   const messages: string[] = [];
-  if (notifySaved) messages.push("Hunk configuration updated in .pi/hunk.json.");
+  if (notifySaved) messages.push(`Hunk configuration updated in ${globalConfigPath()}.`);
   if (overlayChanged && coordinator.hasLiveSurface()) {
     messages.push("Close and reopen the current Hunk review to apply the new layout.");
   }
@@ -208,7 +215,7 @@ async function configureInteractively(
   const runtimeBindings = { ...current.bindings };
   while (true) {
     const choice = await ctx.ui.select(
-      "Pi-hunk configuration — changes auto-save to .pi/hunk.json",
+      `Pi-hunk configuration — changes auto-save to ${globalConfigPath()}`,
       [
         `Review behavior: ${current.review}`,
         `Follow edits: ${current.followEdits ? "on" : "off"}`,
@@ -224,12 +231,12 @@ async function configureInteractively(
 
     if (choice === "Restore defaults…") {
       const confirmed = await ctx.ui.select("Restore default Hunk configuration?", [
-        "Restore — remove project overrides",
+        "Restore — remove global overrides",
         "Cancel",
       ]);
       if (!confirmed?.startsWith("Restore")) continue;
       try {
-        await store.resetProject(ctx);
+        await store.resetGlobal(ctx);
         const restored = store.getLoaded();
         if (
           (["prefix", "toggle", "show"] as const).some(
@@ -248,7 +255,7 @@ async function configureInteractively(
             ? " Close and reopen the current Hunk review to apply the restored layout."
             : "";
         ctx.ui.notify(
-          `Project Hunk configuration removed; inherited/default settings restored.${reloadMessage}${overlayMessage}`,
+          `Global Hunk overrides removed from ${globalConfigPath()}.${reloadMessage}${overlayMessage}`,
           "info",
         );
         current = restored;
@@ -306,7 +313,7 @@ async function configureInteractively(
       continue;
     }
 
-    const saved = await persistProjectChange(
+    const saved = await persistGlobalChange(
       ctx,
       store,
       coordinator,
@@ -325,14 +332,6 @@ export async function handleConfigCommand(
   store: ConfigStore,
   coordinator: ReviewCoordinator,
 ): Promise<void> {
-  if (!ctx.isProjectTrusted()) {
-    ctx.ui.notify(
-      "Hunk configuration requires a trusted project so it can update .pi/hunk.json.",
-      "warning",
-    );
-    return;
-  }
-
   if (!input.trim()) {
     await configureInteractively(ctx, store, coordinator);
     return;
@@ -341,7 +340,7 @@ export async function handleConfigCommand(
   const current = store.get();
   if (input.trim() === "restore") {
     try {
-      await store.resetProject(ctx);
+      await store.resetGlobal(ctx);
       const restored = store.getLoaded();
       const shortcutsChanged = (["prefix", "toggle", "show"] as const).some(
         (binding) => restored.bindings[binding] !== current.bindings[binding],
@@ -349,7 +348,7 @@ export async function handleConfigCommand(
       if (shortcutsChanged) store.patchSession({ bindings: current.bindings });
       const overlayChanged = current.overlay.layout !== restored.overlay.layout;
       ctx.ui.notify(
-        `Project Hunk configuration removed; inherited/default settings restored.${shortcutsChanged ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then." : ""}${overlayChanged && coordinator.hasLiveSurface() ? " Close and reopen the current Hunk review to apply the restored layout." : ""}`,
+        `Global Hunk overrides removed from ${globalConfigPath()}.${shortcutsChanged ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then." : ""}${overlayChanged && coordinator.hasLiveSurface() ? " Close and reopen the current Hunk review to apply the restored layout." : ""}`,
         "info",
       );
     } catch (error) {
@@ -373,5 +372,5 @@ export async function handleConfigCommand(
     ctx.ui.notify("Hunk configuration is unchanged.", "info");
     return;
   }
-  await persistProjectChange(ctx, store, coordinator, current, next, current.bindings, true);
+  await persistGlobalChange(ctx, store, coordinator, current, next, current.bindings, true);
 }

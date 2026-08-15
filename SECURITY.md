@@ -39,9 +39,11 @@ removed globally to land one emergency update.
 ## Security model
 
 Pi extensions execute with the user's permissions. Installing pi-hunk therefore grants it the same
-filesystem and process access as Pi. Pi-hunk launches the configured Hunk command in the current
-project, reads Hunk's local session metadata, and writes trusted-project `.pi/hunk.json` settings.
-Only install the package, project configuration, and Hunk binary from sources you trust.
+filesystem and process access as Pi. Pi-hunk launches the globally configured Hunk command with the
+current project as its working directory, reads Hunk's local session metadata, and writes
+`hunk.json` in Pi's global agent config directory. Keep `hunk.command` as a trusted executable on
+`PATH` or a trusted absolute path; do not migrate a project-relative executable into global config.
+Only install the package and Hunk binary from sources you trust.
 
 The published npm package is checked for unexpected source/test files, runtime dependency growth,
 and clean-consumer loading before release. npm provenance is enabled for published artifacts.

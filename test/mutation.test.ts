@@ -73,6 +73,52 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: "env FOO=1 printf '>'" })).toBe(false);
   });
 
+  it("recognizes common command wrappers and shell control grammar conservatively", () => {
+    expect(isMutation("bash", { command: "command -- touch generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "exec rm generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "nohup cp a.ts b.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "sudo -n -- mv a.ts b.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "sudo --user root rm generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "doas -n install source.ts target.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "nice -n 5 truncate -s 0 generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "timeout -s TERM 2 sh -c 'mkdir out'" })).toBe(true);
+    expect(isMutation("bash", { command: "printf '%s\\n' a.ts | xargs -n 1 rm" })).toBe(true);
+    expect(isMutation("bash", { command: "find build -type f -exec rm {} +" })).toBe(true);
+    expect(isMutation("bash", { command: "find build -type f -delete" })).toBe(true);
+    expect(isMutation("bash", { command: "git restore src/a.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "git checkout -- src/a.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "git mv old.ts new.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "dd if=source.bin of=target.bin" })).toBe(true);
+    expect(isMutation("bash", { command: "if test -f old.ts; then rm old.ts; fi" })).toBe(true);
+    expect(isMutation("bash", { command: 'for file in a b; do touch "$file"; done' })).toBe(true);
+    expect(isMutation("bash", { command: "(mkdir out)" })).toBe(true);
+    expect(isMutation("bash", { command: "{ chmod 600 secret; }" })).toBe(true);
+    expect(isMutation("bash", { command: "! ln -s source target" })).toBe(true);
+
+    expect(isMutation("bash", { command: "sudo -n git status" })).toBe(false);
+    expect(isMutation("bash", { command: "command printf 'please rm the file\\n'" })).toBe(false);
+    expect(isMutation("bash", { command: "find src -type f -print" })).toBe(false);
+    expect(isMutation("bash", { command: "printf 'please rm the file\\n' | xargs echo" })).toBe(
+      false,
+    );
+    expect(isMutation("bash", { command: 'echo "sudo rm prose.ts"' })).toBe(false);
+  });
+
+  it("treats executable shell indirection and output redirection as mutation evidence", () => {
+    expect(isMutation("bash", { command: "git status > status.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo ok 2>> errors.log" })).toBe(true);
+    expect(isMutation("bash", { command: 'echo "$(touch generated.ts)"' })).toBe(true);
+    expect(isMutation("bash", { command: "cat <(mkdir generated)" })).toBe(true);
+    expect(isMutation("bash", { command: 'bash -c "$COMMAND"' })).toBe(true);
+    expect(isMutation("bash", { command: 'eval "$COMMAND"' })).toBe(true);
+    expect(isMutation("bash", { command: "source ./generated-script.sh" })).toBe(true);
+
+    expect(isMutation("bash", { command: 'echo "git status > status.txt"' })).toBe(false);
+    expect(isMutation("bash", { command: `echo "$(printf 'please rm the file')"` })).toBe(false);
+    expect(isMutation("bash", { command: `bash -c 'echo "$HOME"'` })).toBe(false);
+    expect(isMutation("bash", { command: "printf '2> errors.log\\n'" })).toBe(false);
+  });
+
   it("parses GNU env split-string argv conservatively", () => {
     // Exact review example plus every supported spelling.
     expect(isMutation("bash", { command: `env -S 'bash -c "touch generated.ts"'` })).toBe(true);

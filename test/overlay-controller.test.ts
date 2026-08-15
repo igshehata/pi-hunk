@@ -352,6 +352,14 @@ describe("OverlaySurface state machine", () => {
     const harness = createHarness();
     const surface = new OverlaySurface(harness.createComponent);
     const config = cloneConfig(DEFAULT_CONFIG);
+    let releaseReplacement!: () => void;
+    const replacementGuard = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseReplacement = resolve;
+        }),
+    );
+    surface.setReplacementGuard(replacementGuard);
 
     await surface.open(harness.ctx, request(), config);
     const options = harness.components[0]?.options;
@@ -360,6 +368,11 @@ describe("OverlaySurface state machine", () => {
     expect(options?.onShowRequest).toBeTypeOf("function");
 
     options?.onShowRequest?.();
+    await vi.waitFor(() => expect(replacementGuard).toHaveBeenCalledOnce());
+    expect(harness.components).toHaveLength(1);
+    expect(harness.components[0]?.disposed).toBe(false);
+
+    releaseReplacement();
     await vi.waitFor(() => expect(harness.components).toHaveLength(2));
     expect(harness.components[1]?.options.args).toEqual(["show"]);
     expect(surface.getState()).toBe("visible");
@@ -763,7 +776,7 @@ describe("OverlaySurface state machine", () => {
 
     harness.events.length = 0;
     childDone({ exitCode: 0 });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(surface.getState()).toBe("closed"));
 
     expect(surface.getState()).toBe("closed");
     expect(harness.components[0]?.disposed).toBe(true);
@@ -773,6 +786,31 @@ describe("OverlaySurface state machine", () => {
     expect(harness.stack.map((h) => h.id)).toEqual([foreign.id]);
     expect(harness.events.some((e) => e.startsWith("global:hideOverlay"))).toBe(false);
     expect(harness.ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("keeps a naturally exited surface closing until its asynchronous handoff settles", async () => {
+    const harness = createHarness();
+    let release!: () => void;
+    const onChildExit = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const surface = new OverlaySurface(harness.createComponent, { onChildExit });
+    const config = cloneConfig(DEFAULT_CONFIG);
+
+    await surface.open(harness.ctx, request(), config);
+    harness.components[0]!.options.done({ exitCode: 0 });
+    await vi.waitFor(() => expect(onChildExit).toHaveBeenCalledOnce());
+
+    expect(surface.getState()).toBe("closing");
+    expect(surface.getInfo()).toMatchObject({ state: "closing", pid: 9001 });
+    expect(harness.components[0]?.disposed).toBe(false);
+
+    release();
+    await vi.waitFor(() => expect(surface.getState()).toBe("closed"));
+    expect(harness.components[0]?.disposed).toBe(true);
   });
 
   it("notifies once for unexpected child exit after the overlay is live", async () => {
@@ -785,7 +823,7 @@ describe("OverlaySurface state machine", () => {
 
     childDone({ exitCode: 0, signal: 15, detail: "line1\nline2\nline3\nline4\nline5" });
     childDone({ exitCode: 0, signal: 15, detail: "late duplicate" });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(surface.getState()).toBe("closed"));
 
     const notify = vi.mocked(harness.ctx.ui.notify);
     expect(surface.getState()).toBe("closed");
@@ -802,7 +840,7 @@ describe("OverlaySurface state machine", () => {
 
     await surface.open(harness.ctx, request(), config);
     harness.components[0]!.options.done({ exitCode: 2, signal: 0 });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(surface.getState()).toBe("closed"));
 
     const notify = vi.mocked(harness.ctx.ui.notify);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("code 2"), "error");
@@ -820,7 +858,7 @@ describe("OverlaySurface state machine", () => {
       signal: 0,
       detail: 'Hunk startup failed: command "hunk" was not found on child PATH.',
     });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(surface.getState()).toBe("closed"));
 
     expect(harness.ctx.ui.notify).toHaveBeenCalledWith(
       'Hunk startup failed: command "hunk" was not found on child PATH. (code 1).',
@@ -1074,7 +1112,7 @@ describe("OverlaySurface state machine", () => {
     states.length = 0;
 
     harness.components[0]?.options.done({ exitCode: 0 });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(surface.getState()).toBe("closed"));
 
     expect(surface.getState()).toBe("closed");
     expect(states).toContain("closed");

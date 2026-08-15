@@ -3,6 +3,9 @@
 
 const FRAME_START = "\x1b[?2026h";
 const FRAME_END = "\x1b[?2026l";
+const EXIT_DETAIL_MAX_CHARS = 2000;
+const EXIT_DETAIL_MAX_LINES = 12;
+const EXIT_CAPTURE_MAX_CHARS = 16_000;
 
 interface EscapeToken {
   end: number;
@@ -54,11 +57,16 @@ function isCapabilityQuery(sequence: string): boolean {
       final === "n" ||
       final === "c" ||
       (final === "p" && body.endsWith("$")) ||
+      (final === "q" && body === ">0") ||
       (final === "u" && body === "?") ||
       (final === "t" && /^(?:14|16|18)$/.test(body))
     );
   }
-  if (sequence.startsWith("\x1b]")) return sequence.includes("?");
+  if (sequence.startsWith("\x1b]")) {
+    const terminatorLength = sequence.endsWith("\x1b\\") ? 2 : 1;
+    const payload = sequence.slice(2, -terminatorLength);
+    return sequence.includes("?") || payload === "1337;Capabilities";
+  }
   if (sequence.startsWith("\x1bP")) return sequence.includes("+q");
   return false;
 }
@@ -122,6 +130,130 @@ export interface TakeoverStartupEvent {
 }
 
 /**
+ * Split the temporarily leased raw stdin stream into complete terminal events.
+ * User keys pass through the exact listener installed on TakeoverHunk so prefix
+ * chords retain Pi-side interception. Structured terminal replies bypass key
+ * translation and remain byte-for-byte PTY input.
+ */
+export class TakeoverStartupInput {
+  private pending = "";
+  private decoder = new TextDecoder();
+
+  constructor(
+    private readonly dispatch: (data: string) => void,
+    private readonly forwardReply: (data: string) => void = dispatch,
+  ) {}
+
+  push(data: string | Uint8Array): void {
+    if (typeof data === "string") {
+      const decoded = this.decoder.decode();
+      this.decoder = new TextDecoder();
+      if (decoded) this.process(decoded);
+      this.process(data);
+      return;
+    }
+    const decoded = this.decoder.decode(data, { stream: true });
+    if (decoded) this.process(decoded);
+  }
+
+  reset(): void {
+    this.pending = "";
+    this.decoder = new TextDecoder();
+  }
+
+  private process(data: string): void {
+    this.pending += data;
+    let cursor = 0;
+    while (cursor < this.pending.length) {
+      if (this.pending[cursor] === "\x1b") {
+        const token = escapeToken(this.pending, cursor);
+        if (!token.complete) break;
+        const sequence = this.pending.slice(cursor, token.end);
+        if (isCapabilityReply(sequence)) this.forwardReply(sequence);
+        else this.dispatch(sequence);
+        cursor = token.end;
+        continue;
+      }
+
+      const first = this.pending.charCodeAt(cursor);
+      if (first >= 0xd800 && first <= 0xdbff) {
+        if (cursor + 1 >= this.pending.length) break;
+        const second = this.pending.charCodeAt(cursor + 1);
+        if (second >= 0xdc00 && second <= 0xdfff) {
+          this.dispatch(this.pending.slice(cursor, cursor + 2));
+          cursor += 2;
+          continue;
+        }
+      }
+      this.dispatch(this.pending[cursor]!);
+      cursor += 1;
+    }
+    this.pending = this.pending.slice(cursor);
+  }
+}
+
+function isCapabilityReply(sequence: string): boolean {
+  if (sequence.startsWith("\x1b[")) {
+    const body = sequence.slice(2, -1);
+    const final = sequence.at(-1);
+    return (
+      (final === "R" && /^\d+;\d+$/.test(body)) ||
+      (final === "n" && /^\d+$/.test(body)) ||
+      (final === "c" && /^[?>]?[\d;]*$/.test(body)) ||
+      (final === "y" && /^\?\d+;\d+\$$/.test(body)) ||
+      (final === "u" && /^\?\d+$/.test(body)) ||
+      (final === "t" && /^\d+(?:;\d+)+$/.test(body))
+    );
+  }
+  if (sequence.startsWith("\x1b]")) {
+    // Terminal-originated OSC is never a keyboard event. Keep arbitrary
+    // capability payloads (including text resembling Kitty release syntax)
+    // away from key translation.
+    return /^\d+;/.test(sequence.slice(2));
+  }
+  if (sequence.startsWith("\x1bP")) {
+    const payload = sequence.slice(2);
+    return payload.startsWith(">|") || /^[01]\+r/.test(payload);
+  }
+  // APC is likewise a structured terminal response, not user keyboard input.
+  return sequence.startsWith("\x1b_");
+}
+
+function stripTerminalSequences(source: string): string {
+  source = source.replace(/\r\n?/g, "\n");
+  let output = "";
+  let cursor = 0;
+  while (cursor < source.length) {
+    if (source[cursor] === "\x1b") {
+      const token = escapeToken(source, cursor);
+      cursor = token.end;
+      continue;
+    }
+    const character = source[cursor]!;
+    const code = character.charCodeAt(0);
+    if (character === "\t" || character === "\n" || (code >= 32 && code !== 127)) {
+      output += character;
+    }
+    cursor += 1;
+  }
+  return output;
+}
+
+function boundTerminalDetail(source: string): string | undefined {
+  const lines = stripTerminalSequences(source)
+    .split("\n")
+    .map((line) => line.trimEnd());
+  while (lines.length > 0 && !lines[0]?.trim()) lines.shift();
+  while (lines.length > 0 && !lines.at(-1)?.trim()) lines.pop();
+  if (lines.length === 0) return undefined;
+  let detail = lines.slice(-EXIT_DETAIL_MAX_LINES).join("\n").trim();
+  if (detail.length > EXIT_DETAIL_MAX_CHARS) {
+    detail = `…${detail.slice(detail.length - EXIT_DETAIL_MAX_CHARS + 1)}`;
+  }
+  return detail || undefined;
+}
+
+/**
  * Incrementally bridges capability queries and atomically publishes the first
  * complete DEC 2026 frame. Marker prefixes are retained across arbitrary PTY
  * chunk boundaries.
@@ -132,6 +264,8 @@ export class TakeoverStartupGate {
   private fallbackOutput = "";
   private fallbackEligible = false;
   private frame = "";
+  /** Raw pre-frame tail retained only for an actionable early child exit. */
+  private exitCapture = "";
   private readonly queries: CapabilityQueryForwarder;
 
   constructor(
@@ -146,6 +280,9 @@ export class TakeoverStartupGate {
   }
 
   push(text: string): TakeoverStartupEvent {
+    if (this.state !== "ready" && text) {
+      this.exitCapture = (this.exitCapture + text).slice(-EXIT_CAPTURE_MAX_CHARS);
+    }
     if (this.state === "ready") {
       if (text) this.publish(text);
       return { ready: true, frameStarted: false, fallbackEligible: false };
@@ -198,12 +335,18 @@ export class TakeoverStartupGate {
     return true;
   }
 
+  /** Plain, bounded startup stderr/output for exits before a usable frame. */
+  exitDetail(): string | undefined {
+    return boundTerminalDetail(this.exitCapture);
+  }
+
   reset(): void {
     this.state = "waiting";
     this.waiting = "";
     this.fallbackOutput = "";
     this.fallbackEligible = false;
     this.frame = "";
+    this.exitCapture = "";
     this.queries.clear();
   }
 
@@ -217,6 +360,9 @@ export class TakeoverStartupGate {
     this.fallbackOutput = "";
     this.fallbackEligible = false;
     this.state = "ready";
+    // A synchronized UI frame supersedes startup diagnostics; unlike fallback
+    // output it is not useful as plain exit detail without a terminal emulator.
+    this.exitCapture = "";
     // The placeholder was painted outside the renderer's hidden synchronized
     // prelude. Clear it atomically inside the first published transaction so a
     // cursor-home/differential frame cannot leave placeholder remnants behind.

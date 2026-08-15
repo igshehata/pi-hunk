@@ -9,13 +9,16 @@ import type { OverlaySurface } from "../extensions/overlay/surface.ts";
 interface FakeOverlay extends OverlaySurface {
   calls: string[];
   requestCwds: string[];
-  simulateChildExit(result?: { exitCode: number; signal?: number }): void;
+  simulateChildExit(result?: { exitCode: number; signal?: number }): Promise<void>;
 }
 
 function fakeOverlay(options: { nextPid?: () => number } = {}): FakeOverlay {
   let state: "closed" | "visible" | "hidden" = "closed";
   let listener: (() => void) | undefined;
-  let childExitListener: ((result: { exitCode: number; signal?: number }) => void) | undefined;
+  let childExitListener:
+    | ((result: { exitCode: number; signal?: number }) => Promise<void> | void)
+    | undefined;
+  let replacementGuard: (() => Promise<void>) | undefined;
   let launchCwd = "/repo";
   let sessionId: string | undefined;
   let repoRoot: string | undefined;
@@ -31,8 +34,13 @@ function fakeOverlay(options: { nextPid?: () => number } = {}): FakeOverlay {
     setStateListener(next: () => void) {
       listener = next;
     },
-    setChildExitListener(next: (result: { exitCode: number; signal?: number }) => void) {
+    setChildExitListener(
+      next: (result: { exitCode: number; signal?: number }) => Promise<void> | void,
+    ) {
       childExitListener = next;
+    },
+    setReplacementGuard(next: () => Promise<void>) {
+      replacementGuard = next;
     },
     getState: () => state,
     isLive: () => state !== "closed",
@@ -57,6 +65,7 @@ function fakeOverlay(options: { nextPid?: () => number } = {}): FakeOverlay {
         ...(request.args ?? []),
       ]);
       const replaces = state === "closed" || nextArgsKey !== argsKey;
+      if (state !== "closed" && replaces) await replacementGuard?.();
       await new Promise((resolve) => setTimeout(resolve, 10));
       launchCwd = request.cwd;
       argsKey = nextArgsKey;
@@ -89,6 +98,7 @@ function fakeOverlay(options: { nextPid?: () => number } = {}): FakeOverlay {
         ...(request.args ?? []),
       ]);
       if (state === "closed" || nextArgsKey !== argsKey) {
+        if (state !== "closed") await replacementGuard?.();
         launchCwd = request.cwd;
         argsKey = nextArgsKey;
         pid = options.nextPid?.() ?? pidSequence++;
@@ -115,9 +125,9 @@ function fakeOverlay(options: { nextPid?: () => number } = {}): FakeOverlay {
       listener?.();
     },
     /** Test helper: simulate natural child exit. */
-    simulateChildExit(result: { exitCode: number; signal?: number } = { exitCode: 0 }) {
+    async simulateChildExit(result: { exitCode: number; signal?: number } = { exitCode: 0 }) {
       // Surface reports the result before owned removal, then publishes closed.
-      childExitListener?.(result);
+      await childExitListener?.(result);
       state = "closed";
       sessionId = undefined;
       repoRoot = undefined;
@@ -141,6 +151,80 @@ describe("ReviewCoordinator overlay lifecycle", () => {
     expect(overlay.calls).toEqual(["ensure:start", "ensure:end", "toggle"]);
     expect(coordinator.getActiveInfo()?.state).toBe("hidden");
     expect(coordinator.hasLiveSurface()).toBe(true);
+  });
+
+  it("holds the exact surface behind the destructive guard before close", async () => {
+    const overlay = fakeOverlay();
+    const coordinator = new ReviewCoordinator({ overlay });
+    const config = cloneConfig(DEFAULT_CONFIG);
+    await coordinator.ensureOpen(ctx, config, config.hunk.args, "manual");
+
+    let release!: () => void;
+    const guard = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    coordinator.setDestructiveTransitionGuard(guard);
+
+    const closing = coordinator.closeActive();
+    await vi.waitFor(() => expect(guard).toHaveBeenCalledOnce());
+    expect(guard).toHaveBeenCalledWith(
+      "close",
+      expect.objectContaining({ pid: 4242, state: "visible" }),
+    );
+    expect(coordinator.getActiveInfo()?.pid).toBe(4242);
+    expect(overlay.calls).not.toContain("release");
+
+    release();
+    await expect(closing).resolves.toBe(true);
+    expect(coordinator.getActiveInfo()).toBeNull();
+  });
+
+  it("blocks direct diff-to-show replacement when the exact-session guard fails", async () => {
+    const overlay = fakeOverlay();
+    const coordinator = new ReviewCoordinator({ overlay });
+    const config = cloneConfig(DEFAULT_CONFIG);
+    await coordinator.ensureOpen(ctx, config, config.hunk.args, "manual");
+    const original = coordinator.getActiveInfo();
+    coordinator.setDestructiveTransitionGuard(
+      vi.fn(async () => {
+        throw new Error("comment probe failed");
+      }),
+    );
+
+    await expect(coordinator.ensureOpen(ctx, config, ["show"], "manual")).rejects.toThrow(
+      "comment probe failed",
+    );
+    expect(coordinator.getActiveInfo()).toEqual(original);
+    expect(overlay.calls.filter((call) => call === "ensure:start")).toHaveLength(2);
+    expect(overlay.calls.filter((call) => call === "ensure:end")).toHaveLength(1);
+  });
+
+  it("waits for the best-effort natural-exit guard before dropping ownership", async () => {
+    const overlay = fakeOverlay();
+    const coordinator = new ReviewCoordinator({ overlay });
+    const config = cloneConfig(DEFAULT_CONFIG);
+    await coordinator.ensureOpen(ctx, config, [], "manual");
+
+    let release!: () => void;
+    const guard = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    coordinator.setDestructiveTransitionGuard(guard);
+    const exited = overlay.simulateChildExit({ exitCode: 0 });
+
+    await vi.waitFor(() => expect(guard).toHaveBeenCalledOnce());
+    expect(guard).toHaveBeenCalledWith("natural-exit", expect.objectContaining({ pid: 4242 }));
+    expect(coordinator.getActiveInfo()?.pid).toBe(4242);
+
+    release();
+    await exited;
+    expect(coordinator.getActiveInfo()).toBeNull();
   });
 
   it("keeps a routed repository cwd when Pi toggles the active review", async () => {
@@ -199,7 +283,7 @@ describe("ReviewCoordinator overlay lifecycle", () => {
     const config = cloneConfig(DEFAULT_CONFIG);
     await coordinator.ensureOpen(ctx, config, [], "manual");
 
-    overlay.simulateChildExit({ exitCode: 0 });
+    await overlay.simulateChildExit({ exitCode: 0 });
 
     expect(coordinator.getActiveInfo()).toBeNull();
     expect(coordinator.hasLiveSurface()).toBe(false);
@@ -625,7 +709,7 @@ describe("ReviewCoordinator overlay lifecycle", () => {
       await vi.advanceTimersByTimeAsync(20);
       await reopen;
       coordinator.scheduleFollowEdit(followCtx, config, "src/exit.ts");
-      overlay.simulateChildExit({ exitCode: 0, signal: 0 });
+      await overlay.simulateChildExit({ exitCode: 0, signal: 0 });
       await vi.advanceTimersByTimeAsync(750);
       expect(navigateHunk).not.toHaveBeenCalled();
     } finally {
