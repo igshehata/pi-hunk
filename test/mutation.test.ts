@@ -109,6 +109,9 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: "echo ok 2>> errors.log" })).toBe(true);
     expect(isMutation("bash", { command: "cat <> state.db" })).toBe(true);
     expect(isMutation("bash", { command: "exec 3<>state.db" })).toBe(true);
+    expect(isMutation("bash", { command: "echo hello >& output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo hello 1>& output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: 'echo hello >& "$target"' })).toBe(true);
     expect(isMutation("bash", { command: 'echo "$(touch generated.ts)"' })).toBe(true);
     expect(isMutation("bash", { command: "cat <(mkdir generated)" })).toBe(true);
     expect(isMutation("bash", { command: 'bash -c "$COMMAND"' })).toBe(true);
@@ -119,6 +122,11 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: `echo "$(printf 'please rm the file')"` })).toBe(false);
     expect(isMutation("bash", { command: `bash -c 'echo "$HOME"'` })).toBe(false);
     expect(isMutation("bash", { command: "printf '2> errors.log\\n'" })).toBe(false);
+    expect(isMutation("bash", { command: 'grep needle <<< "$text"' })).toBe(false);
+    expect(isMutation("bash", { command: 'grep needle 3<<< "$text"' })).toBe(false);
+    expect(isMutation("bash", { command: "echo hello 2>&1" })).toBe(false);
+    expect(isMutation("bash", { command: "echo hello 2>&-" })).toBe(false);
+    expect(isMutation("bash", { command: "echo hello 2>& 10-" })).toBe(false);
   });
 
   it("distinguishes shell comparisons and arithmetic from file redirection", () => {

@@ -101,18 +101,48 @@ function hasFileOutputRedirection(maskedCommand: string): boolean {
       continue;
     }
 
-    if (char !== ">") continue;
-    if (maskedCommand[i - 1] === ">") continue;
+    if (char === "<") {
+      // Here-strings feed stdin and never name an output file.
+      if (maskedCommand.startsWith("<<<", i)) {
+        i += 2;
+        continue;
+      }
+      // Bash `<>` opens its target for both reading and writing.
+      if (maskedCommand[i + 1] === ">") return true;
+      continue;
+    }
 
-    let end = i + 1;
-    if (maskedCommand[end] === ">" || maskedCommand[end] === "|") end += 1;
-    while (maskedCommand[end] === " " || maskedCommand[end] === "\t") end += 1;
-    // `2>&1` duplicates descriptors and `>(...)` is process substitution;
-    // neither names an output file at this grammar level.
-    if (maskedCommand[end] === "&" || maskedCommand[end] === "(") continue;
+    if (char !== ">") continue;
+    // Process substitutions are inspected recursively by
+    // commandSubstitutionsLookMutating().
+    if (maskedCommand[i + 1] === "(") continue;
+    if (maskedCommand[i + 1] === "&" && isLiteralFileDescriptorTarget(maskedCommand, i + 2)) {
+      i += 1;
+      continue;
+    }
     return true;
   }
   return false;
+}
+
+/** `>&` duplicates or closes only literal descriptor targets; every other word may be a file. */
+function isLiteralFileDescriptorTarget(maskedCommand: string, start: number): boolean {
+  let cursor = start;
+  while (maskedCommand[cursor] === " " || maskedCommand[cursor] === "\t") cursor += 1;
+
+  if (maskedCommand[cursor] === "-") {
+    return isShellRedirectionWordBoundary(maskedCommand[cursor + 1]);
+  }
+
+  const digitsStart = cursor;
+  while (/[0-9]/.test(maskedCommand[cursor] ?? "")) cursor += 1;
+  if (cursor === digitsStart) return false;
+  if (maskedCommand[cursor] === "-") cursor += 1;
+  return isShellRedirectionWordBoundary(maskedCommand[cursor]);
+}
+
+function isShellRedirectionWordBoundary(char: string | undefined): boolean {
+  return char === undefined || /[\s;&|()<>]/.test(char);
 }
 
 function isShellTokenBoundary(char: string | undefined): boolean {
