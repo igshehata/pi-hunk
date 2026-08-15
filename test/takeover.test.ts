@@ -521,6 +521,64 @@ describe("TakeoverHunk", () => {
     component.dispose();
   });
 
+  it("disambiguates a standalone startup Escape after the host input delay", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui } = makeTui();
+      const raw = makeRawInputSource();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done: vi.fn(),
+        rawInputSource: raw.source,
+      });
+      pty.write.mockClear();
+
+      raw.dispatch("\x1b");
+      vi.advanceTimersByTime(9);
+      expect(pty.write).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1);
+      expect(pty.write.mock.calls.map(([data]) => data)).toEqual(["\x1b"]);
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("flushes a pending startup Escape exactly once when readiness releases raw input", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui } = makeTui();
+      const raw = makeRawInputSource();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done: vi.fn(),
+        rawInputSource: raw.source,
+      });
+      const onData = (
+        pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+      )[0]![0];
+      pty.write.mockClear();
+
+      raw.dispatch("\x1b");
+      onData(syncFrame("ready"));
+
+      expect(raw.active()).toBe(false);
+      expect(pty.write.mock.calls.map(([data]) => data)).toEqual(["\x1b"]);
+      vi.advanceTimersByTime(10);
+      expect(pty.write).toHaveBeenCalledOnce();
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps raw input leased through split query-only negotiation beyond fallback", () => {
     vi.useFakeTimers();
     try {

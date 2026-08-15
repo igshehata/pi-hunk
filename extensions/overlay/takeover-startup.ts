@@ -6,6 +6,7 @@ const FRAME_END = "\x1b[?2026l";
 const EXIT_DETAIL_MAX_CHARS = 2000;
 const EXIT_DETAIL_MAX_LINES = 12;
 const EXIT_CAPTURE_MAX_CHARS = 16_000;
+const ESCAPE_DISAMBIGUATION_MS = 10;
 
 interface EscapeToken {
   end: number;
@@ -138,6 +139,7 @@ export interface TakeoverStartupEvent {
 export class TakeoverStartupInput {
   private pending = "";
   private decoder = new TextDecoder();
+  private escapeTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly dispatch: (data: string) => void,
@@ -145,18 +147,32 @@ export class TakeoverStartupInput {
   ) {}
 
   push(data: string | Uint8Array): void {
+    this.clearEscapeTimer();
     if (typeof data === "string") {
       const decoded = this.decoder.decode();
       this.decoder = new TextDecoder();
-      if (decoded) this.process(decoded);
-      this.process(data);
+      this.process(decoded + data);
       return;
     }
     const decoded = this.decoder.decode(data, { stream: true });
     if (decoded) this.process(decoded);
   }
 
+  /** Deliver a pending standalone Escape before the temporary raw-input lease ends. */
+  flush(): void {
+    this.clearEscapeTimer();
+    const decoded = this.decoder.decode();
+    this.decoder = new TextDecoder();
+    if (decoded) this.process(decoded);
+    this.clearEscapeTimer();
+
+    const dispatchEscape = this.pending === "\x1b";
+    this.pending = "";
+    if (dispatchEscape) this.dispatch("\x1b");
+  }
+
   reset(): void {
+    this.clearEscapeTimer();
     this.pending = "";
     this.decoder = new TextDecoder();
   }
@@ -189,6 +205,24 @@ export class TakeoverStartupInput {
       cursor += 1;
     }
     this.pending = this.pending.slice(cursor);
+    if (this.pending === "\x1b") this.armEscapeTimer();
+  }
+
+  private armEscapeTimer(): void {
+    if (this.escapeTimer || this.pending !== "\x1b") return;
+    this.escapeTimer = setTimeout(() => {
+      this.escapeTimer = undefined;
+      if (this.pending !== "\x1b") return;
+      this.pending = "";
+      this.dispatch("\x1b");
+    }, ESCAPE_DISAMBIGUATION_MS);
+    this.escapeTimer.unref?.();
+  }
+
+  private clearEscapeTimer(): void {
+    if (!this.escapeTimer) return;
+    clearTimeout(this.escapeTimer);
+    this.escapeTimer = undefined;
   }
 }
 

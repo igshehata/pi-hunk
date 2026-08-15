@@ -9,7 +9,7 @@ import { normalizeCandidatePath } from "./path-routing.ts";
 
 const MUTATION_TOOLS = /(^|[._:/-])(edit|write|patch|apply[_-]?patch)([._:/-]|$)/i;
 const MUTATING_SHELL =
-  /(?:^|[;&|\n])\s*(?:apply_patch\b|git\s+apply\b|jj\s+(?:abandon|commit|describe|duplicate|edit|new|rebase|restore|squash|undo)\b|sl\s+(?:amend|commit|goto|rebase|revert)\b|sed\s+-i\b|perl\s+-pi\b|tee\b|mv\b|cp\b|rm\b|touch\b|mkdir\b|truncate\b|npm\s+(?:install|uninstall|update)\b|(?:cat|echo|printf)\b[^;&|]*>)/i;
+  /(?:^|[;&|\n])\s*(?:apply_patch\b|git\s+apply\b|jj\s+(?:abandon|commit|describe|duplicate|edit|new|rebase|restore|squash|undo)\b|sl\s+(?:amend|commit|goto|rebase|revert)\b|sed\s+-i\b|perl\s+-pi\b|tee\b|mv\b|cp\b|rm\b|touch\b|mkdir\b|truncate\b|npm\s+(?:install|uninstall|update)\b)/i;
 const PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
 /** Recognized interactive/login shells whose `-c` payload may hide mutations. */
 const NESTED_SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh"]);
@@ -60,8 +60,48 @@ function shellCommandLooksMutating(command: string, depth = 0): boolean {
 
 /** Any non-FD output redirection can create or truncate a filesystem entry. */
 function hasFileOutputRedirection(maskedCommand: string): boolean {
+  let inConditional = false;
+  let arithmeticDepth = 0;
+
   for (let i = 0; i < maskedCommand.length; i += 1) {
-    if (maskedCommand[i] !== ">") continue;
+    const char = maskedCommand[i]!;
+
+    if (inConditional) {
+      if (
+        char === "]" &&
+        maskedCommand[i + 1] === "]" &&
+        isShellTokenBoundary(maskedCommand[i + 2])
+      ) {
+        inConditional = false;
+        i += 1;
+      }
+      continue;
+    }
+
+    if (arithmeticDepth > 0) {
+      if (char === "(") arithmeticDepth += 1;
+      else if (char === ")") arithmeticDepth -= 1;
+      continue;
+    }
+
+    if (
+      char === "[" &&
+      maskedCommand[i + 1] === "[" &&
+      isShellTokenBoundary(maskedCommand[i - 1]) &&
+      isShellTokenBoundary(maskedCommand[i + 2])
+    ) {
+      inConditional = true;
+      i += 1;
+      continue;
+    }
+
+    if (char === "(" && maskedCommand[i + 1] === "(") {
+      arithmeticDepth = 2;
+      i += 1;
+      continue;
+    }
+
+    if (char !== ">") continue;
     const previous = maskedCommand[i - 1];
     if (previous === "<" || previous === ">") continue;
 
@@ -74,6 +114,10 @@ function hasFileOutputRedirection(maskedCommand: string): boolean {
     return true;
   }
   return false;
+}
+
+function isShellTokenBoundary(char: string | undefined): boolean {
+  return char === undefined || /[\s;&|(){}]/.test(char);
 }
 
 /** Inspect executable command/process substitutions while leaving quoted prose masked. */
@@ -101,6 +145,9 @@ function commandSubstitutionsLookMutating(command: string, depth: number): boole
     }
     if (quote === "'") continue;
 
+    // Arithmetic expansion is not command substitution. Continue scanning its
+    // contents so a real nested `$(...)` mutation is still inspected below.
+    if (char === "$" && command.startsWith("$((", i)) continue;
     if ((char === "$" || char === "<" || char === ">") && command[i + 1] === "(") {
       const substitution = readParenthesizedShell(command, i + 2);
       if (substitution === "ambiguous") return true;
@@ -383,6 +430,9 @@ function directCommandLooksMutating(
   while (COMMAND_PREFIX_WORDS.has(words[commandIndex]?.value ?? "")) commandIndex += 1;
   if (commandIndex >= words.length) return false;
 
+  // Arithmetic commands are shell grammar, not dynamically named utilities.
+  // Redirects around them and nested command substitutions were handled above.
+  if (/^[({!]*\(\(/.test(words[commandIndex]!.value)) return false;
   const rawCommand = words[commandIndex]!.value.replace(/^[({!]+/, "");
   if (!rawCommand) return "ambiguous";
   if (/[$`]/.test(rawCommand)) return "ambiguous";

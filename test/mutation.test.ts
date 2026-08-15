@@ -119,6 +119,36 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: "printf '2> errors.log\\n'" })).toBe(false);
   });
 
+  it("distinguishes shell comparisons and arithmetic from file redirection", () => {
+    expect(isMutation("bash", { command: '[[ "$left" > "$right" ]]' })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: 'if [[ "$left" > "$right" ]]; then printf "ordered\\n"; fi',
+      }),
+    ).toBe(false);
+    expect(isMutation("bash", { command: "(( value > limit ))" })).toBe(false);
+    expect(isMutation("bash", { command: "for ((i = 0; i > limit; i++)); do :; done" })).toBe(
+      false,
+    );
+    expect(isMutation("bash", { command: "echo $(( value > limit ))" })).toBe(false);
+    expect(isMutation("bash", { command: 'echo "$(( value > limit ))"' })).toBe(false);
+
+    // Single-bracket `>` is a shell redirect unless quoted or escaped.
+    expect(isMutation("bash", { command: '[ "$left" > "$right" ]' })).toBe(true);
+    expect(isMutation("bash", { command: '[[ "$left" > "$right" ]] > comparison.txt' })).toBe(true);
+    expect(isMutation("bash", { command: "(( value > limit )) > arithmetic.txt" })).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: '[[ -n "$(printf changed > nested.txt)" ]]',
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "echo $(( $(printf changed > nested.txt) + 1 ))",
+      }),
+    ).toBe(true);
+  });
+
   it("parses GNU env split-string argv conservatively", () => {
     // Exact review example plus every supported spelling.
     expect(isMutation("bash", { command: `env -S 'bash -c "touch generated.ts"'` })).toBe(true);

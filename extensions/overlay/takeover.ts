@@ -723,6 +723,12 @@ export class TakeoverHunk implements Component, Focusable {
   }
 
   private releaseStartupRawInput(): void {
+    if (this.lifecycle === "running" && this.presentation === "active") {
+      this.startupInput.flush();
+    } else {
+      this.startupInput.reset();
+    }
+
     const release = this.releaseRawInput;
     this.releaseRawInput = undefined;
     try {
