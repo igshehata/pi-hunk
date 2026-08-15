@@ -521,7 +521,11 @@ describe("TakeoverHunk", () => {
     component.dispose();
   });
 
-  it("disambiguates a standalone startup Escape after the host input delay", () => {
+  it.each([
+    ["a standalone Escape", "\x1b"],
+    ["an ambiguous CSI prefix", "\x1b["],
+    ["an ambiguous SS3 prefix", "\x1bO"],
+  ])("disambiguates %s after the host input delay", (_label, sequence) => {
     vi.useFakeTimers();
     try {
       const { tui } = makeTui();
@@ -536,19 +540,23 @@ describe("TakeoverHunk", () => {
       });
       pty.write.mockClear();
 
-      raw.dispatch("\x1b");
+      raw.dispatch(sequence);
       vi.advanceTimersByTime(9);
       expect(pty.write).not.toHaveBeenCalled();
 
       vi.advanceTimersByTime(1);
-      expect(pty.write.mock.calls.map(([data]) => data)).toEqual(["\x1b"]);
+      expect(pty.write.mock.calls.map(([data]) => data)).toEqual([sequence]);
       component.dispose();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("flushes a pending startup Escape exactly once when readiness releases raw input", () => {
+  it.each([
+    ["a pending standalone Escape", "\x1b"],
+    ["a pending ambiguous CSI prefix", "\x1b["],
+    ["a pending ambiguous SS3 prefix", "\x1bO"],
+  ])("flushes %s exactly once when readiness releases raw input", (_label, sequence) => {
     vi.useFakeTimers();
     try {
       const { tui } = makeTui();
@@ -566,11 +574,11 @@ describe("TakeoverHunk", () => {
       )[0]![0];
       pty.write.mockClear();
 
-      raw.dispatch("\x1b");
+      raw.dispatch(sequence);
       onData(syncFrame("ready"));
 
       expect(raw.active()).toBe(false);
-      expect(pty.write.mock.calls.map(([data]) => data)).toEqual(["\x1b"]);
+      expect(pty.write.mock.calls.map(([data]) => data)).toEqual([sequence]);
       vi.advanceTimersByTime(10);
       expect(pty.write).toHaveBeenCalledOnce();
       component.dispose();

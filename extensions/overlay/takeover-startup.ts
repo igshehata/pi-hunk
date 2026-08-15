@@ -158,7 +158,7 @@ export class TakeoverStartupInput {
     if (decoded) this.process(decoded);
   }
 
-  /** Deliver a pending standalone Escape before the temporary raw-input lease ends. */
+  /** Deliver any pending incomplete input before the temporary raw-input lease ends. */
   flush(): void {
     this.clearEscapeTimer();
     const decoded = this.decoder.decode();
@@ -166,9 +166,9 @@ export class TakeoverStartupInput {
     if (decoded) this.process(decoded);
     this.clearEscapeTimer();
 
-    const dispatchEscape = this.pending === "\x1b";
+    const pending = this.pending;
     this.pending = "";
-    if (dispatchEscape) this.dispatch("\x1b");
+    if (pending) this.dispatch(pending);
   }
 
   reset(): void {
@@ -205,16 +205,17 @@ export class TakeoverStartupInput {
       cursor += 1;
     }
     this.pending = this.pending.slice(cursor);
-    if (this.pending === "\x1b") this.armEscapeTimer();
+    if (this.pending.startsWith("\x1b")) this.armEscapeTimer();
   }
 
   private armEscapeTimer(): void {
-    if (this.escapeTimer || this.pending !== "\x1b") return;
+    if (this.escapeTimer || !this.pending.startsWith("\x1b")) return;
     this.escapeTimer = setTimeout(() => {
       this.escapeTimer = undefined;
-      if (this.pending !== "\x1b") return;
+      if (!this.pending.startsWith("\x1b")) return;
+      const pending = this.pending;
       this.pending = "";
-      this.dispatch("\x1b");
+      this.dispatch(pending);
     }, ESCAPE_DISAMBIGUATION_MS);
     this.escapeTimer.unref?.();
   }

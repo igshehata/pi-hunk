@@ -58,7 +58,7 @@ function shellCommandLooksMutating(command: string, depth = 0): boolean {
   return false;
 }
 
-/** Any non-FD output redirection can create or truncate a filesystem entry. */
+/** Any redirection token with write capability can create or truncate a filesystem entry. */
 function hasFileOutputRedirection(maskedCommand: string): boolean {
   let inConditional = false;
   let arithmeticDepth = 0;
@@ -102,8 +102,7 @@ function hasFileOutputRedirection(maskedCommand: string): boolean {
     }
 
     if (char !== ">") continue;
-    const previous = maskedCommand[i - 1];
-    if (previous === "<" || previous === ">") continue;
+    if (maskedCommand[i - 1] === ">") continue;
 
     let end = i + 1;
     if (maskedCommand[end] === ">" || maskedCommand[end] === "|") end += 1;

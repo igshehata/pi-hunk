@@ -107,6 +107,8 @@ describe("isMutation", () => {
   it("treats executable shell indirection and output redirection as mutation evidence", () => {
     expect(isMutation("bash", { command: "git status > status.txt" })).toBe(true);
     expect(isMutation("bash", { command: "echo ok 2>> errors.log" })).toBe(true);
+    expect(isMutation("bash", { command: "cat <> state.db" })).toBe(true);
+    expect(isMutation("bash", { command: "exec 3<>state.db" })).toBe(true);
     expect(isMutation("bash", { command: 'echo "$(touch generated.ts)"' })).toBe(true);
     expect(isMutation("bash", { command: "cat <(mkdir generated)" })).toBe(true);
     expect(isMutation("bash", { command: 'bash -c "$COMMAND"' })).toBe(true);
