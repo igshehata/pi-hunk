@@ -136,6 +136,7 @@ export class TakeoverHunk implements Component, Focusable {
   private resumeSettleTimer: ReturnType<typeof setTimeout> | undefined;
   private resumeRefreshPending = false;
   private resumeFrameStarted = false;
+  private resumeQuarantinedFrameSeen = false;
   private resumeFrameTail = "";
   private removeInputListener: (() => void) | undefined;
   private releaseRawInput: (() => void) | undefined;
@@ -528,6 +529,7 @@ export class TakeoverHunk implements Component, Focusable {
     this.cancelResumeRefresh();
     this.resumeRefreshPending = true;
     this.resumeFrameStarted = false;
+    this.resumeQuarantinedFrameSeen = false;
     this.resumeFrameTail = "";
     this.resumeRefreshTimer = setTimeout(() => {
       this.resumeRefreshTimer = undefined;
@@ -561,30 +563,39 @@ export class TakeoverHunk implements Component, Focusable {
   private observeResumeRefresh(text: string): void {
     if (!this.resumeRefreshPending || !text) return;
 
-    const marker = this.resumeFrameStarted ? SYNCHRONIZED_FRAME_END : SYNCHRONIZED_FRAME_START;
     const source = this.resumeFrameTail + text;
-    const markerIndex = source.indexOf(marker);
-    if (markerIndex < 0) {
-      this.resumeFrameTail = retainedMarkerPrefix(source, marker);
-      return;
-    }
+    this.resumeFrameTail = "";
+    let cursor = 0;
 
-    if (!this.resumeFrameStarted) {
-      this.resumeFrameStarted = true;
-      const trailing = source.slice(markerIndex + SYNCHRONIZED_FRAME_START.length);
-      if (!trailing.includes(SYNCHRONIZED_FRAME_END)) {
-        this.resumeFrameTail = retainedMarkerPrefix(trailing, SYNCHRONIZED_FRAME_END);
+    while (cursor < source.length && this.resumeRefreshPending) {
+      const marker = this.resumeFrameStarted ? SYNCHRONIZED_FRAME_END : SYNCHRONIZED_FRAME_START;
+      const markerIndex = source.indexOf(marker, cursor);
+      if (markerIndex < 0) {
+        this.resumeFrameTail = retainedMarkerPrefix(source.slice(cursor), marker);
         return;
       }
-    }
 
-    // A complete transaction can have been queued while Hunk was hidden. Wait
-    // for a short quiet interval before restoring final geometry: the actual
-    // temporary-size repaint supersedes a stale differential frame and rearms
-    // this timer. The hard fallback still bounds continuously updating output.
-    this.resumeFrameStarted = false;
-    this.resumeFrameTail = "";
-    if (this.resumeSettleTimer) clearTimeout(this.resumeSettleTimer);
+      cursor = markerIndex + marker.length;
+      if (!this.resumeFrameStarted) {
+        this.resumeFrameStarted = true;
+        continue;
+      }
+
+      this.resumeFrameStarted = false;
+      this.observeCompleteResumeFrame();
+    }
+  }
+
+  private observeCompleteResumeFrame(): void {
+    // The first complete transaction can have been queued while Hunk was
+    // hidden, so it cannot acknowledge the temporary resize. Quarantine it;
+    // subsequent complete frames rearm a quiet interval so the causal repaint
+    // reaches the terminal before final geometry is restored.
+    if (!this.resumeQuarantinedFrameSeen) {
+      this.resumeQuarantinedFrameSeen = true;
+      return;
+    }
+    clearTimeout(this.resumeSettleTimer);
     this.resumeSettleTimer = setTimeout(() => {
       this.resumeSettleTimer = undefined;
       if (
@@ -625,6 +636,7 @@ export class TakeoverHunk implements Component, Focusable {
     this.resumeSettleTimer = undefined;
     this.resumeRefreshPending = false;
     this.resumeFrameStarted = false;
+    this.resumeQuarantinedFrameSeen = false;
     this.resumeFrameTail = "";
   }
 

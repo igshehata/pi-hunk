@@ -236,11 +236,11 @@ describe("TakeoverHunk", () => {
       expect(pty.resize.mock.calls).toEqual([[80, 23]]);
       expect(terminalWrite.mock.calls.flat().join("")).toContain("Restoring Hunk…");
 
-      // A complete frame queued while hidden must not immediately acknowledge
-      // the resize. The causal temporary-size frame supersedes it during the
-      // settle interval, including when DEC markers cross PTY chunks.
+      // A complete frame queued while hidden must not acknowledge the resize.
+      // The causal temporary-size frame may arrive after the short settle
+      // duration, so the first complete frame cannot start that countdown.
       onData(syncFrame("stale-differential"));
-      vi.advanceTimersByTime(50);
+      vi.advanceTimersByTime(150);
       expect(pty.resize.mock.calls).toEqual([[80, 23]]);
       onData("\x1b[?2026hfresh-");
       onData("frame\x1b[?2026l");
@@ -255,6 +255,39 @@ describe("TakeoverHunk", () => {
       const resumedOutput = terminalWrite.mock.calls.flat().join("");
       expect(resumedOutput).toContain("fresh-frame");
       expect(resumedOutput).not.toContain("discarded-while-hidden");
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("observes stale and causal resume frames coalesced in one PTY chunk", () => {
+    vi.useFakeTimers();
+    try {
+      const { tui } = makeTui();
+      const component = new TakeoverHunk({
+        command: "hunk",
+        args: ["diff"],
+        cwd: "/repo",
+        tui,
+        done: vi.fn(),
+      });
+      const onData = (
+        pty.onData.mock.calls as unknown as Array<[(data: string | Uint8Array) => void]>
+      )[0]![0];
+      onData(syncFrame("initial-frame"));
+      component.setVisible(false);
+      pty.resize.mockClear();
+
+      component.setVisible(true);
+      onData(syncFrame("stale-differential") + syncFrame("fresh-frame"));
+      vi.advanceTimersByTime(99);
+      expect(pty.resize.mock.calls).toEqual([[80, 23]]);
+      vi.advanceTimersByTime(1);
+      expect(pty.resize.mock.calls).toEqual([
+        [80, 23],
+        [80, 24],
+      ]);
       component.dispose();
     } finally {
       vi.useRealTimers();
@@ -281,6 +314,7 @@ describe("TakeoverHunk", () => {
 
       component.setVisible(true);
       expect(pty.resize.mock.calls).toEqual([[80, 23]]);
+      onData(syncFrame("single-candidate-frame"));
       vi.advanceTimersByTime(999);
       expect(pty.resize.mock.calls).toEqual([[80, 23]]);
       vi.advanceTimersByTime(1);

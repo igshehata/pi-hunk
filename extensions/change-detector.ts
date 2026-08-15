@@ -15,6 +15,47 @@ const PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
 const NESTED_SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh"]);
 const COMMAND_PREFIX_WORDS = new Set(["!", "(", "{", "then", "do", "else", "elif"]);
 const SIMPLE_COMMAND_WRAPPERS = new Set(["command", "exec", "nohup", "setsid"]);
+const CONDITIONAL_COMMAND_PREFIX_WORDS = new Set([
+  "!",
+  "if",
+  "then",
+  "do",
+  "else",
+  "elif",
+  "while",
+  "until",
+  "time",
+  "coproc",
+  "(",
+  "{",
+]);
+const SHELL_REDIRECTION_OPERATOR =
+  /^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<&|<>|>>|>\||>&|<|>)$/;
+const SHELL_REDIRECTION_WITH_TARGET =
+  /^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<&|<>|>>|>\||>&|<|>)\S+$/;
+const GIT_MUTATING_SUBCOMMANDS = new Set(["apply", "checkout", "mv", "restore", "rm"]);
+const GIT_INFO_OPTIONS = new Set([
+  "-v",
+  "--version",
+  "-h",
+  "--help",
+  "--exec-path",
+  "--html-path",
+  "--man-path",
+  "--info-path",
+]);
+const GIT_FLAG_OPTIONS = new Set([
+  "-p",
+  "--paginate",
+  "-P",
+  "--no-pager",
+  "--no-replace-objects",
+  "--no-lazy-fetch",
+  "--no-optional-locks",
+  "--no-advice",
+  "--bare",
+]);
+const GIT_VALUE_OPTIONS = new Set(["--git-dir", "--work-tree", "--namespace", "--config-env"]);
 /** Bound pathological nesting / command-substitution style chains. */
 const MAX_NESTED_SHELL_DEPTH = 4;
 const MAX_ENV_SPLIT_EXPANSIONS = 4;
@@ -86,6 +127,7 @@ function hasFileOutputRedirection(maskedCommand: string): boolean {
 
     if (
       char === "[" &&
+      isShellCommandPosition(maskedCommand, i) &&
       maskedCommand[i + 1] === "[" &&
       isShellTokenBoundary(maskedCommand[i - 1]) &&
       isShellTokenBoundary(maskedCommand[i + 2])
@@ -147,6 +189,88 @@ function isShellRedirectionWordBoundary(char: string | undefined): boolean {
 
 function isShellTokenBoundary(char: string | undefined): boolean {
   return char === undefined || /[\s;&|(){}]/.test(char);
+}
+
+interface PreviousShellWord {
+  start: number;
+  value: string;
+}
+
+/**
+ * `[[` is conditional grammar only where a command may begin. Walk backward
+ * through reserved prefixes, assignments, and leading redirections; an
+ * existing command word makes `[[` an ordinary argument.
+ */
+function isShellCommandPosition(maskedCommand: string, offset: number): boolean {
+  let cursor = offset;
+  while (
+    maskedCommand[cursor - 1] === " " ||
+    maskedCommand[cursor - 1] === "\t" ||
+    maskedCommand[cursor - 1] === "\r"
+  ) {
+    cursor -= 1;
+  }
+  if (cursor === 0) return true;
+
+  const previous = maskedCommand[cursor - 1]!;
+  if (previous === "\n" || previous === ";") return true;
+  if (
+    (previous === "&" || previous === "|") &&
+    maskedCommand[cursor - 2] !== ">" &&
+    maskedCommand[cursor - 2] !== "<"
+  ) {
+    return true;
+  }
+
+  const word = previousShellWord(maskedCommand, cursor);
+  if (!word) return true;
+
+  const beforeWord = previousShellWord(maskedCommand, word.start);
+  if (beforeWord && SHELL_REDIRECTION_OPERATOR.test(beforeWord.value)) {
+    return isShellCommandPosition(maskedCommand, beforeWord.start);
+  }
+  if (isEnvironmentAssignment(word.value) || CONDITIONAL_COMMAND_PREFIX_WORDS.has(word.value)) {
+    return isShellCommandPosition(maskedCommand, word.start);
+  }
+  if (SHELL_REDIRECTION_OPERATOR.test(word.value)) return false;
+  if (isShellRedirectionWithTarget(word.value)) {
+    return isShellCommandPosition(maskedCommand, word.start);
+  }
+  return false;
+}
+
+function previousShellWord(maskedCommand: string, offset: number): PreviousShellWord | undefined {
+  let end = offset;
+  while (
+    maskedCommand[end - 1] === " " ||
+    maskedCommand[end - 1] === "\t" ||
+    maskedCommand[end - 1] === "\r"
+  ) {
+    end -= 1;
+  }
+  if (end === 0 || maskedCommand[end - 1] === "\n" || maskedCommand[end - 1] === ";") {
+    return undefined;
+  }
+
+  let start = end;
+  while (start > 0) {
+    const char = maskedCommand[start - 1]!;
+    if (/\s/.test(char) || char === ";") break;
+    if (
+      (char === "&" || char === "|") &&
+      maskedCommand[start - 2] !== ">" &&
+      maskedCommand[start - 2] !== "<"
+    ) {
+      break;
+    }
+    start -= 1;
+  }
+  return start === end ? undefined : { start, value: maskedCommand.slice(start, end) };
+}
+
+function isShellRedirectionWithTarget(word: string): boolean {
+  if (word.startsWith("<(") || word.startsWith(">(")) return false;
+  return SHELL_REDIRECTION_WITH_TARGET.test(word);
 }
 
 /** Inspect executable command/process substitutions while leaving quoted prose masked. */
@@ -242,7 +366,7 @@ function readParenthesizedShell(
   return "ambiguous";
 }
 
-/** Preserve shell operators and command names while removing quoted data. */
+/** Preserve syntax and token boundaries while replacing quoted data with inert placeholders. */
 function maskQuotedShellText(command: string): string {
   let result = "";
   let quote: "'" | '"' | undefined;
@@ -250,23 +374,23 @@ function maskQuotedShellText(command: string): string {
 
   for (const char of command) {
     if (escaping) {
-      result += " ";
+      result += "x";
       escaping = false;
       continue;
     }
     if (char === "\\" && quote !== "'") {
-      result += " ";
+      result += "x";
       escaping = true;
       continue;
     }
     if (quote) {
       if (char === quote) quote = undefined;
-      result += " ";
+      result += "x";
       continue;
     }
     if (char === "'" || char === '"') {
       quote = char;
-      result += " ";
+      result += "x";
       continue;
     }
     result += char;
@@ -449,6 +573,53 @@ function isEnvironmentAssignment(word: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
 }
 
+function gitCommandLooksMutating(args: string[]): boolean | "ambiguous" {
+  let index = 0;
+  while (index < args.length) {
+    const argument = args[index]!;
+    if (GIT_INFO_OPTIONS.has(argument)) return false;
+    if (argument.startsWith("--exec-path=")) {
+      index += 1;
+      continue;
+    }
+    if (GIT_FLAG_OPTIONS.has(argument)) {
+      index += 1;
+      continue;
+    }
+    if (argument === "--") {
+      index += 1;
+      break;
+    }
+    if (argument === "-C" || argument === "-c") {
+      if (index + 1 >= args.length) return "ambiguous";
+      index += 2;
+      continue;
+    }
+    if ((argument.startsWith("-C") || argument.startsWith("-c")) && argument.length > 2) {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--")) {
+      const separator = argument.indexOf("=");
+      const option = separator < 0 ? argument : argument.slice(0, separator);
+      if (!GIT_VALUE_OPTIONS.has(option)) return "ambiguous";
+      if (separator >= 0) {
+        if (separator === argument.length - 1) return "ambiguous";
+        index += 1;
+        continue;
+      }
+      if (index + 1 >= args.length) return "ambiguous";
+      index += 2;
+      continue;
+    }
+    if (argument.startsWith("-")) return "ambiguous";
+    return GIT_MUTATING_SUBCOMMANDS.has(argument);
+  }
+
+  const command = args[index];
+  return command === undefined ? false : GIT_MUTATING_SUBCOMMANDS.has(command);
+}
+
 function directCommandLooksMutating(
   words: ShellWord[],
   commandIndex: number,
@@ -490,9 +661,7 @@ function directCommandLooksMutating(
   ) {
     return true;
   }
-  if (command === "git") {
-    return new Set(["apply", "checkout", "mv", "restore", "rm"]).has(args[0] ?? "");
-  }
+  if (command === "git") return gitCommandLooksMutating(args);
   if (command === "jj") {
     return new Set([
       "abandon",

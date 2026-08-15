@@ -104,6 +104,43 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: 'echo "sudo rm prose.ts"' })).toBe(false);
   });
 
+  it("peels Git global options before classifying subcommands", () => {
+    expect(isMutation("bash", { command: "git -C ../repo restore src/a.ts" })).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "git -c core.fsmonitor=false checkout -- src/a.ts",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "git --git-dir=.git --work-tree=../tree rm old.ts",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "git --paginate -C ../repo mv old.ts new.ts",
+      }),
+    ).toBe(true);
+
+    expect(isMutation("bash", { command: "git -C ../repo status" })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "git -c color.ui=false --no-pager log -1",
+      }),
+    ).toBe(false);
+    expect(isMutation("bash", { command: "git --version" })).toBe(false);
+    expect(isMutation("bash", { command: "git --html-path" })).toBe(false);
+    expect(isMutation("bash", { command: "git --exec-path" })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "git --exec-path=/tmp/git-core status",
+      }),
+    ).toBe(false);
+
+    expect(isMutation("bash", { command: "git --future-option restore src/a.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "git -C" })).toBe(true);
+  });
+
   it("treats executable shell indirection and output redirection as mutation evidence", () => {
     expect(isMutation("bash", { command: "git status > status.txt" })).toBe(true);
     expect(isMutation("bash", { command: "echo ok 2>> errors.log" })).toBe(true);
@@ -142,11 +179,34 @@ describe("isMutation", () => {
     );
     expect(isMutation("bash", { command: "echo $(( value > limit ))" })).toBe(false);
     expect(isMutation("bash", { command: 'echo "$(( value > limit ))"' })).toBe(false);
+    expect(isMutation("bash", { command: 'X=1 [[ "$left" > "$right" ]]' })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: '< /dev/null [[ "$left" > "$right" ]]',
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: '< "/dev/null" [[ "$left" > "$right" ]]',
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: 'if ! [[ "$left" > "$right" ]]; then printf "ordered\\n"; fi',
+      }),
+    ).toBe(false);
 
     // Single-bracket `>` is a shell redirect unless quoted or escaped.
     expect(isMutation("bash", { command: '[ "$left" > "$right" ]' })).toBe(true);
     expect(isMutation("bash", { command: '[[ "$left" > "$right" ]] > comparison.txt' })).toBe(true);
     expect(isMutation("bash", { command: "(( value > limit )) > arithmetic.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo if [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo X=1 [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo { [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "cat <<< [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "X=1 <<< [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "<<< [[ > output.txt" })).toBe(true);
     expect(
       isMutation("bash", {
         command: '[[ -n "$(printf changed > nested.txt)" ]]',
