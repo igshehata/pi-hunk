@@ -42,7 +42,7 @@
     "lint": "oxlint .",
     "prepare": "npm run build",
     "test": "vitest run",
-    "test:critical": "vitest run test/auto-review-integration.test.ts test/overlay-embedded-integration.test.ts test/exclusive-embedded-integration.test.ts test/experimental-pi-wrap.test.ts test/exclusive-frame.test.ts test/direct-rectangle.test.ts test/overlay-controller.test.ts test/embedded-visibility.test.ts test/config-command.test.ts test/extension-toggle.test.ts test/zigpty-adapter.test.ts",
+    "test:critical": "vitest run test/auto-review-integration.test.ts test/overlay-embedded-integration.test.ts test/exclusive-embedded-integration.test.ts test/experimental-pi-wrap.test.ts test/exclusive-frame.test.ts test/direct-rectangle.test.ts test/overlay-controller.test.ts test/embedded-visibility.test.ts test/takeover.test.ts test/takeover-resume-integration.test.ts test/config-command.test.ts test/extension-toggle.test.ts test/omp-compatibility.test.ts test/zigpty-adapter.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "verify:package": "node scripts/verify-package.mjs"
@@ -78,6 +78,11 @@
     "node": ">=22.19.0"
   },
   "packageManager": "npm@11.17.0",
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
   "pi": {
     "extensions": [
       "./dist/index.js"

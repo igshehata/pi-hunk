@@ -53,8 +53,9 @@ export interface OverlayComponent extends Component {
 }
 
 export type OverlayComponentFactory = (options: EmbeddedOptions) => OverlayComponent;
-export type OverlayChildExitListener = (result: HunkExit) => void;
+export type OverlayChildExitListener = (result: HunkExit) => Promise<void> | void;
 export type OverlayTransitionScheduler = <T>(operation: () => Promise<T>) => Promise<T>;
+export type OverlayReplacementGuard = () => Promise<void>;
 
 /** Minimal shape of the lazily-loaded embedded module. */
 type EmbeddedModule = { EmbeddedHunk: new (options: EmbeddedOptions) => OverlayComponent };
@@ -185,6 +186,7 @@ export class OverlaySurface {
   private stateListener: (() => void) | undefined;
   private childExitListener: OverlayChildExitListener | undefined;
   private transitionScheduler: OverlayTransitionScheduler | undefined;
+  private replacementGuard: OverlayReplacementGuard | undefined;
   private handle: OverlayHandle | undefined;
   private component: OverlayComponent | undefined;
   private currentPid: number | undefined;
@@ -228,6 +230,11 @@ export class OverlaySurface {
   /** Route focused-component actions through the coordinator lifecycle queue. */
   setTransitionScheduler(scheduler: OverlayTransitionScheduler | undefined): void {
     this.transitionScheduler = scheduler;
+  }
+
+  /** Guard direct surface replacements, including focused diff/show callbacks. */
+  setReplacementGuard(guard: OverlayReplacementGuard | undefined): void {
+    this.replacementGuard = guard;
   }
 
   private scheduleTransition<T>(operation: () => Promise<T>): Promise<T> {
@@ -275,6 +282,7 @@ export class OverlaySurface {
         await this.open(ctx, request, config);
         return;
       case "replace":
+        await this.replacementGuard?.();
         await this.close();
         await this.open(ctx, request, config);
         return;
@@ -298,11 +306,12 @@ export class OverlaySurface {
     }
   }
 
-  private emitChildExit(result: HunkExit): void {
+  private async emitChildExit(result: HunkExit): Promise<void> {
     try {
-      this.childExitListener?.(result);
+      await this.childExitListener?.(result);
     } catch {
-      // A misbehaving listener must never corrupt surface state.
+      // A misbehaving listener must never corrupt surface state. The child has
+      // already exited, so teardown must continue after any best-effort guard.
     }
   }
 
@@ -759,9 +768,23 @@ export class OverlaySurface {
       return;
     }
 
-    const message = formatUnexpectedHunkExit(result);
-    this.emitChildExit(result);
+    // Publish `closing` before yielding to the comment barrier. A concurrent
+    // coordinator request can then only wait for this exact closePromise; it
+    // cannot replace the frozen surface while its final session is inspected.
     this.transitionState("closing");
+    this.emitStateChange();
+    void this.finishPresentedChildDone(gen, result, ctx);
+  }
+
+  private async finishPresentedChildDone(
+    gen: number,
+    result: HunkExit,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    await this.emitChildExit(result);
+    if (gen !== this.generation || this.state !== "closing") return;
+
+    const message = formatUnexpectedHunkExit(result);
     if (message) {
       try {
         ctx.ui.notify(message, "error");

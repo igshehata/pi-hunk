@@ -73,6 +73,199 @@ describe("isMutation", () => {
     expect(isMutation("bash", { command: "env FOO=1 printf '>'" })).toBe(false);
   });
 
+  it("recognizes common command wrappers and shell control grammar conservatively", () => {
+    expect(isMutation("bash", { command: "command -- touch generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "exec rm generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "nohup cp a.ts b.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "sudo -n -- mv a.ts b.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "sudo --user root rm generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "doas -n install source.ts target.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "nice -n 5 truncate -s 0 generated.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "timeout -s TERM 2 sh -c 'mkdir out'" })).toBe(true);
+    expect(isMutation("bash", { command: "printf '%s\\n' a.ts | xargs -n 1 rm" })).toBe(true);
+    expect(isMutation("bash", { command: "find build -type f -exec rm {} +" })).toBe(true);
+    expect(isMutation("bash", { command: "find build -type f -delete" })).toBe(true);
+    expect(isMutation("bash", { command: "git restore src/a.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "git checkout -- src/a.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "git mv old.ts new.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "dd if=source.bin of=target.bin" })).toBe(true);
+    expect(isMutation("bash", { command: "if test -f old.ts; then rm old.ts; fi" })).toBe(true);
+    expect(isMutation("bash", { command: 'for file in a b; do touch "$file"; done' })).toBe(true);
+    expect(isMutation("bash", { command: "(mkdir out)" })).toBe(true);
+    expect(isMutation("bash", { command: "{ chmod 600 secret; }" })).toBe(true);
+    expect(isMutation("bash", { command: "! ln -s source target" })).toBe(true);
+
+    expect(isMutation("bash", { command: "sudo -n git status" })).toBe(false);
+    expect(isMutation("bash", { command: "command printf 'please rm the file\\n'" })).toBe(false);
+    expect(isMutation("bash", { command: "find src -type f -print" })).toBe(false);
+    expect(isMutation("bash", { command: "printf 'please rm the file\\n' | xargs echo" })).toBe(
+      false,
+    );
+    expect(isMutation("bash", { command: 'echo "sudo rm prose.ts"' })).toBe(false);
+  });
+
+  it("peels Git global options before classifying subcommands", () => {
+    expect(isMutation("bash", { command: "git -C ../repo restore src/a.ts" })).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "git -c core.fsmonitor=false checkout -- src/a.ts",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "git --git-dir=.git --work-tree=../tree rm old.ts",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "git --paginate -C ../repo mv old.ts new.ts",
+      }),
+    ).toBe(true);
+
+    expect(isMutation("bash", { command: "git -C ../repo status" })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "git -c color.ui=false --no-pager log -1",
+      }),
+    ).toBe(false);
+    expect(isMutation("bash", { command: "git --version" })).toBe(false);
+    expect(isMutation("bash", { command: "git --html-path" })).toBe(false);
+    expect(isMutation("bash", { command: "git --exec-path" })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "git --exec-path=/tmp/git-core status",
+      }),
+    ).toBe(false);
+
+    expect(isMutation("bash", { command: "git --future-option restore src/a.ts" })).toBe(true);
+    expect(isMutation("bash", { command: "git -C" })).toBe(true);
+  });
+
+  it("treats executable shell indirection and output redirection as mutation evidence", () => {
+    expect(isMutation("bash", { command: "git status > status.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo ok 2>> errors.log" })).toBe(true);
+    expect(isMutation("bash", { command: "cat <> state.db" })).toBe(true);
+    expect(isMutation("bash", { command: "exec 3<>state.db" })).toBe(true);
+    expect(isMutation("bash", { command: "echo hello >& output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo hello 1>& output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: 'echo hello >& "$target"' })).toBe(true);
+    expect(isMutation("bash", { command: 'echo "$(touch generated.ts)"' })).toBe(true);
+    expect(isMutation("bash", { command: "cat <(mkdir generated)" })).toBe(true);
+    expect(isMutation("bash", { command: 'bash -c "$COMMAND"' })).toBe(true);
+    expect(isMutation("bash", { command: 'eval "$COMMAND"' })).toBe(true);
+    expect(isMutation("bash", { command: "source ./generated-script.sh" })).toBe(true);
+
+    expect(isMutation("bash", { command: 'echo "git status > status.txt"' })).toBe(false);
+    expect(isMutation("bash", { command: `echo "$(printf 'please rm the file')"` })).toBe(false);
+    expect(isMutation("bash", { command: `bash -c 'echo "$HOME"'` })).toBe(false);
+    expect(isMutation("bash", { command: "printf '2> errors.log\\n'" })).toBe(false);
+    expect(isMutation("bash", { command: 'grep needle <<< "$text"' })).toBe(false);
+    expect(isMutation("bash", { command: 'grep needle 3<<< "$text"' })).toBe(false);
+    expect(isMutation("bash", { command: "echo hello 2>&1" })).toBe(false);
+    expect(isMutation("bash", { command: "echo hello 2>&-" })).toBe(false);
+    expect(isMutation("bash", { command: "echo hello 2>& 10-" })).toBe(false);
+  });
+
+  it("ignores shell syntax inside here-document bodies", () => {
+    expect(
+      isMutation("bash", {
+        command: "python <<'PY'\nprint(1 > 0)\nPY",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<EOF\n1 > 0\nEOF",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<'EOF'\n$(touch ignored.ts)\nEOF",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<EOF\n$(touch generated.ts)\nEOF",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "cat <<-EOF\n\t1 > 0\n\tEOF",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<A <<'B'\n1 > 0\nA\n$(touch ignored.ts)\nB",
+      }),
+    ).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "cat <<EOF\n1 > 0\nEOF\necho ok > output.txt",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "echo ok # <<EOF\necho ok > output.txt",
+      }),
+    ).toBe(true);
+  });
+
+  it("distinguishes shell comparisons and arithmetic from file redirection", () => {
+    expect(isMutation("bash", { command: '[[ "$left" > "$right" ]]' })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: 'if [[ "$left" > "$right" ]]; then printf "ordered\\n"; fi',
+      }),
+    ).toBe(false);
+    expect(isMutation("bash", { command: "(( value > limit ))" })).toBe(false);
+    expect(isMutation("bash", { command: "for ((i = 0; i > limit; i++)); do :; done" })).toBe(
+      false,
+    );
+    expect(isMutation("bash", { command: "echo $(( value > limit ))" })).toBe(false);
+    expect(isMutation("bash", { command: 'echo "$(( value > limit ))"' })).toBe(false);
+    expect(
+      isMutation("bash", {
+        command: "X=1 [[ x > assignment.out ]] || true",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "< /dev/null [[ x > leading.out ]] || true",
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: '< "/dev/null" [[ x > quoted-leading.out ]] || true',
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: 'if ! [[ "$left" > "$right" ]]; then printf "ordered\\n"; fi',
+      }),
+    ).toBe(false);
+
+    // Single-bracket `>` is a shell redirect unless quoted or escaped.
+    expect(isMutation("bash", { command: '[ "$left" > "$right" ]' })).toBe(true);
+    expect(isMutation("bash", { command: '[[ "$left" > "$right" ]] > comparison.txt' })).toBe(true);
+    expect(isMutation("bash", { command: "(( value > limit )) > arithmetic.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo if [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo X=1 [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "echo { [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "cat <<< [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "X=1 <<< [[ > output.txt" })).toBe(true);
+    expect(isMutation("bash", { command: "<<< [[ > output.txt" })).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: '[[ -n "$(printf changed > nested.txt)" ]]',
+      }),
+    ).toBe(true);
+    expect(
+      isMutation("bash", {
+        command: "echo $(( $(printf changed > nested.txt) + 1 ))",
+      }),
+    ).toBe(true);
+  });
+
   it("parses GNU env split-string argv conservatively", () => {
     // Exact review example plus every supported spelling.
     expect(isMutation("bash", { command: `env -S 'bash -c "touch generated.ts"'` })).toBe(true);

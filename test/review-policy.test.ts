@@ -180,7 +180,7 @@ describe("policy defaults", () => {
   it("validates review strings and ships overlay defaults", () => {
     expect(isReviewPolicy("after-run")).toBe(true);
     expect(isReviewPolicy("nope")).toBe(false);
-    expect(DEFAULT_CONFIG.review).toBe("after-run");
+    expect(DEFAULT_CONFIG.review).toBe("off");
     expect(DEFAULT_CONFIG.hunk.args).toContain("--watch");
     expect(DEFAULT_CONFIG).not.toHaveProperty("display");
   });

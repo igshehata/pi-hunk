@@ -19,9 +19,8 @@ export interface ExperimentalPiWrapController {
 export function installExperimentalPiWrap(
   tui: TUI,
   layout: OverlayLayout,
-  enabled = true,
 ): ExperimentalPiWrapController | undefined {
-  if (!enabled || (layout !== "left" && layout !== "right")) return undefined;
+  if (layout !== "left" && layout !== "right") return undefined;
 
   const originalRender = tui.render;
   let active = true;

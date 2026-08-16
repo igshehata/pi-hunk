@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SettledEvidence } from "./change-detector.ts";
 import type { HunkConfig } from "./config.ts";
-import type { ReviewCoordinator } from "./coordinator.ts";
+import type { DestructiveSurfaceTransition, ReviewCoordinator } from "./coordinator.ts";
 import {
   findLiveHunkSession,
   runHunk,
@@ -13,7 +13,7 @@ import {
 } from "./hunk-session.ts";
 import { resolve } from "node:path";
 import { canonicalizePotentialPath, pathIsInside, resolveLaunchDirectory } from "./path-routing.ts";
-import { argsKey } from "./overlay/types.ts";
+import { argsKey, type SurfaceSessionInfo } from "./overlay/types.ts";
 
 /** The deliberately small, read-only note shape exposed to the agent. */
 export interface HunkReviewNote {
@@ -252,6 +252,9 @@ interface ManagedReviewTarget {
   sessionId?: string;
   managedPid: number;
   fileCount: number;
+  /** Present for a coordinator-captured destructive-transition identity. */
+  argsKey?: string;
+  source?: string;
 }
 
 interface PendingReviewNote {
@@ -268,6 +271,39 @@ type ManagedReviewInspection =
 
 /** Acceptance is for the host turn only; it never implies model completion. */
 export type LateReviewSubmissionResult = { status: "accepted" } | { status: "unconfirmed" };
+
+export type ReviewHandoffBarrierBehavior = "block" | "continue-best-effort";
+
+export type ReviewHandoffBarrierResult =
+  | {
+      status: "ready";
+      transition: DestructiveSurfaceTransition;
+      sessionId?: string;
+      pid?: number;
+      /** Notes discovered by this final exact-session probe. */
+      notes: HunkReviewNote[];
+      /** Collected notes whose host acceptance remains unconfirmed. */
+      retainedNotes: number;
+    }
+  | {
+      status: "unavailable";
+      transition: DestructiveSurfaceTransition;
+      behavior: ReviewHandoffBarrierBehavior;
+      reason: string;
+      detail: string;
+    };
+
+/** A user-destructive transition is fail-closed when its exact probe fails. */
+export class ReviewTransitionBlockedError extends Error {
+  readonly name = "ReviewTransitionBlockedError";
+
+  constructor(readonly result: Extract<ReviewHandoffBarrierResult, { status: "unavailable" }>) {
+    super(
+      `Hunk ${result.transition} was blocked because comments could not be preserved ` +
+        `(${result.reason}): ${result.detail}`,
+    );
+  }
+}
 
 export interface LateReviewDeliveryContext {
   /** Pi-session epoch that discovered and owns this batch. */
@@ -304,6 +340,8 @@ interface LateDelivery {
   promise: Promise<void>;
 }
 
+const LATE_HIDE_RECHECK_MS = 150;
+
 /** One asynchronous comment handoff and repository queue per Pi session. */
 export class ReviewHandoffGate {
   private readonly submittedNoteKeys = new Set<string>();
@@ -324,13 +362,185 @@ export class ReviewHandoffGate {
   /** Recoverable automatic inspection failure, retained until a successful retry/reset. */
   private lateProbeFailure: LateProbeFailureState | null = null;
   private lateDelivery: LateDelivery | null = null;
+  private lateHideRecheckTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly coordinator: ReviewCoordinator,
     private readonly getConfig: () => HunkConfig,
     private readonly run?: HunkRunner,
     private readonly waitForSession: ReviewSessionWaiter = waitForManagedHunkSession,
-  ) {}
+  ) {
+    // The coordinator owns transition serialization; this callback performs no
+    // queued coordinator operation, so holding that queue while probing cannot
+    // deadlock. User close/replace/release is fail-closed. Lifecycle teardown
+    // and a child that has already exited are necessarily best-effort.
+    this.coordinator.setDestructiveTransitionGuard?.(async (transition, surface) => {
+      const result = await this.beforeDestructiveTransition(transition, surface);
+      if (result.status === "unavailable" && result.behavior === "block") {
+        throw new ReviewTransitionBlockedError(result);
+      }
+    });
+  }
+
+  /**
+   * Inspect and drain the exact active PID/session before its surface is lost.
+   * The caller-provided identity is captured by the coordinator while its
+   * transition queue owns that surface; no repository-nearest fallback occurs.
+   */
+  async beforeDestructiveTransition(
+    transition: DestructiveSurfaceTransition,
+    surface: SurfaceSessionInfo | null = this.coordinator.getActiveInfo(),
+  ): Promise<ReviewHandoffBarrierResult> {
+    const behavior = this.barrierBehavior(transition);
+    if (!surface) {
+      return { status: "ready", transition, notes: [], retainedNotes: 0 };
+    }
+    if (surface.pid === undefined || !Number.isInteger(surface.pid) || surface.pid <= 0) {
+      return this.barrierUnavailable(
+        transition,
+        behavior,
+        "managed-pid-missing",
+        "the active Pi-owned Hunk surface has no valid managed PID",
+      );
+    }
+
+    const epoch = this.sessionEpoch;
+    const target: ManagedReviewTarget = {
+      launchCwd: surface.launchCwd,
+      repoRoot: surface.repoRoot,
+      sessionId: surface.sessionId,
+      managedPid: surface.pid,
+      fileCount: surface.fileCount ?? 0,
+      argsKey: surface.argsKey,
+      source: surface.source,
+    };
+    const allowClosing = transition === "natural-exit";
+    const inspected = await this.runInspection(async (): Promise<ReviewHandoffBarrierResult> => {
+      if (epoch !== this.sessionEpoch) {
+        return this.barrierUnavailable(
+          transition,
+          behavior,
+          "session-boundary",
+          "the Pi session changed before its Hunk comments could be inspected",
+        );
+      }
+      if (!this.targetMatchesActiveSurface(target, allowClosing)) {
+        return this.barrierUnavailable(
+          transition,
+          behavior,
+          "surface-changed",
+          "the exact active Hunk surface changed before its comments could be inspected",
+        );
+      }
+
+      try {
+        const review = await this.inspectTarget(target, undefined, allowClosing);
+        if (epoch !== this.sessionEpoch) {
+          return this.barrierUnavailable(
+            transition,
+            behavior,
+            "session-boundary",
+            "the Pi session changed while its Hunk comments were being inspected",
+          );
+        }
+        if (review.status === "not-found") {
+          return this.barrierUnavailable(
+            transition,
+            behavior,
+            "hunk-died",
+            "the exact managed Hunk session was not found",
+          );
+        }
+        if (review.status === "surface-changed") {
+          return this.barrierUnavailable(
+            transition,
+            behavior,
+            "surface-changed",
+            "the exact active Hunk surface changed while its comments were being inspected",
+          );
+        }
+        if (!allowClosing && !this.adoptInspectedSession(target, review.session)) {
+          return this.barrierUnavailable(
+            transition,
+            behavior,
+            "surface-changed",
+            "the exact managed Hunk session could not be adopted by its active surface",
+          );
+        }
+
+        this.lateProbeFailure = null;
+        const notes: HunkReviewNote[] = [];
+        if (review.status === "reviewable") {
+          notes.push(...this.unseenNotes(review.session.sessionId, review.notes));
+          if (notes.length > 0) {
+            this.submitDetectedNotes(review.session.sessionId, notes, review.notes.length);
+          }
+        }
+        return {
+          status: "ready",
+          transition,
+          sessionId: review.session.sessionId,
+          pid: review.session.pid,
+          notes,
+          retainedNotes: this.pendingReviewNotes.size,
+        };
+      } catch (error) {
+        return this.barrierUnavailable(
+          transition,
+          behavior,
+          "comment-probe-failed",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    });
+
+    // Host delivery is deliberately awaited outside inspectionQueue. A host
+    // callback can therefore trigger /hunk feedback without creating a queue
+    // cycle, while the coordinator still holds the exact destructive surface.
+    await this.awaitCurrentDelivery(epoch);
+    if (epoch !== this.sessionEpoch) {
+      return this.barrierUnavailable(
+        transition,
+        behavior,
+        "session-boundary",
+        "the Pi session changed while collected Hunk comments were being delivered",
+      );
+    }
+    if (inspected.status === "ready") {
+      return { ...inspected, retainedNotes: this.pendingReviewNotes.size };
+    }
+    return inspected;
+  }
+
+  private barrierBehavior(transition: DestructiveSurfaceTransition): ReviewHandoffBarrierBehavior {
+    return transition === "shutdown" ||
+      transition === "activate" ||
+      transition === "natural-exit" ||
+      transition === "automatic-release"
+      ? "continue-best-effort"
+      : "block";
+  }
+
+  private barrierUnavailable(
+    transition: DestructiveSurfaceTransition,
+    behavior: ReviewHandoffBarrierBehavior,
+    reason: string,
+    detail: string,
+  ): Extract<ReviewHandoffBarrierResult, { status: "unavailable" }> {
+    const result = { status: "unavailable" as const, transition, behavior, reason, detail };
+    if (behavior === "continue-best-effort") {
+      const handler = this.lateProbeWarningHandler;
+      try {
+        handler?.(
+          `Hunk comments could not be inspected before ${transition} (${detail}); ` +
+            "teardown will continue because this transition cannot safely be blocked.",
+        );
+      } catch {
+        // A lifecycle warning must never prevent unavoidable teardown.
+      }
+    }
+    return result;
+  }
 
   /** Report a failed hide probe once, with `/hunk feedback` as its recovery action. */
   onLateProbeWarning(handler: LateReviewProbeWarningHandler): () => void {
@@ -357,6 +567,7 @@ export class ReviewHandoffGate {
       this.lateStateUnsubscribe?.();
       this.lateStateUnsubscribe = null;
       this.lateSurfaceSnapshot = null;
+      this.clearLateHideRecheck();
     };
   }
 
@@ -376,6 +587,7 @@ export class ReviewHandoffGate {
     // returned snapshot is the explicit lifecycle handoff for failed,
     // unconfirmed, or aborted notes and can never join the new epoch's queue.
     this.pendingReviewNotes = new Map();
+    this.clearLateHideRecheck();
     this.evidenceRevision = 0;
     this.submittedNoteKeys.clear();
     this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
@@ -879,6 +1091,7 @@ export class ReviewHandoffGate {
   private async inspectTarget(
     target: ManagedReviewTarget,
     signal?: AbortSignal,
+    allowClosing = false,
   ): Promise<ManagedReviewInspection> {
     const config = this.getConfig();
     const refreshed = await this.waitForSession({
@@ -897,7 +1110,7 @@ export class ReviewHandoffGate {
       throw new Error("The managed Hunk session changed while comments were being collected.");
     }
 
-    if (!this.sessionMatchesActiveSurface(refreshed.session)) {
+    if (!this.targetMatchesActiveSurface(target, allowClosing)) {
       return { status: "surface-changed" };
     }
     if (refreshed.status === "no-diff") {
@@ -912,6 +1125,11 @@ export class ReviewHandoffGate {
       run: this.run,
       signal,
     });
+    // Comment-list is pinned to the refreshed session id, but delivery also
+    // requires that the coordinator still owns the same exact PTY afterward.
+    if (!this.targetMatchesActiveSurface(target, allowClosing)) {
+      return { status: "surface-changed" };
+    }
     return { status: "reviewable", session: refreshed.session, notes: review.notes };
   }
 
@@ -960,7 +1178,7 @@ export class ReviewHandoffGate {
   private async runReviewAction(ctx: ExtensionContext): Promise<HunkFeedbackResult> {
     if (ctx.mode !== "tui") return this.unavailable("not-tui");
     const actionEpoch = this.sessionEpoch;
-    if (this.lateDelivery) await this.lateDelivery.promise;
+    await this.awaitCurrentDelivery(actionEpoch);
     if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
 
     // Retry known notes first, but still perform the promised fresh probe. New
@@ -1018,13 +1236,7 @@ export class ReviewHandoffGate {
           return this.pendingResult("No new Hunk notes were found.");
         }
 
-        const result = this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
-        if (this.lateDelivery) await this.lateDelivery.promise;
-        return unseen.some((note) => this.pendingReviewNotes.has(this.noteKey(sessionId, note)))
-          ? this.pendingResult(
-              "Fresh Hunk notes remain queued; run /hunk feedback if automatic delivery keeps failing.",
-            )
-          : result;
+        return this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
       } catch (error) {
         return this.unavailable(
           "comment-probe-failed",
@@ -1032,6 +1244,9 @@ export class ReviewHandoffGate {
         );
       }
     });
+
+    await this.awaitCurrentDelivery(actionEpoch);
+    if (actionEpoch !== this.sessionEpoch) return this.unavailable("session-boundary");
 
     const deliveredQueuedNotes = queuedEntries
       .filter(([key, entry]) => this.pendingReviewNotes.get(key) !== entry)
@@ -1051,6 +1266,23 @@ export class ReviewHandoffGate {
     }
     if (deliveredQueuedNotes.length > 0) return this.submittedResult(deliveredQueuedNotes);
     return probed;
+  }
+
+  private targetMatchesActiveSurface(target: ManagedReviewTarget, allowClosing = false): boolean {
+    const info = this.coordinator.getActiveInfo();
+    if (
+      !info ||
+      (info.state !== "visible" &&
+        info.state !== "hidden" &&
+        !(allowClosing && info.state === "closing")) ||
+      info.pid !== target.managedPid
+    ) {
+      return false;
+    }
+    if (target.sessionId !== undefined && info.sessionId !== target.sessionId) return false;
+    if (target.argsKey !== undefined && info.argsKey !== target.argsKey) return false;
+    if (target.source !== undefined && info.source !== target.source) return false;
+    return info.launchCwd === target.launchCwd;
   }
 
   private sessionMatchesActiveSurface(session: LiveHunkSession): boolean {
@@ -1128,20 +1360,78 @@ export class ReviewHandoffGate {
     const previous = this.lateSurfaceSnapshot;
     const current = this.currentSurfaceSnapshot();
     this.lateSurfaceSnapshot = current;
-    if (
-      !previous ||
-      !current ||
-      previous.key !== current.key ||
-      previous.state !== "visible" ||
-      current.state !== "hidden"
-    ) {
+    if (!previous || !current || previous.key !== current.key) {
+      this.clearLateHideRecheck();
       return;
     }
+
+    const hidden = previous.state === "visible" && current.state === "hidden";
+    const restored = previous.state === "hidden" && current.state === "visible";
+    const hadPendingEmptyRecheck = this.lateHideRecheckTimer !== null;
+    // Restore needs a fresh probe only when the successful hide probe found no
+    // notes and armed its persistence debounce. Failed probes retain their one
+    // warning; discovered notes retain their explicit delivery/retry semantics.
+    if (!hidden && !(restored && hadPendingEmptyRecheck)) return;
+
     const target = this.activeReviewTarget();
     if (!target) return;
     const epoch = this.sessionEpoch;
     const lifecycle = ++this.lateSurfaceLifecycle;
-    void this.runInspection(() => this.probeLateTarget(target, epoch, current.key, lifecycle));
+    const probe = this.runInspection(() =>
+      this.probeLateTarget(target, epoch, current.key, lifecycle),
+    );
+
+    this.clearLateHideRecheck();
+    if (!hidden) {
+      void probe;
+      return;
+    }
+    // Hunk may persist a just-saved note shortly after Pi observes the hide.
+    // Recheck only when the immediate exact-session probe succeeded but found
+    // nothing; failures keep their one warning and discovered notes must not
+    // cause an unsolicited retry after a delivery failure.
+    void probe.then((result) => {
+      if (
+        result !== "empty" ||
+        epoch !== this.sessionEpoch ||
+        lifecycle !== this.lateSurfaceLifecycle
+      ) {
+        return;
+      }
+      const snapshot = this.currentSurfaceSnapshot();
+      if (!snapshot || snapshot.key !== current.key) return;
+      if (snapshot.state === "visible") {
+        const latest = this.activeReviewTarget();
+        if (latest) {
+          void this.runInspection(() =>
+            this.probeLateTarget(latest, epoch, current.key, lifecycle),
+          );
+        }
+        return;
+      }
+      if (snapshot.state !== "hidden") return;
+      this.lateHideRecheckTimer = setTimeout(() => {
+        this.lateHideRecheckTimer = null;
+        if (epoch !== this.sessionEpoch || lifecycle !== this.lateSurfaceLifecycle) return;
+        const latestSnapshot = this.currentSurfaceSnapshot();
+        if (
+          !latestSnapshot ||
+          latestSnapshot.key !== current.key ||
+          latestSnapshot.state !== "hidden"
+        ) {
+          return;
+        }
+        const latest = this.activeReviewTarget();
+        if (!latest) return;
+        void this.runInspection(() => this.probeLateTarget(latest, epoch, current.key, lifecycle));
+      }, LATE_HIDE_RECHECK_MS);
+      this.lateHideRecheckTimer.unref?.();
+    });
+  }
+
+  private clearLateHideRecheck(): void {
+    if (this.lateHideRecheckTimer) clearTimeout(this.lateHideRecheckTimer);
+    this.lateHideRecheckTimer = null;
   }
 
   private async probeLateTarget(
@@ -1149,10 +1439,10 @@ export class ReviewHandoffGate {
     epoch: number,
     surfaceKey: string,
     lifecycle: number,
-  ): Promise<void> {
+  ): Promise<"empty" | "handled" | "failed" | "stale"> {
     try {
       const inspected = await this.inspectTarget(target);
-      if (epoch !== this.sessionEpoch) return;
+      if (epoch !== this.sessionEpoch) return "stale";
       if (inspected.status === "not-found") {
         this.recordLateProbeFailure(
           epoch,
@@ -1160,7 +1450,7 @@ export class ReviewHandoffGate {
           lifecycle,
           "the managed Hunk session was not found",
         );
-        return;
+        return "failed";
       }
       if (inspected.status === "surface-changed") {
         this.recordLateProbeFailure(
@@ -1169,7 +1459,7 @@ export class ReviewHandoffGate {
           lifecycle,
           "the managed Hunk surface changed",
         );
-        return;
+        return "failed";
       }
       if (!this.adoptInspectedSession(target, inspected.session)) {
         this.recordLateProbeFailure(
@@ -1178,23 +1468,26 @@ export class ReviewHandoffGate {
           lifecycle,
           "the managed Hunk surface changed",
         );
-        return;
+        return "failed";
       }
       this.lateProbeFailure = null;
-      if (inspected.status === "no-diff") return;
+      if (inspected.status === "no-diff") return "empty";
       const sessionId = inspected.session.sessionId;
       const unseen = this.unseenNotes(sessionId, inspected.notes);
       if (unseen.length > 0) {
         this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
+        return "handled";
       }
+      return "empty";
     } catch (error) {
-      if (epoch !== this.sessionEpoch) return;
+      if (epoch !== this.sessionEpoch) return "stale";
       this.recordLateProbeFailure(
         epoch,
         surfaceKey,
         lifecycle,
         error instanceof Error ? error.message : String(error),
       );
+      return "failed";
     }
   }
 
@@ -1228,6 +1521,15 @@ export class ReviewHandoffGate {
       );
     } catch {
       // Notification failure must not affect probe recovery or create a retry loop.
+    }
+  }
+
+  private async awaitCurrentDelivery(epoch: number): Promise<void> {
+    for (;;) {
+      const delivery = this.lateDelivery;
+      if (!delivery || delivery.epoch !== epoch) return;
+      await delivery.promise;
+      if (this.lateDelivery === delivery) this.lateDelivery = null;
     }
   }
 

@@ -2,7 +2,7 @@ import { createTerminal } from "@coder/libghostty-vt-node";
 import type { GhosttyVtTerminal } from "@coder/libghostty-vt-node";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import type { Component, Focusable, KeyId, TUI } from "@earendil-works/pi-tui";
-import { MouseInputTranslator, toPtyInput, type MouseViewport } from "./input.ts";
+import { MouseInputTranslator, PtyInputEncoder, type MouseViewport } from "./input.ts";
 import { type OverlayPty, type PtySubscription, spawnOverlayPty } from "./pty.ts";
 import { paintTerminalCursor, renderGhosttyHtml, resizeRenderedLines } from "./render-buffer.ts";
 import type { TerminalCursor } from "./render-buffer.ts";
@@ -85,7 +85,7 @@ type PtyState = "running" | "exited" | "disposed";
 type PtyEvent = "exit" | "dispose";
 const PTY_TRANSITIONS: Record<PtyState, Record<PtyEvent, PtyState>> = {
   running: { exit: "exited", dispose: "disposed" },
-  exited: { exit: "exited", dispose: "exited" },
+  exited: { exit: "exited", dispose: "disposed" },
   disposed: { exit: "disposed", dispose: "disposed" },
 };
 
@@ -151,6 +151,7 @@ export class EmbeddedHunk implements Component, Focusable {
   private readonly exclusiveFrame?: ExclusiveFrameController;
   private readonly startupFrameDeadlineMs: number;
   private readonly mouseInput = new MouseInputTranslator();
+  private readonly ptyInput = new PtyInputEncoder();
   private prefixPending = false;
   private columns: number;
   private rows: number;
@@ -201,7 +202,11 @@ export class EmbeddedHunk implements Component, Focusable {
     const next = PRESENTATION_TRANSITIONS[this.presentationState][event];
     if (next === this.presentationState) return;
     this.presentationState = next;
-    if (!value) this.prefixPending = false;
+    if (!value) {
+      this.prefixPending = false;
+      this.mouseInput.reset();
+      this.ptyInput.reset();
+    }
     // Revoke direct terminal ownership before focus-driven cursor/mouse writes.
     this.exclusiveFrame?.setFocused(value);
     this.updateMouseMode();
@@ -298,37 +303,51 @@ export class EmbeddedHunk implements Component, Focusable {
       throw error;
     }
 
-    const gen = this.generation;
-    this.subscriptions.push(
-      this.pty.onData((data) => {
-        if (!this.isRunning() || gen !== this.generation) return;
-        // Feed through each completed boundary separately. A chunk may end frame
-        // N and begin frame N+1; frame N must be captured before N+1 mutates the
-        // native terminal buffer.
-        const synchronizedFrame = this.processSynchronizedFrameOutput(data);
-        // Avoid exposing OpenTUI's capability-probe prelude between the startup
-        // placeholder and its first complete synchronized frame.
-        if (this.startupState !== "ready") this.observeStartupOutput(synchronizedFrame);
-        // Keep the native terminal current while hidden, but only notify a visible
-        // consumer of complete frames. A completion is a publication event even
-        // when the final state of this PTY chunk is another open frame.
-        if (this.isVisibleState() && this.startupState === "ready") {
-          if (synchronizedFrame.publishedRevision !== undefined) {
-            this.requestFrame(synchronizedFrame.publishedRevision);
-          } else if (!this.synchronizedFrameOpen) {
-            this.requestFrame();
+    try {
+      const gen = this.generation;
+      // Store each subscription immediately. Array.push(a, b) evaluates both
+      // subscriptions before retaining either one, so an onExit setup failure
+      // would otherwise strand a successfully installed onData listener.
+      this.subscriptions.push(
+        this.pty.onData((data) => {
+          if (!this.isRunning() || gen !== this.generation) return;
+          // Feed through each completed boundary separately. A chunk may end frame
+          // N and begin frame N+1; frame N must be captured before N+1 mutates the
+          // native terminal buffer.
+          const synchronizedFrame = this.processSynchronizedFrameOutput(data);
+          // Avoid exposing OpenTUI's capability-probe prelude between the startup
+          // placeholder and its first complete synchronized frame.
+          if (this.startupState !== "ready") this.observeStartupOutput(synchronizedFrame);
+          // Keep the native terminal current while hidden, but only notify a visible
+          // consumer of complete frames. A completion is a publication event even
+          // when the final state of this PTY chunk is another open frame.
+          if (this.isVisibleState() && this.startupState === "ready") {
+            if (synchronizedFrame.publishedRevision !== undefined) {
+              this.requestFrame(synchronizedFrame.publishedRevision);
+            } else if (!this.synchronizedFrameOpen) {
+              this.requestFrame();
+            }
           }
-        }
-      }),
-      this.pty.onExit((event) => {
-        if (!this.isRunning() || gen !== this.generation) return;
-        this.transitionPty("exit");
-        const detail = this.captureExitDetail();
-        this.complete(detail ? { ...event, detail } : event);
-      }),
-    );
-    this.armStartupDeadline();
-    this.updateMouseMode();
+        }),
+      );
+      this.subscriptions.push(
+        this.pty.onExit((event) => {
+          if (!this.isRunning() || gen !== this.generation) return;
+          this.transitionPty("exit");
+          const detail = this.captureExitDetail();
+          // A reaped PTY leader can leave its process group alive. Disposal is
+          // still required so the adapter can terminate captured descendants.
+          this.complete(detail ? { ...event, detail } : event, { disposePty: true });
+        }),
+      );
+      this.armStartupDeadline();
+      this.updateMouseMode();
+    } catch (error) {
+      // Spawning transferred ownership to this component. Roll back every lease
+      // acquired so far while preserving the subscription setup exception.
+      this.dispose();
+      throw error;
+    }
   }
 
   /**
@@ -336,7 +355,10 @@ export class EmbeddedHunk implements Component, Focusable {
    * Call before/after OverlayHandle.setHidden so mouse state stays in lockstep.
    */
   setVisible(visible: boolean): void {
-    if (!visible) this.mouseInput.reset();
+    if (!visible) {
+      this.mouseInput.reset();
+      this.ptyInput.reset();
+    }
     const event: PresentationEvent = visible ? "show" : "hide";
     const next = PRESENTATION_TRANSITIONS[this.presentationState][event];
     if (next === this.presentationState) return;
@@ -358,6 +380,7 @@ export class EmbeddedHunk implements Component, Focusable {
     if (!this.isVisibleState() || !this.isRunning()) return;
     if (!isKeyRelease(data) && this.prefixKey && matchesKey(data, this.prefixKey)) {
       this.prefixPending = true;
+      this.ptyInput.reset();
       this.exclusiveFrame?.armPostInputRenderSuppression();
       return;
     }
@@ -369,7 +392,7 @@ export class EmbeddedHunk implements Component, Focusable {
       // Unknown suffixes cancel the Pi-hunk chord and are not sent to Hunk.
       return;
     }
-    let translated = toPtyInput(data);
+    let translated = this.ptyInput.translate(data);
     if (translated && this.resolveMouseViewport) {
       const viewport = this.resolveMouseViewport(
         this.tui.terminal.columns,
@@ -460,24 +483,41 @@ export class EmbeddedHunk implements Component, Focusable {
     if (this.isDisposed()) return;
     this.transitionLifecycle("dispose");
     this.transitionStartup("dispose");
-    this.exclusiveFrame?.revoke("component-disposed");
+    try {
+      this.exclusiveFrame?.revoke("component-disposed");
+    } catch {
+      // Continue releasing independently owned cleanup leases.
+    }
     this.mouseInput.reset();
+    this.ptyInput.reset();
     this.generation += 1;
     this.clearStartupTimers();
     this.setMouseEnabled(false);
-    if (this.ptyState === "running") {
+    if (this.ptyState !== "disposed") {
+      // Backend leader exit is not adapter disposal: captured descendants may
+      // still occupy the PTY process group and need TERM→KILL escalation.
       this.transitionPty("dispose");
       try {
         this.pty.dispose();
       } catch {
-        // Already exited.
+        // The backend may already be closed; remaining cleanup must still run.
       }
     }
     this.renderQueued = false;
     this.renderQueuedFrameRevision = undefined;
-    for (const subscription of this.subscriptions) subscription.dispose();
+    for (const subscription of this.subscriptions) {
+      try {
+        subscription.dispose();
+      } catch {
+        // One faulty disposer must not strand later subscriptions or terminal state.
+      }
+    }
     this.subscriptions.length = 0;
-    this.terminal.dispose();
+    try {
+      this.terminal.dispose();
+    } catch {
+      // Native terminal teardown is best-effort and disposal remains idempotent.
+    }
   }
 
   /**
@@ -728,16 +768,23 @@ export class EmbeddedHunk implements Component, Focusable {
 
   private complete(result: HunkExit, options: { disposePty?: boolean } = {}): void {
     if (!this.isRunning()) return;
-    this.transitionLifecycle("complete");
-    this.exclusiveFrame?.revoke("child-completed");
-    this.mouseInput.reset();
-    this.renderQueued = false;
-    this.renderQueuedFrameRevision = undefined;
-    this.clearStartupTimers();
-    this.setMouseEnabled(false);
     try {
+      this.transitionLifecycle("complete");
+      try {
+        this.exclusiveFrame?.revoke("child-completed");
+      } catch {
+        // A presentation hook must not suppress the authoritative child result.
+      }
+      this.mouseInput.reset();
+      this.ptyInput.reset();
+      this.renderQueued = false;
+      this.renderQueuedFrameRevision = undefined;
+      this.clearStartupTimers();
+      this.setMouseEnabled(false);
       this.done(result);
     } finally {
+      // Natural leader exit and startup failure both transfer immediately to
+      // full disposal, even if an observer or presentation cleanup hook throws.
       if (options.disposePty) this.dispose();
     }
   }

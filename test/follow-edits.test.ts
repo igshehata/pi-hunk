@@ -200,7 +200,7 @@ describe("navigateHunkSession", () => {
       filePath: "src/a.ts",
       hunk: 3,
       sessionId: "pinned",
-      managedPid: 222,
+      managedPid: 111,
       run,
     });
     expect(run).toHaveBeenCalledTimes(2);
@@ -328,9 +328,9 @@ describe("navigateHunkSession", () => {
             managedPid: 909,
             run,
           }),
-        ).rejects.toThrow(/outside selected repository/);
-        // The target remains absolute evidence for repository routing; it must
-        // never be translated into a --file argument for the main worktree.
+        ).rejects.toThrow(/No live Hunk session found/);
+        // The sibling worktree must not be treated as the exact-PID session's
+        // repository or translated into a --file argument for the main worktree.
         expect(run).toHaveBeenCalledTimes(1);
       } finally {
         await execFileAsync("git", ["-C", mainRepo, "worktree", "remove", "--force", featureRepo], {
@@ -368,7 +368,7 @@ describe("navigateHunkSession", () => {
             managedPid: 910,
             run,
           }),
-        ).rejects.toThrow(/outside selected repository/);
+        ).rejects.toThrow(/No live Hunk session found/);
         expect(run).toHaveBeenCalledTimes(1);
       } finally {
         await rm(root, { recursive: true, force: true });

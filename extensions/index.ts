@@ -65,6 +65,26 @@ interface SettledDiagnostics {
 const UNRESOLVED_MUTATION_WARNING =
   "Automatic Hunk review skipped a pathless mutation because its repository could not be inferred safely; open Hunk manually from the target repository.";
 
+interface OmpAgentEndEvent {
+  type: "agent_end";
+  willContinue?: boolean;
+}
+
+interface OmpExtensionAPI {
+  readonly zod: unknown;
+  on(
+    event: "agent_end",
+    handler: (event: OmpAgentEndEvent, ctx: ExtensionContext) => Promise<void> | void,
+  ): void;
+}
+
+interface RuntimeRegistrationOptions {
+  registerSessionLifecycle: boolean;
+  hostName: "Pi" | "OMP";
+  settledEvent: "agent_settled" | "agent_end";
+  preparedConfigWarnings?: readonly string[];
+}
+
 /**
  * Collaborators shared by the lifecycle handlers below. The factory builds
  * this once; each `pi.on` registration only wires it into one named handler.
@@ -75,13 +95,23 @@ interface LifecycleDeps {
   coordinator: ReviewCoordinator;
   reviewGate: ReviewHandoffGate;
   diagnostics: SettledDiagnostics;
-  /** Registers the config-driven prefix; see the factory for why registration is late-bound. */
-  registerPrefix: (ctx: ExtensionContext) => void;
+  /** Registers the config-driven prefix before the host snapshots shortcuts. */
+  registerPrefix: (ctx?: ExtensionContext) => void;
   /** Selects the Pi session that receives live coordinator status updates. */
   setStatusContext: (ctx: ExtensionContext | undefined) => void;
 }
 
-export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps = {}): void {
+interface HunkRuntimeLifecycle {
+  startSession: (ctx: ExtensionContext) => Promise<void>;
+  shutdownSession: (ctx: ExtensionContext) => Promise<void>;
+  registerPrefix: () => void;
+}
+
+function registerHunkRuntime(
+  pi: ExtensionAPI,
+  deps: HunkExtensionDeps,
+  options: RuntimeRegistrationOptions,
+): HunkRuntimeLifecycle {
   const store = deps.store ?? new ConfigStore();
   const detector = deps.detector ?? new ChangeDetector();
   const coordinator = deps.coordinator ?? new ReviewCoordinator();
@@ -93,20 +123,19 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
   );
 
   /**
-   * The dedicated prefix is configurable, but config only loads inside
-   * session_start. Pi snapshots extension shortcuts after session_start
-   * handlers settle, so late registration here is still early enough.
+   * Pi loads config during session_start, before it snapshots shortcuts. OMP
+   * snapshots registrations earlier, so its bootstrap preloads config and calls
+   * this once before the async extension factory resolves.
    */
   let registeredPrefix: string | undefined;
   const registeredPrefixes = new Set<string>();
-  const registerPrefix = (ctx: ExtensionContext): void => {
+  const registerPrefix = (ctx?: ExtensionContext): void => {
     const prefix = store.get().bindings.prefix;
     if (registeredPrefix === prefix) return;
     if (registeredPrefix !== undefined) {
-      // Pi has no shortcut unregistration: within one extension load the old
-      // prefix stays bound. Say so instead of pretending the rebind was clean.
-      ctx.ui.notify(
-        `Pi-hunk prefix changed to ${prefix}; ${registeredPrefix} stays active until Pi reloads extensions.`,
+      // Neither host exposes shortcut unregistration within an extension load.
+      ctx?.ui.notify(
+        `Pi-hunk prefix changed to ${prefix}; ${registeredPrefix} stays active until ${options.hostName} reloads extensions.`,
         "warning",
       );
     }
@@ -166,10 +195,29 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
     },
   };
 
-  pi.on("session_start", (_event, ctx) => onSessionStart(ctx, lifecycle));
-  pi.on("session_shutdown", (_event, ctx) => onSessionShutdown(ctx, lifecycle));
+  let preparedConfigWarnings = options.preparedConfigWarnings;
+  const runtime: HunkRuntimeLifecycle = {
+    startSession: (ctx) => {
+      const prepared = preparedConfigWarnings;
+      preparedConfigWarnings = undefined;
+      return onSessionStart(ctx, lifecycle, prepared);
+    },
+    shutdownSession: (ctx) => onSessionShutdown(ctx, lifecycle),
+    registerPrefix: () => registerPrefix(),
+  };
+  if (options.registerSessionLifecycle) {
+    pi.on("session_start", (_event, ctx) => runtime.startSession(ctx));
+    pi.on("session_shutdown", (_event, ctx) => runtime.shutdownSession(ctx));
+  }
   pi.on("agent_start", (_event, ctx) => onAgentStart(ctx, lifecycle));
-  pi.on("agent_settled", (_event, ctx) => onAgentSettled(ctx, lifecycle));
+  if (options.settledEvent === "agent_end") {
+    const omp = pi as unknown as OmpExtensionAPI;
+    omp.on("agent_end", (event, ctx) => {
+      if (!event.willContinue) return onAgentSettled(ctx, lifecycle);
+    });
+  } else {
+    pi.on("agent_settled", (_event, ctx) => onAgentSettled(ctx, lifecycle));
+  }
   pi.on("tool_call", (event, ctx) => onToolCall(event, ctx, lifecycle));
   pi.on("tool_execution_start", (event, ctx) => onToolExecutionStart(event, ctx, lifecycle));
   pi.on("tool_execution_end", (event, ctx) => onToolExecutionEnd(event, ctx, lifecycle));
@@ -181,15 +229,134 @@ export default function hunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps 
     handler: (input, ctx) =>
       routeHunkCommand(input, ctx, store, coordinator, diagnostics, deps.reviewRun, reviewGate),
   });
+  return runtime;
+}
+
+/** Register directly for deterministic integration tests with injected collaborators. */
+export function registerHunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps = {}): void {
+  registerHunkRuntime(pi, deps, {
+    registerSessionLifecycle: true,
+    hostName: "Pi",
+    settledEvent: "agent_settled",
+  });
+}
+
+interface ProductionSessionLifecycle {
+  startSession: (ctx: ExtensionContext) => Promise<void>;
+  shutdownSession: (ctx: ExtensionContext) => Promise<void>;
+}
+
+/**
+ * A host may repeat a lifecycle notification or begin a replacement context
+ * before the prior context's shutdown arrives. Serialize real transitions,
+ * remember starts by context identity, and revoke old shutdown ownership
+ * synchronously when a distinct context starts.
+ */
+function productionSessionLifecycle(runtime: HunkRuntimeLifecycle): ProductionSessionLifecycle {
+  const starts = new WeakMap<ExtensionContext, Promise<void>>();
+  let currentContext: ExtensionContext | undefined;
+  let transitions = Promise.resolve();
+
+  const enqueue = (operation: () => Promise<void>): Promise<void> => {
+    const pending = transitions.then(operation);
+    transitions = pending.catch(() => undefined);
+    return pending;
+  };
+
+  return {
+    startSession: (ctx) => {
+      const existing = starts.get(ctx);
+      if (existing) return existing;
+
+      // This assignment precedes queued initialization deliberately: once the
+      // host presents a newer context, a late shutdown for the old one is stale.
+      currentContext = ctx;
+      const pending = enqueue(async () => {
+        await runtime.startSession(ctx);
+      });
+      starts.set(ctx, pending);
+      return pending;
+    },
+    shutdownSession: (ctx) => {
+      if (currentContext !== ctx) return Promise.resolve();
+      currentContext = undefined;
+      return enqueue(() => runtime.shutdownSession(ctx));
+    },
+  };
+}
+
+function isOmpExtensionApi(pi: ExtensionAPI): pi is ExtensionAPI & OmpExtensionAPI {
+  return "zod" in pi;
+}
+
+async function registerOmpProductionExtension(pi: ExtensionAPI & OmpExtensionAPI): Promise<void> {
+  const store = new ConfigStore();
+  const preparedConfigWarnings: string[] = [];
+  try {
+    await store.startSession({ cwd: process.cwd() }, (message) =>
+      preparedConfigWarnings.push(message),
+    );
+  } catch (error) {
+    preparedConfigWarnings.push(error instanceof Error ? error.message : String(error));
+  }
+
+  const runtime = registerHunkRuntime(
+    pi,
+    { store },
+    {
+      registerSessionLifecycle: false,
+      hostName: "OMP",
+      settledEvent: "agent_end",
+      preparedConfigWarnings,
+    },
+  );
+  runtime.registerPrefix();
+  const sessions = productionSessionLifecycle(runtime);
+  pi.on("session_start", (_event, ctx) => sessions.startSession(ctx));
+  pi.on("session_shutdown", (_event, ctx) => sessions.shutdownSession(ctx));
+}
+
+/**
+ * Production bootstrap. Pi can register its config-driven shortcut during
+ * session_start. OMP snapshots shortcuts earlier, so its async bootstrap
+ * preloads config and registers eagerly before the factory resolves.
+ */
+export default function hunkExtension(
+  pi: ExtensionAPI,
+  deps?: HunkExtensionDeps,
+): void | Promise<void> {
+  // Explicit dependency injection is a deterministic Pi-compatible test seam.
+  if (deps !== undefined) {
+    registerHunkExtension(pi, deps);
+    return;
+  }
+  if (isOmpExtensionApi(pi)) return registerOmpProductionExtension(pi);
+
+  const runtime = registerHunkRuntime(
+    pi,
+    {},
+    {
+      registerSessionLifecycle: false,
+      hostName: "Pi",
+      settledEvent: "agent_settled",
+    },
+  );
+  const sessions = productionSessionLifecycle(runtime);
+  pi.on("session_start", (_event, ctx) => sessions.startSession(ctx));
+  pi.on("session_shutdown", (_event, ctx) => sessions.shutdownSession(ctx));
 }
 
 /**
  * session_start: defensive activation cleans leftover surfaces before reviving
  * so a repeated session_start cannot drop active pointers while resources
- * remain. The full config reload follows, then config-driven wiring (toggle
- * key and status line).
+ * remain. Pi loads config here; OMP consumes the config prepared before its
+ * factory resolved. Config-driven wiring and status follow either path.
  */
-async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promise<void> {
+async function onSessionStart(
+  ctx: ExtensionContext,
+  deps: LifecycleDeps,
+  preparedConfigWarnings?: readonly string[],
+): Promise<void> {
   const {
     store,
     detector,
@@ -199,10 +366,10 @@ async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promi
     registerPrefix,
     setStatusContext,
   } = deps;
-  // Retire the prior epoch before exposing the new Pi context. A blocked old
-  // handler can finish later, but can neither target nor mutate this session.
-  reportSessionDrain(ctx, reviewGate.resetSession());
-  setStatusContext(ctx);
+  // Keep the retiring epoch and delivery context alive while activation's
+  // coordinator barrier inspects any surviving exact surface. After cleanup,
+  // quarantine old asynchronous work and keep status revoked until fresh
+  // config is ready for the replacement context.
   try {
     await coordinator.activateSession();
   } catch {
@@ -213,14 +380,21 @@ async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promi
       // Session setup continues even when final cleanup is unavailable.
     }
   }
+  reportSessionDrain(ctx, reviewGate.resetSession());
+  setStatusContext(undefined);
   detector.reset();
   diagnostics.decision = null;
-  try {
-    await store.startSession(ctx, (message) => ctx.ui.notify(message, "warning"));
-  } catch (error) {
-    ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+  if (preparedConfigWarnings !== undefined) {
+    for (const message of preparedConfigWarnings) ctx.ui.notify(message, "warning");
+  } else {
+    try {
+      await store.startSession(ctx, (message) => ctx.ui.notify(message, "warning"));
+    } catch (error) {
+      ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+    }
   }
   registerPrefix(ctx);
+  setStatusContext(ctx);
   updateStatus(ctx, store.get(), coordinator);
 }
 
@@ -228,16 +402,17 @@ async function onSessionStart(ctx: ExtensionContext, deps: LifecycleDeps): Promi
 async function onSessionShutdown(ctx: ExtensionContext, deps: LifecycleDeps): Promise<void> {
   const { detector, coordinator, reviewGate, setStatusContext } = deps;
   detector.reset();
-  // Abort and drain feedback before surface teardown can trigger more probes,
-  // and revoke the delivery context before any asynchronous shutdown wait.
-  const drained = reviewGate.resetSession();
-  setStatusContext(undefined);
-  reportSessionDrain(ctx, drained);
+  // Keep the ending session's delivery context alive until shutdown's exact
+  // surface barrier has inspected and attempted every final note. Teardown is
+  // best-effort on probe failure; reset then quarantines unconfirmed work.
   try {
     await coordinator.shutdown();
   } catch {
     // Best-effort.
   }
+  const drained = reviewGate.resetSession();
+  setStatusContext(undefined);
+  reportSessionDrain(ctx, drained);
   ctx.ui.setStatus("hunk", undefined);
 }
 
@@ -812,22 +987,27 @@ async function handleReviewCommand(
     ctx.ui.notify("Usage: /hunk review off|after-run|live", "warning");
     return;
   }
-  if (!ctx.isProjectTrusted()) {
-    ctx.ui.notify(
-      "Hunk configuration requires a trusted project so it can update .pi/hunk.json.",
-      "warning",
-    );
-    return;
-  }
 
+  // The prefix and focused-overlay action keys were bound at session start.
+  // A sparse review write reloads the file and may discover a concurrent
+  // external binding edit, but it must not pretend those keys are live before
+  // Pi reloads extensions.
+  const runtimeBindings = store.get().bindings;
   try {
-    await store.persist(ctx, "project", { review: value });
+    await store.persist(ctx, "global", { review: value });
   } catch (error) {
     ctx.ui.notify(
-      `Could not update project Hunk config: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not update global Hunk config: ${error instanceof Error ? error.message : String(error)}`,
       "error",
     );
     return;
+  }
+  if (
+    (["prefix", "toggle", "show"] as const).some(
+      (binding) => store.get().bindings[binding] !== runtimeBindings[binding],
+    )
+  ) {
+    store.patchSession({ bindings: runtimeBindings });
   }
   reportPersistedReviewPolicy(ctx, store, value);
 }

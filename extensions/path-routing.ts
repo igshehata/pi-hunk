@@ -1,5 +1,6 @@
+import { realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 function invalidPath(message: string): Error {
   return new Error(`Invalid Hunk review target: ${message}`);
@@ -8,10 +9,23 @@ function invalidPath(message: string): Error {
 /** Resolve an untrusted path value lexically without ever passing it through a shell. */
 export function normalizeCandidatePath(value: string, baseCwd: string): string {
   if (typeof value !== "string") throw invalidPath("expected a string path.");
-  const trimmed = value.trim();
-  if (!trimmed) throw invalidPath("the path must not be empty.");
-  if (trimmed.includes("\0")) throw invalidPath("NUL bytes are not allowed.");
-  return resolve(baseCwd, trimmed);
+  if (value.length === 0) throw invalidPath("the path must not be empty.");
+  if (value.includes("\0")) throw invalidPath("NUL bytes are not allowed.");
+  if (isAbsolute(value)) return resolve(value);
+
+  // Pi's cwd may retain a symlink spelling. Canonicalize that directory before
+  // applying a relative target so `..` follows the directory that the symlink
+  // actually names rather than the symlink's lexical parent.
+  let canonicalCwd: string;
+  try {
+    canonicalCwd = realpathSync(baseCwd);
+  } catch (error) {
+    if (!isMissingPathError(error)) throw error;
+    // Extension cwd values are normally live directories. Keep the helper
+    // useful for synthetic/missing roots without weakening live cwd semantics.
+    canonicalCwd = resolve(baseCwd);
+  }
+  return resolve(canonicalCwd, value);
 }
 
 function isMissingPathError(error: unknown): boolean {
@@ -69,18 +83,21 @@ export async function resolveLaunchDirectory(value: string, baseCwd?: string): P
  * ancestor, which keeps deleted targets and symlinked workspaces comparable.
  */
 export async function canonicalizePotentialPath(value: string): Promise<string> {
-  const target = resolve(value);
+  const target = isAbsolute(value) ? value : resolve(value);
   let ancestor = target;
+  const missingSuffix: string[] = [];
 
   for (;;) {
     try {
       const canonicalAncestor = await realpath(ancestor);
-      const suffix = relative(ancestor, target);
-      return suffix ? resolve(canonicalAncestor, suffix) : canonicalAncestor;
+      return missingSuffix.length === 0
+        ? canonicalAncestor
+        : resolve(canonicalAncestor, ...missingSuffix.reverse());
     } catch (error) {
       if (!isMissingPathError(error)) throw error;
       const parent = dirname(ancestor);
-      if (parent === ancestor) return target;
+      if (parent === ancestor) return resolve(target);
+      missingSuffix.push(basename(ancestor));
       ancestor = parent;
     }
   }

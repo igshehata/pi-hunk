@@ -37,6 +37,22 @@ describe("mutation target evidence", () => {
     ).toEqual(["/work/repo-a/src/a.ts", "/work/repo-b/src/b.ts", "/tmp/c.ts"]);
   });
 
+  it("preserves leading, trailing, and all-whitespace structured filenames", () => {
+    expect(
+      mutationTargetPaths(
+        {
+          path: " leading.ts",
+          file_path: "trailing.ts ",
+          edits: [{ path: "   " }],
+        },
+        "/work/repo",
+      ),
+    ).toEqual(["/work/repo/ leading.ts", "/work/repo/trailing.ts ", "/work/repo/   "]);
+
+    expect(() => mutationTargetPaths({ path: "" }, "/work/repo")).toThrow(/must not be empty/);
+    expect(() => mutationTargetPaths({ path: "bad\0path" }, "/work/repo")).toThrow(/NUL/);
+  });
+
   it("records successful target and pathless evidence separately", () => {
     const detector = new ChangeDetector();
     detector.recordSuccessfulMutation("write", { path: "../repo-b/a.ts" }, "/work/repo-a");
@@ -83,9 +99,30 @@ describe("safe launch-directory routing", () => {
 
   it("resolves explicit relative values from Pi's startup cwd and rejects unsafe input", () => {
     expect(normalizeCandidatePath("../repo-b", "/work/repo-a")).toBe("/work/repo-b");
+    expect(normalizeCandidatePath("   ", "/work/repo-a")).toBe("/work/repo-a/   ");
     expect(() => normalizeCandidatePath("", "/work/repo-a")).toThrow(/must not be empty/);
     expect(() => normalizeCandidatePath("bad\0path", "/work/repo-a")).toThrow(/NUL/);
   });
+
+  it.runIf(process.platform !== "win32")(
+    "canonicalizes a symlink cwd before applying a parent-relative target",
+    async () => {
+      const root = await temporaryRoot("pi-hunk-cwd-symlink-parent-");
+      const realRepo = join(root, "storage", "repo");
+      const linkedRepo = join(root, "links", "repo");
+      await mkdir(join(realRepo, "src"), { recursive: true });
+      await mkdir(dirname(linkedRepo), { recursive: true });
+      await symlink(realRepo, linkedRepo);
+
+      const canonicalRepo = await resolveLaunchDirectory(realRepo);
+      expect(normalizeCandidatePath("../ sibling.ts ", join(linkedRepo, "src"))).toBe(
+        join(canonicalRepo, " sibling.ts "),
+      );
+      await expect(resolveLaunchDirectory("..", join(linkedRepo, "src"))).resolves.toBe(
+        canonicalRepo,
+      );
+    },
+  );
 
   it.runIf(process.platform !== "win32")(
     "canonicalizes symlinked targets for boundary-aware containment",

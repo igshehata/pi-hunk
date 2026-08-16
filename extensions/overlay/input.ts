@@ -476,6 +476,52 @@ function translateProtocolPrintable(event: KeyboardProtocolEvent): string {
   }
 }
 
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/**
+ * Stateful wrapper for Pi's input stream.
+ *
+ * Pi TUI 0.80.6's StdinBuffer emits ordinary text one UTF-16 code unit at a
+ * time. A non-BMP character therefore reaches a component as two callbacks.
+ * Passing those lone surrogates to a native PTY separately encodes each as a
+ * replacement character. Hold the high surrogate for the immediately
+ * following callback and restore the original scalar before encoding it.
+ */
+export class PtyInputEncoder {
+  private pendingHighSurrogate = "";
+
+  translate(data: string): string {
+    let prefix = "";
+    if (this.pendingHighSurrogate) {
+      const high = this.pendingHighSurrogate;
+      this.pendingHighSurrogate = "";
+      if (data.length > 0 && isLowSurrogate(data.charCodeAt(0))) {
+        data = high + data;
+      } else {
+        // Invalid standalone UTF-16 gets one deterministic replacement, not the
+        // two replacements produced by independently encoding both halves.
+        prefix = "\ufffd";
+      }
+    }
+
+    if (data.length === 1 && isHighSurrogate(data.charCodeAt(0))) {
+      this.pendingHighSurrogate = data;
+      return prefix;
+    }
+    return prefix + toPtyInput(data);
+  }
+
+  reset(): void {
+    this.pendingHighSurrogate = "";
+  }
+}
+
 /** Convert Pi's Kitty/modifyOtherKeys events back to conventional xterm PTY input. */
 export function toPtyInput(data: string): string {
   // Press and repeat have identical PTY semantics. Releases never reach Hunk.

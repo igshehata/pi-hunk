@@ -11,6 +11,7 @@ export {
   resolveOverlayHostMode,
   isPrefixBinding,
   isHotkeyBinding,
+  bindingIdentity,
   applyConfig,
   cloneConfig,
 } from "./config-schema.ts";

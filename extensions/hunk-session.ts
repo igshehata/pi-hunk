@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, relative, sep } from "node:path";
 import { promisify } from "node:util";
-import { canonicalizePotentialPath, pathIsInside } from "./path-routing.ts";
+import { canonicalizePotentialPath, normalizeCandidatePath, pathIsInside } from "./path-routing.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -176,35 +176,72 @@ export function parseLiveHunkSessions(value: unknown): LiveHunkSession[] {
   });
 }
 
-export function selectLiveHunkSession(
+export async function selectLiveHunkSession(
   sessions: readonly LiveHunkSession[],
   options: HunkSessionSelectionOptions,
-): LiveHunkSession | undefined {
-  if (options.sessionId) return sessions.find((entry) => entry.sessionId === options.sessionId);
-
+): Promise<LiveHunkSession | undefined> {
   const managedPid = normalizeManagedPid(options.managedPid);
-  if (managedPid !== undefined) {
-    const pidMatches = sessions.filter((entry) => entry.pid === managedPid);
-    if (pidMatches.length > 1)
-      throw new Error(
-        `Hunk session JSON drift: multiple live sessions advertise pid ${managedPid}.`,
-      );
-    if (pidMatches.length === 1) return pidMatches[0];
-    if (options.requireManagedPid) return undefined;
-  } else if (options.requireManagedPid) {
-    return undefined;
+
+  if (options.sessionId !== undefined) {
+    const pinned = sessions.find((entry) => entry.sessionId === options.sessionId);
+    if (!pinned) return undefined;
+    // A supplied id and PID are a compound identity, not competing hints.
+    if (
+      options.managedPid !== undefined &&
+      (managedPid === undefined || pinned.pid !== managedPid)
+    ) {
+      return undefined;
+    }
+    if (options.requireManagedPid && managedPid === undefined) return undefined;
+    return pinned;
   }
 
-  const repoMatches = sessions.filter(
-    (entry) => entry.repoRoot !== undefined && pathIsInside(options.cwd, entry.repoRoot),
+  if (options.requireManagedPid && managedPid === undefined) return undefined;
+
+  const canonicalCwd = await canonicalizePotentialPath(options.cwd);
+  const canonicalRoots = await Promise.all(
+    sessions.map(async (entry) => ({
+      session: entry,
+      repoRoot:
+        entry.repoRoot === undefined ? undefined : await canonicalizePotentialPath(entry.repoRoot),
+      cwd: await canonicalizePotentialPath(entry.cwd),
+    })),
   );
-  if (repoMatches.length === 0) return undefined;
-  if (repoMatches.length === 1) return repoMatches[0];
+  const sameRepository = canonicalRoots.filter(
+    (entry) => entry.repoRoot !== undefined && pathIsInside(canonicalCwd, entry.repoRoot),
+  );
+
+  if (managedPid !== undefined) {
+    // PID reuse and stale registry entries must not select a process from a
+    // different repository. A repoRoot-less exact PID is safe only when its
+    // launch cwd canonically contains Pi's cwd.
+    const pidMatches = canonicalRoots.filter(
+      (entry) =>
+        entry.session.pid === managedPid &&
+        (entry.repoRoot !== undefined
+          ? pathIsInside(canonicalCwd, entry.repoRoot)
+          : pathIsInside(canonicalCwd, entry.cwd)),
+    );
+    if (pidMatches.length > 1) {
+      throw new Error(
+        `Hunk session JSON drift: multiple live sessions advertise pid ${managedPid} for repository ${options.cwd}.`,
+      );
+    }
+    if (pidMatches.length === 1) return pidMatches[0]!.session;
+    // Registration waits and exact follow-edit navigation may never adopt a
+    // repository-near session whose PID differs from the managed process.
+    if (options.requireManagedPid) return undefined;
+  }
+
+  // Command wrappers can make Hunk advertise a child PID. Permit that fallback
+  // only when one canonical same-worktree repository session exists.
+  if (sameRepository.length === 0) return undefined;
+  if (sameRepository.length === 1) return sameRepository[0]!.session;
 
   throw new Error(
     `Ambiguous live Hunk sessions for repository ${options.cwd}${
       managedPid !== undefined ? `; no session has managed pid ${managedPid}` : ""
-    }. Matching sessions: ${repoMatches.map(describeSession).join(", ")}.`,
+    }. Matching sessions: ${sameRepository.map(({ session }) => describeSession(session)).join(", ")}.`,
   );
 }
 
@@ -217,7 +254,7 @@ export async function listLiveHunkSessions(
 export async function findLiveHunkSession(
   options: HunkSessionLookupOptions,
 ): Promise<LiveHunkSession | undefined> {
-  return selectLiveHunkSession(await listLiveHunkSessions(options), options);
+  return await selectLiveHunkSession(await listLiveHunkSessions(options), options);
 }
 
 export type ManagedHunkSessionWaitResult =
@@ -311,10 +348,10 @@ async function toHunkRepoRelativePath(
   piCwd: string,
   session: LiveHunkSession,
 ): Promise<string> {
-  const lexicalTarget = resolve(piCwd, filePath);
+  const resolvedTarget = isAbsolute(filePath) ? filePath : normalizeCandidatePath(filePath, piCwd);
   const [repositoryRoot, target] = await Promise.all([
     canonicalizePotentialPath(session.repoRoot ?? session.cwd),
-    canonicalizePotentialPath(lexicalTarget),
+    canonicalizePotentialPath(resolvedTarget),
   ]);
   const repoRelative = relative(repositoryRoot, target);
   if (isParentRelative(repoRelative) || isAbsolute(repoRelative)) {

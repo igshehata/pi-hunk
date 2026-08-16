@@ -64,7 +64,7 @@ describe("exclusive EmbeddedHunk integration", () => {
     const tui = new TUI(terminal);
     const base = new BaseProbe();
     tui.addChild(base);
-    const wrap = installExperimentalPiWrap(tui, "right", true)!;
+    const wrap = installExperimentalPiWrap(tui, "right")!;
     const exclusive = installExclusiveFrame(tui, "right", true)!;
     const component = new EmbeddedHunk({
       command: "hunk",

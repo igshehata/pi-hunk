@@ -73,7 +73,7 @@ Do not include generated `dist/` output; the package build creates it during pre
 - Hunk remains authoritative for diff presentation and comments.
 - Comment handoff is read-only: pi-hunk must never create, edit, apply, resolve, remove, or clear
   comments.
-- Project-local config is loaded only for trusted projects.
+- Pi-hunk configuration is global; project-local `.pi/hunk.json` files are ignored.
 - Native dependencies must remain optional Pi peers or bounded runtime dependencies; run
   `mise run pack` after dependency changes.
 

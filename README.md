@@ -2,9 +2,9 @@
 
 # pi-hunk
 
-**Review Pi's changes in Hunk without leaving Pi.**
+**Review Pi or Oh My Pi changes in Hunk without leaving the agent.**
 
-Annotate diffs, send comments back to the agent, and keep your review open while Pi continues
+Annotate diffs, send comments back to the agent, and keep your review open while it continues
 working.
 
 [![CI](https://github.com/igshehata/pi-hunk/actions/workflows/ci.yml/badge.svg)](https://github.com/igshehata/pi-hunk/actions/workflows/ci.yml)
@@ -18,9 +18,9 @@ working.
 
 ## What you get
 
-- **Review inside Pi.** No tmux or external pane manager.
-- **Automatic reviews.** Open after a change or watch edits live.
-- **Inline feedback.** Hide Hunk to send new comments back to Pi.
+- **Review inside Pi or OMP.** No tmux or external pane manager.
+- **Optional automatic reviews.** Open after a change or watch edits live when you opt in.
+- **Inline feedback.** Hide Hunk to send new comments back to the agent.
 - **Persistent sessions.** Hide and restore Hunk without losing your place or comments.
 - **Multiple repositories.** Review each repository touched in the same agent run.
 - **Your VCS, your Hunk setup.** Git, Jujutsu, and Sapling work through Hunk's normal configuration.
@@ -32,27 +32,40 @@ working.
 
 Requirements:
 
-- [Pi](https://github.com/earendil-works/pi) 0.80+
+- [Pi](https://github.com/earendil-works/pi) 0.80+ or
+  [Oh My Pi](https://github.com/can1357/oh-my-pi) 17.3.4+
 - [Hunk](https://github.com/modem-dev/hunk) 0.17.6+ on `PATH`
 - Node.js 22.19+
 - macOS arm64, or glibc Linux x64/arm64
+
+Pi:
 
 ```bash
 pi install npm:pi-hunk
 ```
 
-Then run `/reload` in Pi.
+Oh My Pi:
+
+```bash
+omp install pi-hunk
+```
+
+Then run `/reload` in the active host.
+
+A managed `pi update --extensions` replaces `npm:pi-hunk` in place. If Pi reports a duplicate
+`/hunk` command, run `pi list`: another local, project, or CLI extension source is also configured.
+Remove that source, keep `npm:pi-hunk`, then run `/reload`.
 
 ## Quick start
 
-1. Ask Pi to change some code.
-2. Hunk opens when Pi finishes.
+1. Ask Pi or OMP to change some code.
+2. Press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> to open Hunk.
 3. Review the diff and leave inline comments.
-4. Press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> to hide Hunk.
-5. Pi receives the new comments as follow-up feedback.
+4. Use the same shortcut to hide Hunk and send the comments back to the agent.
 
-Use the same shortcut to restore the review. If feedback delivery cannot be confirmed, run
-`/hunk feedback`; the notes remain recoverable.
+Automatic opening is off by default. Run `/hunk review after-run` to open Hunk after successful
+changes, or `/hunk review live` to follow edits during a run. If feedback delivery cannot be
+confirmed, run `/hunk feedback`; the notes remain recoverable.
 
 ## Shortcuts
 
@@ -65,17 +78,17 @@ Change either shortcut from `/hunk config` by pressing the key you want.
 
 ## Choose when Hunk opens
 
-| Policy      | Behavior                                                      |
-| ----------- | ------------------------------------------------------------- |
-| `after-run` | Open after Pi successfully changes code. **Default.**         |
-| `live`      | Open on the first change attempt and follow successful edits. |
-| `off`       | Never open automatically; commands and shortcuts still work.  |
+| Policy      | Behavior                                                                  |
+| ----------- | ------------------------------------------------------------------------- |
+| `off`       | Never open automatically; commands and shortcuts still work. **Default.** |
+| `after-run` | Open after the agent successfully changes code.                           |
+| `live`      | Open on the first change attempt and follow successful edits.             |
 
 ```text
 /hunk review live
 ```
 
-Automatic review is triggered by Pi's coding tools, not by conversation or read-only work.
+Automatic review is triggered by the host's coding tools, not by conversation or read-only work.
 
 ## Commands
 
@@ -93,13 +106,16 @@ Automatic review is triggered by Pi's coding tools, not by conversation or read-
 | `/hunk status`                      | Show policy, review state, and diagnostics |
 | `/hunk close`                       | Close the managed Hunk process             |
 | `/hunk review off\|after-run\|live` | Change the automatic-review policy         |
-| `/hunk config`                      | Open project settings                      |
-| `/hunk config restore`              | Remove project overrides                   |
+| `/hunk config`                      | Open global settings                       |
+| `/hunk config restore`              | Remove global overrides                    |
 
 ## Configure
 
-Run `/hunk config` to change the review policy, follow-edits, layout, and shortcuts. Changes save
-immediately to the trusted project's `.pi/hunk.json`.
+Run `/hunk config` to change the review policy, follow-edits, layout, and shortcuts. Changes save in
+Pi's global agent directory (`~/.pi/agent/hunk.json` by default). `PI_CODING_AGENT_DIR` and
+`PI_HUNK_CONFIG` are respected. Project-local `.pi/hunk.json` files are ignored; trusted projects
+receive a migration warning. Reapply UI settings through `/hunk config` rather than copying a
+project-relative `hunk.command` into global config.
 
 Choose a layout directly:
 
@@ -116,6 +132,9 @@ Choose a layout directly:
 | `right` | Pi and Hunk side by side              |
 | `left`  | Hunk and Pi side by side              |
 | `float` | Hunk in a centered overlay            |
+
+Pi wrapping is derived from layout and is not configurable: `left` and `right` wrap Pi into the
+remaining columns; `full` and `float` do not.
 
 > **Note:** For the best experience, pi-hunk is intended to be used in full-screen (`full`) mode.
 >

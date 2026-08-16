@@ -176,6 +176,17 @@ describe("EmbeddedHunk presentation state", () => {
     pty.write.mockClear();
     component.handleInput("\x1b[<65;25;20M");
     expect(pty.write).not.toHaveBeenCalled();
+
+    // A press captured inside the pane must not survive focus transfer. After
+    // refocus, an outside drag/release belongs to Pi rather than stale Hunk input.
+    component.focused = true;
+    component.handleInput("\x1b[<0;75;20M");
+    component.focused = false;
+    component.focused = true;
+    pty.write.mockClear();
+    component.handleInput("\x1b[<32;25;20M");
+    component.handleInput("\x1b[<0;25;20m");
+    expect(pty.write).not.toHaveBeenCalled();
     component.dispose();
   });
 
@@ -194,6 +205,12 @@ describe("EmbeddedHunk presentation state", () => {
 
     component.handleInput("\x1b[104;6u");
     expect(pty.write).toHaveBeenCalledOnce();
+
+    pty.write.mockClear();
+    component.handleInput("\ud83d");
+    expect(pty.write).not.toHaveBeenCalled();
+    component.handleInput("\ude00");
+    expect(pty.write).toHaveBeenCalledWith("😀");
     component.dispose();
   });
 
@@ -449,6 +466,158 @@ describe("EmbeddedHunk presentation state", () => {
     expect(() => component.render(80)).not.toThrow();
     expect(pty.resize).not.toHaveBeenCalled();
     component.dispose();
+  });
+
+  it("rolls back the spawned adapter when onData subscription setup throws", () => {
+    const setupError = new Error("data subscription setup failed");
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender: vi.fn(),
+    } as unknown as TUI;
+    pty.onData.mockImplementationOnce(() => {
+      throw setupError;
+    });
+
+    expect(
+      () =>
+        new EmbeddedHunk({
+          command: "hunk",
+          args: ["diff"],
+          cwd: "/repo",
+          tui,
+          done: vi.fn(),
+        }),
+    ).toThrow(setupError);
+
+    expect(pty.onExit).not.toHaveBeenCalled();
+    expect(pty.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("rolls back an installed data subscription when onExit setup throws", () => {
+    const setupError = new Error("exit subscription setup failed");
+    const dataSubscription = { dispose: vi.fn() };
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender: vi.fn(),
+    } as unknown as TUI;
+    pty.onData.mockReturnValueOnce(dataSubscription);
+    pty.onExit.mockImplementationOnce(() => {
+      throw setupError;
+    });
+
+    expect(
+      () =>
+        new EmbeddedHunk({
+          command: "hunk",
+          args: ["diff"],
+          cwd: "/repo",
+          tui,
+          done: vi.fn(),
+        }),
+    ).toThrow(setupError);
+
+    expect(dataSubscription.dispose).toHaveBeenCalledOnce();
+    expect(pty.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("continues cleanup when one subscription disposer throws", () => {
+    const dataSubscription = {
+      dispose: vi.fn(() => {
+        throw new Error("data disposer failed");
+      }),
+    };
+    const exitSubscription = { dispose: vi.fn() };
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender: vi.fn(),
+    } as unknown as TUI;
+    pty.onData.mockReturnValueOnce(dataSubscription);
+    pty.onExit.mockReturnValueOnce(exitSubscription);
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff"],
+      cwd: "/repo",
+      tui,
+      done: vi.fn(),
+    });
+    const terminal = (
+      component as unknown as {
+        terminal: { dispose(): void };
+      }
+    ).terminal;
+    const terminalDispose = vi.spyOn(terminal, "dispose");
+
+    expect(() => component.dispose()).not.toThrow();
+    expect(dataSubscription.dispose).toHaveBeenCalledOnce();
+    expect(exitSubscription.dispose).toHaveBeenCalledOnce();
+    expect(pty.dispose).toHaveBeenCalledOnce();
+    expect(terminalDispose).toHaveBeenCalledOnce();
+  });
+
+  it("always disposes the adapter after natural exit, even when done throws", () => {
+    const doneError = new Error("done callback failed");
+    const dataSubscription = { dispose: vi.fn() };
+    const exitSubscription = { dispose: vi.fn() };
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender: vi.fn(),
+    } as unknown as TUI;
+    pty.onData.mockReturnValueOnce(dataSubscription);
+    pty.onExit.mockReturnValueOnce(exitSubscription);
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff"],
+      cwd: "/repo",
+      tui,
+      done: () => {
+        throw doneError;
+      },
+    });
+    const onExit = (
+      pty.onExit.mock.calls as unknown as Array<
+        [(event: { exitCode: number; signal?: number }) => void]
+      >
+    )[0][0];
+
+    expect(() => onExit({ exitCode: 0, signal: 0 })).toThrow(doneError);
+    expect(pty.dispose).toHaveBeenCalledOnce();
+    expect(dataSubscription.dispose).toHaveBeenCalledOnce();
+    expect(exitSubscription.dispose).toHaveBeenCalledOnce();
+    component.dispose();
+    expect(pty.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("delivers natural exit even when exclusive-frame revocation throws", () => {
+    const done = vi.fn();
+    const tui = {
+      terminal: { columns: 100, rows: 40, write: vi.fn() },
+      requestRender: vi.fn(),
+    } as unknown as TUI;
+    const component = new EmbeddedHunk({
+      command: "hunk",
+      args: ["diff"],
+      cwd: "/repo",
+      tui,
+      done,
+    });
+    (
+      component as unknown as {
+        exclusiveFrame: { revoke(reason: string): void };
+      }
+    ).exclusiveFrame = {
+      revoke: () => {
+        throw new Error("exclusive frame already revoked");
+      },
+    };
+    const onExit = (
+      pty.onExit.mock.calls as unknown as Array<
+        [(event: { exitCode: number; signal?: number }) => void]
+      >
+    )[0][0];
+
+    expect(() => onExit({ exitCode: 3, signal: 0 })).not.toThrow();
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 3 }));
+    expect(pty.dispose).toHaveBeenCalledOnce();
   });
 
   it("does not deliver a stale exit callback after disposal", () => {
