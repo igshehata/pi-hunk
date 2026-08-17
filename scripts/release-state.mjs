@@ -50,8 +50,8 @@ async function publishedVersions(url) {
 }
 
 if (name !== "pi-hunk") throw new Error("release-state only supports pi-hunk");
-if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-  throw new Error(`invalid package version: ${version}`);
+if (!/^\d+\.\d+\.\d+$/.test(version)) {
+  throw new Error(`invalid stable package version: ${version}`);
 }
 
 const pendingChangesets = readdirSync(join(root, ".changeset")).filter(
@@ -74,4 +74,6 @@ appendOutput({
   reason,
   package: name,
   version,
+  stream: "stable",
+  tag: "latest",
 });

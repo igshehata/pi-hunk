@@ -20,8 +20,8 @@ function appendOutput(values) {
 }
 
 if (name !== "pi-hunk") fail("package name is not pi-hunk");
-if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(requestedVersion ?? "")) {
-  fail(`invalid requested version: ${requestedVersion ?? "(missing)"}`);
+if (!/^\d+\.\d+\.\d+$/.test(requestedVersion ?? "")) {
+  fail(`expected a stable x.y.z version, received ${requestedVersion ?? "(missing)"}`);
 }
 
 const encodedName = encodeURIComponent(name).replace(/^%40/, "@");

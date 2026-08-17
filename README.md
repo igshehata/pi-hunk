@@ -38,23 +38,32 @@ Requirements:
 - Node.js 22.19+
 - macOS arm64, or glibc Linux x64/arm64
 
-Pi:
+Stable 0.3.x (`latest`, recommended):
 
 ```bash
-pi install npm:pi-hunk
+# Pi
+pi install npm:pi-hunk@latest
+
+# Oh My Pi
+omp install pi-hunk@latest
 ```
 
-Oh My Pi:
+Canary is a rolling build from `main`, independent of the stable Changesets plan, and may regress:
 
 ```bash
-omp install pi-hunk
+# Pi
+pi install npm:pi-hunk@canary
+
+# Oh My Pi
+omp install pi-hunk@canary
 ```
 
-Then run `/reload` in the active host.
+Both streams use the same package; npm tags select the stream. Then run `/reload` in the active
+host.
 
-A managed `pi update --extensions` replaces `npm:pi-hunk` in place. If Pi reports a duplicate
-`/hunk` command, run `pi list`: another local, project, or CLI extension source is also configured.
-Remove that source, keep `npm:pi-hunk`, then run `/reload`.
+A managed `pi update --extensions` replaces its configured npm source in place. If Pi reports a
+duplicate `/hunk` command, run `pi list`: another local, project, or CLI extension source is also
+configured. Remove that source, keep the intended `npm:pi-hunk` source, then run `/reload`.
 
 ## Quick start
 

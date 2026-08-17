@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: release
@@ -16,9 +17,11 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      should-stage: ${{ steps.state.outputs.should_stage }}
-      reason: ${{ steps.state.outputs.reason }}
-      version: ${{ steps.state.outputs.version }}
+      should-stage: ${{ steps.stable.outputs.should_stage || steps.canary.outputs.should_stage }}
+      reason: ${{ steps.stable.outputs.reason || steps.canary.outputs.reason }}
+      version: ${{ steps.stable.outputs.version || steps.canary.outputs.version }}
+      stream: ${{ steps.stable.outputs.stream || steps.canary.outputs.stream }}
+      tag: ${{ steps.stable.outputs.tag || steps.canary.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -29,19 +32,28 @@ jobs:
           cache: true
           install: true
       - run: npm ci --ignore-scripts
+      - name: Require main for an on-demand canary
+        if: github.event_name == 'workflow_dispatch'
+        run: test "$GITHUB_REF" = refs/heads/main
       # Inspect the immutable commit before changesets/action versions the job
       # workspace while creating or updating its release pull request.
-      - id: state
-        name: Determine whether this commit contains an unpublished release
+      - id: stable
+        if: github.event_name == 'push'
+        name: Determine whether this commit contains an unpublished stable release
         run: node scripts/release-state.mjs
       - name: Create or update the version pull request
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
+        if: github.event_name == 'push'
         with:
           version: mise run release:version
           commit: "chore: version package"
           title: "chore: version package"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: canary
+        if: github.event_name == 'workflow_dispatch'
+        name: Prepare the rolling canary identity
+        run: node scripts/prepare-canary-version.mjs --write
 
   verify:
     name: Verify pi-hunk@${{ needs.version.outputs.version }}
@@ -59,6 +71,20 @@ jobs:
           cache: true
           install: true
       - run: npm ci --ignore-scripts
+      - name: Prepare the ephemeral canary version
+        if: needs.version.outputs.stream == 'canary'
+        run: node scripts/prepare-canary-version.mjs --write
+      - name: Verify selected release identity
+        env:
+          RELEASE_STREAM: ${{ needs.version.outputs.stream }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          case "$RELEASE_STREAM:$RELEASE_TAG" in
+            stable:latest|canary:canary) ;;
+            *) echo "Invalid release stream/tag: $RELEASE_STREAM:$RELEASE_TAG" >&2; exit 1 ;;
+          esac
       - run: mise run check
       - name: Pack the verified release without lifecycle scripts
         env:
@@ -107,6 +133,8 @@ jobs:
       NPM_CONFIG_PROVENANCE: true
       RELEASE_COMMIT: ${{ github.sha }}
       RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_STREAM: ${{ needs.version.outputs.stream }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -141,8 +169,13 @@ jobs:
 
           node npm-cli/package/bin/npm-cli.js stage publish ./publish/package \
             --ignore-scripts \
+            --tag "$RELEASE_TAG" \
             --access public
       - name: Approval required
         run: |
-          echo "pi-hunk@${RELEASE_VERSION} is staged, not public."
-          echo "Inspect and approve it with npm 2FA before finalizing the release."
+          echo "pi-hunk@${RELEASE_VERSION} is staged on npm tag ${RELEASE_TAG}, not public."
+          if test "$RELEASE_STREAM" = canary; then
+            echo "Inspect and approve it with npm 2FA. Canary releases do not get Git tags or GitHub Releases."
+          else
+            echo "Inspect and approve it with npm 2FA before finalizing the stable release."
+          fi
