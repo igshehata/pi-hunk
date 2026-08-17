@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Exact npm version that has been reviewed and approved
+        description: Exact stable npm version (x.y.z) that has been reviewed and approved
         required: true
         type: string
 

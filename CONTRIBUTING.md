@@ -38,17 +38,36 @@ in [SECURITY.md](SECURITY.md).
 
 ## Useful tasks
 
-| Task                    | Purpose                                             |
-| ----------------------- | --------------------------------------------------- |
-| `mise run format`       | Format supported files with Oxfmt                   |
-| `mise run format:check` | Check formatting without writes                     |
-| `mise run lint`         | Run Oxlint                                          |
-| `mise run typecheck`    | Run TypeScript without emitting                     |
-| `mise run test`         | Run the full Vitest suite                           |
-| `mise run build`        | Bundle `dist/index.js`                              |
-| `mise run pack`         | Validate the npm tarball and clean consumer install |
-| `mise run check`        | Run all release gates                               |
-| `mise run changeset`    | Describe a release-worthy change                    |
+| Task                              | Purpose                                                    |
+| --------------------------------- | ---------------------------------------------------------- |
+| `mise run format`                 | Format supported files with Oxfmt                          |
+| `mise run format:check`           | Check formatting without writes                            |
+| `mise run lint`                   | Run Oxlint                                                 |
+| `mise run typecheck`              | Run TypeScript without emitting                            |
+| `mise run test`                   | Run the full Vitest suite                                  |
+| `mise run build`                  | Bundle `dist/index.js`                                     |
+| `mise run pack`                   | Validate the npm tarball and clean consumer install        |
+| `mise run check`                  | Run all release gates                                      |
+| `mise run changeset`              | Describe a release-worthy change                           |
+| `mise run release:canary:preview` | Preview the rolling canary identity without changing files |
+
+## Release streams
+
+Pi-hunk has two npm streams:
+
+- **Stable 0.3.x** uses the `latest` npm tag. Add Changesets normally, merge the generated version
+  PR, approve the package staged by `.github/workflows/release.yml`, then run `finalize-release.yml`
+  with that exact stable version. Finalization creates the immutable `vX.Y.Z` tag and GitHub Release
+  and rejects prerelease versions.
+- **Canary** is the rolling `canary` npm tag, independent of the stable Changesets plan. Preview its
+  deterministic identity with `mise run release:canary:preview`, then dispatch the **Release**
+  workflow from `main` (or run `gh workflow run release.yml --ref main`). Users always select
+  `pi-hunk@canary`; npm's immutable package registry requires each underlying artifact to use a
+  unique `0.0.0-canary.<run-number>.<run-attempt>` SemVer. The workflow verifies and stages that
+  exact tarball and waits for npm 2FA approval. Do not run the finalization workflow for a canary.
+
+Both streams stay in `release.yml` because npm trusted publishing is bound to that workflow and the
+`npm-release` environment. Canary releases never create Git tags or GitHub Releases.
 
 ## Testing expectations
 

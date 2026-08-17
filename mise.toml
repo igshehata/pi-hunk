@@ -59,6 +59,9 @@ run = "npm exec changeset"
 description = "Show pending Changesets and the resulting version"
 run = "npm exec changeset status"
 
+[tasks."release:canary:preview"]
+description = "Preview the rolling canary package identity"
+run = "CANARY_RUN_NUMBER=1 CANARY_RUN_ATTEMPT=1 node scripts/prepare-canary-version.mjs"
 [tasks."release:version"]
 description = "Consume pending Changesets and update package versions/changelog"
 run = [
