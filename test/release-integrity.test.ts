@@ -76,6 +76,7 @@ async function runCanaryFixture(options: {
   version: string;
   runNumber: string;
   runAttempt: string;
+  selectedVersion?: string;
   writePackage: boolean;
 }) {
   const root = await mkdtemp(join(tmpdir(), "pi-hunk-canary-"));
@@ -88,6 +89,7 @@ async function runCanaryFixture(options: {
   try {
     const args = [canaryVersionScript];
     if (options.writePackage) args.push("--write");
+    if (options.selectedVersion !== undefined) args.push("--version", options.selectedVersion);
     const { stdout } = await execFileAsync(process.execPath, args, {
       cwd: root,
       env: {
@@ -191,6 +193,41 @@ describe("release pipeline invariants", () => {
     expect(result.githubOutput).toContain("version=0.0.0-canary.417.2\n");
     expect(result.githubOutput).toContain("tag=canary\n");
   });
+  it("retains the version-job canary identity when failed jobs rerun", async () => {
+    const result = await runCanaryFixture({
+      version: "0.2.0",
+      runNumber: "417",
+      runAttempt: "2",
+      selectedVersion: "0.0.0-canary.417.1",
+      writePackage: true,
+    });
+
+    expect(result.state.version).toBe("0.0.0-canary.417.1");
+    expect(result.packageJson.version).toBe("0.0.0-canary.417.1");
+    expect(result.githubOutput).toContain("version=0.0.0-canary.417.1\n");
+  });
+
+  it("strictly validates a selected canary identity", async () => {
+    await expect(
+      runCanaryFixture({
+        version: "0.2.0",
+        runNumber: "418",
+        runAttempt: "2",
+        selectedVersion: "0.0.0-canary.419.1",
+        writePackage: true,
+      }),
+    ).rejects.toThrow(/belongs to run 419, not current run 418/);
+
+    await expect(
+      runCanaryFixture({
+        version: "0.2.0",
+        runNumber: "418",
+        runAttempt: "2",
+        selectedVersion: "0.3.0-canary.418.1",
+        writePackage: true,
+      }),
+    ).rejects.toThrow(/must match 0\.0\.0-canary/);
+  });
 
   it("keeps a rolling canary preview read-only", async () => {
     const result = await runCanaryFixture({
@@ -240,6 +277,8 @@ describe("release pipeline invariants", () => {
     expect(workflow).toContain('test "$GITHUB_REF" = refs/heads/main');
     expect(plannerUses).toHaveLength(2);
     expect(workflow).not.toContain("CANARY_PLAN");
+    expect(workflow).toContain("CANARY_VERSION: ${{ needs.version.outputs.version }}");
+    expect(workflow).toContain('--write --version "$CANARY_VERSION"');
     expect(workflow).toContain('--tag "$RELEASE_TAG"');
     expect(workflow).toContain("stable:latest|canary:canary");
   });
