@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+### Minor Changes
+
+- 8fcab8a: Default automatic review to off, derive Pi wrapping only from the selected layout, and
+  save `/hunk config` and `/hunk review` in Pi's global agent directory without losing concurrent
+  updates. Project-local Hunk config is now ignored, with a migration warning in trusted projects.
+
+### Patch Changes
+
+- 8fcab8a: Prevent full-screen Hunk from hanging on “Restoring Hunk…” after it is toggled off and
+  back on.
+
+  Restore Oh My Pi compatibility by registering config-backed shortcuts before OMP snapshots
+  extensions and treating only terminal `agent_end` events as settled runs.
+
 ## 0.2.0
 
 ### Minor Changes
