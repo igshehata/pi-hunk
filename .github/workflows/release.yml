@@ -71,9 +71,11 @@ jobs:
           cache: true
           install: true
       - run: npm ci --ignore-scripts
-      - name: Prepare the ephemeral canary version
+      - name: Apply the selected ephemeral canary version
         if: needs.version.outputs.stream == 'canary'
-        run: node scripts/prepare-canary-version.mjs --write
+        env:
+          CANARY_VERSION: ${{ needs.version.outputs.version }}
+        run: node scripts/prepare-canary-version.mjs --write --version "$CANARY_VERSION"
       - name: Verify selected release identity
         env:
           RELEASE_STREAM: ${{ needs.version.outputs.stream }}
