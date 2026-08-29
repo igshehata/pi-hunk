@@ -1,23 +1,40 @@
-import type { OverlaySize } from "../config.ts";
-
 export type LaunchSource = "auto" | "live" | "manual" | "shortcut" | "recover";
-export type SurfaceState = "closed" | "starting" | "visible" | "hidden" | "closing";
+export type SurfaceState = "closed" | "starting" | "visible" | "closing";
+
+/** One saved inline Hunk note captured before the takeover process exits. */
+export interface HunkReviewNote {
+  noteId: string;
+  file: string;
+  oldLine: number | null;
+  newLine: number | null;
+  oldRange: [number, number] | null;
+  newRange: [number, number] | null;
+  summary: string;
+  rationale: string;
+}
+
+export interface HunkExit {
+  exitCode: number;
+  signal?: NodeJS.Signals;
+  detail?: string;
+  /** Present when the bundled Hunk extension captured a final saved-note snapshot. */
+  notes?: HunkReviewNote[];
+}
 
 export interface OpenRequest {
   cwd: string;
   command: string;
   args: string[];
   source: LaunchSource;
-  focus?: boolean;
 }
 
 export interface SurfaceSessionInfo {
   state: SurfaceState;
-  /** Managed surface identity: normalized launch cwd, command, and argv. */
+  /** Normalized launch directory, command, and argv. */
   argsKey: string;
   launchCwd: string;
   source: LaunchSource;
-  /** OS pid of the managed Hunk PTY leader, when available. */
+  /** OS pid of the Hunk child process. */
   pid?: number;
   /** Authoritative metadata adopted from Hunk's exact managed-PID session. */
   sessionId?: string;
@@ -28,25 +45,4 @@ export interface SurfaceSessionInfo {
 
 export function argsKey(command: string, args: string[], cwd?: string): string {
   return JSON.stringify(cwd === undefined ? [command, ...args] : [cwd, command, ...args]);
-}
-
-function resolveOverlaySize(size: OverlaySize, terminalSize: number): number {
-  const available = Math.max(1, terminalSize);
-  if (typeof size === "number") {
-    return Math.max(1, Math.min(available, Math.floor(size)));
-  }
-
-  const percentage = Number.parseFloat(size.slice(0, -1));
-  if (Number.isFinite(percentage) && percentage > 0) {
-    return Math.max(1, Math.min(available, Math.floor((available * percentage) / 100)));
-  }
-  return available;
-}
-
-export function resolveOverlayColumns(width: OverlaySize, terminalColumns: number): number {
-  return resolveOverlaySize(width, terminalColumns);
-}
-
-export function resolveOverlayRows(maxHeight: OverlaySize, terminalRows: number): number {
-  return resolveOverlaySize(maxHeight, terminalRows);
 }

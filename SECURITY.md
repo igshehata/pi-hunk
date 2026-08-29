@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-Until the first stable release, only the latest published version and the current `main` branch
-receive security fixes.
+Only the latest stable npm release and the current `main` branch receive security fixes.
 
-| Version            | Supported |
-| ------------------ | --------- |
-| Latest npm release | Yes       |
-| Older releases     | No        |
+| Version                   | Supported |
+| ------------------------- | --------- |
+| Latest stable npm release | Yes       |
+| Current `main`            | Yes       |
+| Older releases            | No        |
 
 ## Reporting a vulnerability
 
@@ -39,11 +39,15 @@ removed globally to land one emergency update.
 ## Security model
 
 Pi extensions execute with the user's permissions. Installing pi-hunk therefore grants it the same
-filesystem and process access as Pi. Pi-hunk launches the globally configured Hunk command with the
-current project as its working directory, reads Hunk's local session metadata, and writes
-`hunk.json` in Pi's global agent config directory. Keep `hunk.command` as a trusted executable on
-`PATH` or a trusted absolute path; do not migrate a project-relative executable into global config.
-Only install the package and Hunk binary from sources you trust.
+filesystem and process access as Pi. Pi-hunk launches the globally configured Hunk command with
+inherited terminal stdio, loads its bundled feedback extension, reads Hunk's local session metadata,
+and writes `hunk.json` in Pi's global agent config directory. The feedback extension writes saved
+user notes to a private temporary path supplied by pi-hunk; the parent validates and deletes that
+snapshot after Hunk exits.
 
-The published npm package is checked for unexpected source/test files, runtime dependency growth,
-and clean-consumer loading before release. npm provenance is enabled for published artifacts.
+Keep `hunk.command` as a trusted executable on `PATH` or a trusted absolute path; do not migrate a
+project-relative executable into global config. Hunk also loads extensions according to its own
+trusted configuration. Only install pi-hunk, Hunk, and Hunk extensions from sources you trust.
+
+The published npm package is checked for unexpected source files, runtime dependency growth, and
+clean-consumer loading before release. npm provenance is enabled for published artifacts.

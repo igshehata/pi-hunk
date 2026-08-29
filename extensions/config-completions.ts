@@ -43,23 +43,21 @@ export function splitArgs(input: string): string[] {
   return args;
 }
 
-/** Hunk CLI verbs supported by the managed interactive overlay. */
+/** Hunk CLI verbs supported by the full-screen takeover. */
 export const HUNK_VERBS = new Set(["diff", "show", "stash"]);
 
-/** Entrypoints that depend on external stdin/file-pair integration rather than Pi's overlay. */
+/** Entrypoints that depend on external stdin/file-pair integration. */
 export const UNSUPPORTED_HUNK_VERBS = new Set(["patch", "pager", "difftool"]);
 
 /**
  * First-token words the /hunk command reserves for its own subcommands. These
  * MUST stay disjoint from HUNK_VERBS so no reserved word shadows a passthrough
- * verb (asserted by a unit test).
+ * verb.
  */
 export const RESERVED_SUBCOMMANDS = new Set([
   "close",
-  "toggle",
   "status",
   "feedback",
-  "submit",
   "next",
   "review",
   "config",
@@ -76,7 +74,7 @@ function subcommandValues(
     return undefined;
   }
   if (first === "config") {
-    if (argumentIndex === 1) return ["restore", "full", "left", "right", "float"];
+    if (argumentIndex === 1) return ["restore"];
     return undefined;
   }
   return undefined;

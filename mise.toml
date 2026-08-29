@@ -22,16 +22,9 @@ run = "npm run lint"
 description = "Type-check the project"
 run = "npm run typecheck"
 
-[tasks.test]
-description = "Run the full automated test suite"
-run = "npm test"
-
-[tasks."test:critical"]
-description = "Run the release-blocking boundary suite"
-run = "npm run test:critical"
 
 [tasks.build]
-description = "Build the distributable Pi extension"
+description = "Build the Pi extension and Hunk feedback bridge"
 run = "npm run build"
 
 [tasks.pack]

@@ -11,9 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-// libghostty's ABI-stable package currently carries three platform prebuilds.
-// Keep bounded headroom over the measured 15.9 MB clean consumer install.
-const MAX_RUNTIME_BYTES = 19_000_000;
+const MAX_RUNTIME_BYTES = 1_000_000;
 const root = process.cwd();
 const scratch = mkdtempSync(join(tmpdir(), "pi-hunk-package-"));
 const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -45,6 +43,9 @@ try {
   if (packageJson.repository?.url !== "git+https://github.com/igshehata/pi-hunk.git") {
     fail("repository metadata does not match the public repository");
   }
+  if (packageJson.dependencies && Object.keys(packageJson.dependencies).length > 0) {
+    fail("the full-screen core must not ship runtime dependencies");
+  }
 
   const pack = JSON.parse(
     execFileSync("npm", ["pack", "--json", "--pack-destination", scratch], {
@@ -55,6 +56,7 @@ try {
   const paths = new Set(pack.files.map((file) => file.path));
   for (const required of [
     "dist/index.js",
+    "dist/hunk-feedback.js",
     "package.json",
     "README.md",
     "CHANGELOG.md",
@@ -70,21 +72,20 @@ try {
         path === "extensions" ||
         path.startsWith("extensions/") ||
         path === "test" ||
-        path.startsWith("test/"),
+        path.startsWith("test/") ||
+        path.startsWith("dist/chunks/"),
     )
   ) {
-    fail("source extensions or tests leaked into the package");
+    fail("source, tests, documentation, or obsolete runtime chunks leaked into the package");
   }
 
-  const nativeChunks = [...paths].filter((path) => /^dist\/chunks\/.*\.js$/.test(path));
-  if (nativeChunks.length === 0) fail("lazy embedded-terminal chunk is missing");
-  const entrySource = readFileSync(join(root, "dist", "index.js"), "utf8");
-  if (entrySource.includes("zigpty") || entrySource.includes("@coder/libghostty-vt-node")) {
-    fail("native terminal dependencies leaked into the eager extension entry");
-  }
-  const chunkSource = nativeChunks.map((path) => readFileSync(join(root, path), "utf8")).join("\n");
-  if (!chunkSource.includes("zigpty") || !chunkSource.includes("@coder/libghostty-vt-node")) {
-    fail("lazy embedded-terminal chunk does not contain both native adapters");
+  const bundledSources = ["index.js", "hunk-feedback.js"].map((file) =>
+    readFileSync(join(root, "dist", file), "utf8"),
+  );
+  for (const forbidden of ["zigpty", "@coder/libghostty-vt-node", "vitest"]) {
+    if (bundledSources.some((source) => source.includes(forbidden))) {
+      fail(`${forbidden} leaked into the bundle`);
+    }
   }
 
   const consumer = join(scratch, "consumer");
@@ -105,16 +106,16 @@ try {
     "fast-check",
     "pure-rand",
     "node-pty",
+    "zigpty",
+    "vitest",
+    join("@coder", "libghostty-vt-node"),
     join("@standard-schema", "spec"),
     join("@earendil-works", "pi-coding-agent"),
     join("@earendil-works", "pi-tui"),
   ]) {
     if (existsSync(join(modules, forbidden))) fail(`${forbidden} was installed at runtime`);
   }
-  for (const required of ["pi-hunk", "zigpty", join("@coder", "libghostty-vt-node")]) {
-    if (!existsSync(join(modules, required)))
-      fail(`${required} is missing from the runtime install`);
-  }
+  if (!existsSync(join(modules, "pi-hunk"))) fail("pi-hunk is missing from the runtime install");
 
   const entry = join(modules, "pi-hunk", "dist", "index.js");
   const pi = resolve(root, "node_modules", ".bin", "pi");
@@ -124,8 +125,9 @@ try {
     input: `${JSON.stringify({ type: "prompt", message: "/hunk status" })}\n`,
   });
   if (rpc.status !== 0) fail(`Pi RPC load exited ${rpc.status}: ${rpc.stderr}`);
-  if (!/statusKey":"hunk|Hunk status|hunk:/.test(rpc.stdout))
+  if (!/statusKey":"hunk|Hunk status|hunk:/.test(rpc.stdout)) {
     fail("packed extension did not register Hunk status");
+  }
 
   console.log(
     JSON.stringify(
@@ -135,10 +137,9 @@ try {
         packedFiles: pack.entryCount,
         installedRuntimeBytes: runtimeBytes,
         runtimeLimitBytes: MAX_RUNTIME_BYTES,
-        effectInstalled: false,
+        runtimeDependencies: 0,
         piPeersAutoInstalled: false,
         piRpcLoad: true,
-        lazyNativeChunk: true,
       },
       null,
       2,

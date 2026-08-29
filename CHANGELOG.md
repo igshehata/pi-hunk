@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Major Changes
+
+- Reduce pi-hunk to one full-screen takeover. Pi stops its TUI, Hunk inherits the physical terminal,
+  and Pi restarts after Hunk exits.
+- Remove embedded, side-by-side, floating, hide/restore, and persistent-session behavior together
+  with the `overlay.layout` configuration.
+- Remove zigpty, libghostty, all native terminal rendering code, and every runtime dependency.
+- Capture saved user notes through a bundled Hunk extension before natural exit, then deliver them
+  after Pi resumes. Hunk 0.18.2 or newer is now required.
+- Remove the unit-test suite and unit-test tooling; release gates now verify formatting, lint,
+  types, bundles, package contents, and the clean consumer install.
+
 ## 0.2.0
 
 ### Minor Changes

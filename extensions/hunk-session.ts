@@ -40,7 +40,7 @@ export interface HunkSessionSelectionOptions {
   cwd: string;
   /** Pin selection to one Hunk session id. */
   sessionId?: string;
-  /** OS pid of Pi's managed PTY leader, when available. */
+  /** OS pid of Pi's managed Hunk child process, when available. */
   managedPid?: number;
   /** Refuse repository fallback when the managed process has not registered yet. */
   requireManagedPid?: boolean;

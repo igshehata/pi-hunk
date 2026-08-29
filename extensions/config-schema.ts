@@ -1,8 +1,8 @@
 import type { KeyId } from "@earendil-works/pi-tui";
 
-/** Dedicated Pi-hunk chord used both by Pi and the focused overlay. */
+/** Dedicated Pi-hunk chord used while Pi owns the terminal. */
 export const PREFIX_KEY = "ctrl+space";
-export const TOGGLE_KEY = "h";
+export const OPEN_KEY = "h";
 export const SHOW_KEY = "s";
 
 export type ReviewPolicy = "off" | "after-run" | "live";
@@ -12,37 +12,9 @@ export interface HunkCommandConfig {
   args: string[];
 }
 
-export type OverlayLayout = "full" | "left" | "right" | "float";
-export type OverlaySize = number | `${number}%`;
-
-/** Pi-owned presentation only. Hunk's own config remains authoritative. */
-export interface OverlayConfig {
-  layout: OverlayLayout;
-}
-
-/**
- * Internal host selection — not user config. Derived from layout only.
- * - full → same-tab takeover (Hunk owns the TTY)
- * - left/right → exclusive region paint (Pi always wrapped into remaining columns)
- * - float → classic embed composite
- */
-export type OverlayHostMode = "embed" | "exclusive" | "takeover";
-
-export function resolveOverlayHostMode(overlay: Pick<OverlayConfig, "layout">): OverlayHostMode {
-  if (overlay.layout === "full") return "takeover";
-  if (overlay.layout === "left" || overlay.layout === "right") return "exclusive";
-  return "embed";
-}
-
-export interface ResolvedOverlayLayout {
-  anchor: "center" | "right-center" | "left-center";
-  width: OverlaySize;
-  maxHeight: OverlaySize;
-}
-
 export interface BindingsConfig {
   prefix: KeyId;
-  toggle: KeyId;
+  open: KeyId;
   show: KeyId;
 }
 
@@ -50,33 +22,12 @@ export interface HunkConfig {
   review: ReviewPolicy;
   followEdits: boolean;
   hunk: HunkCommandConfig;
-  overlay: OverlayConfig;
   bindings: BindingsConfig;
-}
-
-export const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
-  // full → takeover host (Hunk owns the TTY). left/right use exclusive+wrap.
-  layout: "full",
-};
-
-const OVERLAY_LAYOUTS: Record<OverlayLayout, ResolvedOverlayLayout> = {
-  full: { anchor: "center", width: "100%", maxHeight: "100%" },
-  left: { anchor: "left-center", width: "50%", maxHeight: "100%" },
-  right: { anchor: "right-center", width: "50%", maxHeight: "100%" },
-  float: { anchor: "center", width: "75%", maxHeight: "75%" },
-};
-
-export function isOverlayLayout(value: unknown): value is OverlayLayout {
-  return value === "full" || value === "left" || value === "right" || value === "float";
-}
-
-export function resolveOverlayLayout(layout: OverlayLayout): ResolvedOverlayLayout {
-  return { ...OVERLAY_LAYOUTS[layout] };
 }
 
 export const DEFAULT_BINDINGS_CONFIG: BindingsConfig = {
   prefix: PREFIX_KEY,
-  toggle: TOGGLE_KEY,
+  open: OPEN_KEY,
   show: SHOW_KEY,
 };
 
@@ -88,7 +39,6 @@ export const DEFAULT_CONFIG: HunkConfig = {
     command: "hunk",
     args: ["diff", "--watch"],
   },
-  overlay: { ...DEFAULT_OVERLAY_CONFIG },
   bindings: { ...DEFAULT_BINDINGS_CONFIG },
 };
 
@@ -132,7 +82,7 @@ const BINDING_SYMBOL_KEYS = new Set("`-=[]\\;',./!@#$%^&*()_+|~{}:<>?");
 
 /**
  * Validate a prefix without allowing ordinary typing or navigation keys to
- * be swallowed by the focused Hunk overlay. Function keys, insert, and clear
+ * be swallowed while Pi owns the terminal. Function keys, insert, and clear
  * may be bare; everything else needs ctrl, alt, or super.
  */
 function parseBinding(
@@ -207,14 +157,6 @@ function applyHunkCommand(base: HunkCommandConfig, input: unknown): HunkCommandC
   return next;
 }
 
-function applyOverlayConfig(base: OverlayConfig, input: unknown): OverlayConfig {
-  if (!isRecord(input)) return base;
-  const next = { ...base };
-  if (isOverlayLayout(input.layout)) next.layout = input.layout;
-  // experimentalPiWrap and other legacy overlay keys are ignored as unknown.
-  return next;
-}
-
 export function applyConfig(base: HunkConfig, input: unknown): HunkConfig {
   if (!isRecord(input)) return base;
   const next = cloneConfig(base);
@@ -224,12 +166,11 @@ export function applyConfig(base: HunkConfig, input: unknown): HunkConfig {
   }
   if (typeof input.followEdits === "boolean") next.followEdits = input.followEdits;
   if ("hunk" in input) next.hunk = applyHunkCommand(next.hunk, input.hunk);
-  if ("overlay" in input) next.overlay = applyOverlayConfig(next.overlay, input.overlay);
   if (isRecord(input.bindings)) {
     if (isPrefixBinding(input.bindings.prefix)) {
       next.bindings.prefix = input.bindings.prefix as KeyId;
     }
-    for (const action of ["toggle", "show"] as const) {
+    for (const action of ["open", "show"] as const) {
       const value = input.bindings[action];
       if (isHotkeyBinding(value)) next.bindings[action] = value as KeyId;
     }
@@ -245,7 +186,6 @@ export function cloneConfig(config: HunkConfig): HunkConfig {
     review: config.review,
     followEdits: config.followEdits,
     hunk: { command: config.hunk.command, args: [...config.hunk.args] },
-    overlay: { ...config.overlay },
     bindings: { ...config.bindings },
   };
 }

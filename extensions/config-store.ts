@@ -24,7 +24,6 @@ import {
   cloneConfig,
   DEFAULT_BINDINGS_CONFIG,
   DEFAULT_CONFIG,
-  isOverlayLayout,
   isRecord,
   isReviewPolicy,
   isPrefixBinding,
@@ -592,10 +591,10 @@ function warnInvalidBindings(
   }
   const validators = {
     prefix: isPrefixBinding,
-    toggle: isHotkeyBinding,
+    open: isHotkeyBinding,
     show: isHotkeyBinding,
   };
-  for (const action of ["prefix", "toggle", "show"] as const) {
+  for (const action of ["prefix", "open", "show"] as const) {
     const value = raw.bindings[action];
     if (value === undefined || validators[action](value)) continue;
     onWarning(
@@ -606,42 +605,26 @@ function warnInvalidBindings(
   }
   const bindings = {
     prefix: isPrefixBinding(raw.bindings.prefix) ? raw.bindings.prefix : inherited.prefix,
-    toggle: isHotkeyBinding(raw.bindings.toggle) ? raw.bindings.toggle : inherited.toggle,
+    open: isHotkeyBinding(raw.bindings.open) ? raw.bindings.open : inherited.open,
     show: isHotkeyBinding(raw.bindings.show) ? raw.bindings.show : inherited.show,
   };
   const identities = Object.values(bindings).map(bindingIdentity);
   if (new Set(identities).size !== 3) {
     onWarning(
-      `Ignoring colliding Hunk bindings in ${path}; prefix, toggle, and show must use distinct keys.`,
-    );
-  }
-}
-
-function warnInvalidOverlayConfig(raw: unknown, path: string, onWarning?: ConfigWarning): void {
-  if (!onWarning || !isRecord(raw) || raw.overlay === undefined) return;
-  if (!isRecord(raw.overlay)) {
-    onWarning(`Ignoring invalid overlay configuration in ${path}; expected an object.`);
-    return;
-  }
-  const { layout } = raw.overlay;
-  if (layout !== undefined && !isOverlayLayout(layout)) {
-    onWarning(
-      `Ignoring invalid overlay.layout ${JSON.stringify(layout)} in ${path}. ` +
-        `Use "full", "left", "right", or "float".`,
+      `Ignoring colliding Hunk bindings in ${path}; prefix, open, and show must use distinct keys.`,
     );
   }
 }
 
 function warnUnknownConfig(raw: unknown, path: string, onWarning?: ConfigWarning): void {
   if (!onWarning || !isRecord(raw)) return;
-  const knownTopLevel = new Set(["review", "followEdits", "hunk", "overlay", "bindings"]);
+  const knownTopLevel = new Set(["review", "followEdits", "hunk", "bindings"]);
   const unknown = Object.keys(raw)
     .filter((key) => !knownTopLevel.has(key))
     .map((key) => key);
   const nested: Array<[string, Set<string>]> = [
     ["hunk", new Set(["command", "args"])],
-    ["overlay", new Set(["layout"])],
-    ["bindings", new Set(["prefix", "toggle", "show"])],
+    ["bindings", new Set(["prefix", "open", "show"])],
   ];
   for (const [section, keys] of nested) {
     const value = raw[section];
@@ -668,7 +651,6 @@ function applyConfigLayer(
   warnInvalidCoreConfig(raw, path, onWarning);
   warnUnknownConfig(raw, path, onWarning);
   warnInvalidBindings(raw, path, config.bindings, onWarning);
-  warnInvalidOverlayConfig(raw, path, onWarning);
   return applyConfig(config, raw);
 }
 

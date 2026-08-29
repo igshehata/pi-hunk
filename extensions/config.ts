@@ -1,14 +1,10 @@
 export {
   PREFIX_KEY,
-  TOGGLE_KEY,
+  OPEN_KEY,
   SHOW_KEY,
-  DEFAULT_OVERLAY_CONFIG,
   DEFAULT_BINDINGS_CONFIG,
   DEFAULT_CONFIG,
   isReviewPolicy,
-  isOverlayLayout,
-  resolveOverlayLayout,
-  resolveOverlayHostMode,
   isPrefixBinding,
   isHotkeyBinding,
   bindingIdentity,
@@ -18,11 +14,6 @@ export {
 export type {
   ReviewPolicy,
   HunkCommandConfig,
-  OverlayLayout,
-  OverlaySize,
-  OverlayConfig,
-  OverlayHostMode,
-  ResolvedOverlayLayout,
   BindingsConfig,
   HunkConfig,
 } from "./config-schema.ts";

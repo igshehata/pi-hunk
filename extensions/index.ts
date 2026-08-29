@@ -21,7 +21,6 @@ import {
   hunkArgumentCompletions,
   isReviewPolicy,
   resolveHunkArgs,
-  resolveOverlayHostMode,
   settledAutoOpenAction,
   shouldEarlyOpenOnMutation,
   type HunkConfig,
@@ -42,18 +41,16 @@ import type { HunkRunner } from "./hunk-session.ts";
 import { resolveLaunchDirectory } from "./path-routing.ts";
 
 /**
- * Injectable collaborators so tests can drive the registered /hunk command and
- * prefix chord end-to-end against a coordinator built from fake surfaces.
- * Pi calls the default export with a single argument; production always gets
- * the real defaults.
+ * Injectable collaborators for deterministic host integration and lifecycle
+ * control. Production calls the default export with the real dependencies.
  */
 export interface HunkExtensionDeps {
   store?: ConfigStore;
   detector?: ChangeDetector;
   coordinator?: ReviewCoordinator;
-  /** Fake-runner seam for the isolated review handoff module. */
+  /** Optional runner for hosts that proxy Hunk CLI calls. */
   reviewRun?: HunkRunner;
-  /** Deterministic managed-session polling seam for integration tests. */
+  /** Optional managed-session poller used by alternate hosts. */
   reviewWaitForSession?: ReviewSessionWaiter;
 }
 
@@ -141,7 +138,7 @@ function registerHunkRuntime(
     }
     if (!registeredPrefixes.has(prefix)) {
       pi.registerShortcut(prefix, {
-        description: `Pi-hunk prefix (then ${store.get().bindings.toggle} to toggle or ${store.get().bindings.show} to show)`,
+        description: `Pi-hunk prefix (then ${store.get().bindings.open} to open or ${store.get().bindings.show} to show)`,
         handler: (shortcutCtx) => handlePrefix(shortcutCtx, store, coordinator),
       });
       registeredPrefixes.add(prefix);
@@ -224,7 +221,7 @@ function registerHunkRuntime(
 
   pi.registerCommand("hunk", {
     description:
-      "Hunk review: /hunk [target] · submit · feedback · next · close · toggle · status · review [policy] · config",
+      "Hunk review: /hunk [target] · submit · feedback · next · close · status · review [policy] · config",
     getArgumentCompletions: (argumentText) => hunkArgumentCompletions(argumentText),
     handler: (input, ctx) =>
       routeHunkCommand(input, ctx, store, coordinator, diagnostics, deps.reviewRun, reviewGate),
@@ -232,7 +229,7 @@ function registerHunkRuntime(
   return runtime;
 }
 
-/** Register directly for deterministic integration tests with injected collaborators. */
+/** Register with explicitly supplied host collaborators. */
 export function registerHunkExtension(pi: ExtensionAPI, deps: HunkExtensionDeps = {}): void {
   registerHunkRuntime(pi, deps, {
     registerSessionLifecycle: true,
@@ -325,7 +322,7 @@ export default function hunkExtension(
   pi: ExtensionAPI,
   deps?: HunkExtensionDeps,
 ): void | Promise<void> {
-  // Explicit dependency injection is a deterministic Pi-compatible test seam.
+  // Explicit collaborators also support Pi-compatible alternate hosts.
   if (deps !== undefined) {
     registerHunkExtension(pi, deps);
     return;
@@ -398,7 +395,7 @@ async function onSessionStart(
   updateStatus(ctx, store.get(), coordinator);
 }
 
-/** session_shutdown: release surfaces and clear the status segment. */
+/** session_shutdown: terminate Hunk and clear the status segment. */
 async function onSessionShutdown(ctx: ExtensionContext, deps: LifecycleDeps): Promise<void> {
   const { detector, coordinator, reviewGate, setStatusContext } = deps;
   detector.reset();
@@ -675,10 +672,6 @@ async function routeHunkCommand(
       if (!acceptsNoArguments("close", rest, ctx)) return;
       await handleClose(ctx, store, coordinator);
       return;
-    case "toggle":
-      if (!acceptsNoArguments("toggle", rest, ctx)) return;
-      await handleToggle(ctx, store, coordinator);
-      return;
     case "status":
       if (!acceptsNoArguments("status", rest, ctx)) return;
       await handleStatus(ctx, store, coordinator, diagnostics, reviewRun);
@@ -686,10 +679,6 @@ async function routeHunkCommand(
     case "feedback":
       if (!acceptsNoArguments("feedback", rest, ctx)) return;
       await handleFeedback(ctx, reviewGate);
-      return;
-    case "submit":
-      if (!acceptsNoArguments("submit", rest, ctx)) return;
-      await handleReviewAction(ctx, reviewGate);
       return;
     case "next":
       if (!acceptsNoArguments("next", rest, ctx)) return;
@@ -700,7 +689,7 @@ async function routeHunkCommand(
       updateStatus(ctx, store.get(), coordinator);
       return;
     case "config":
-      await handleConfigCommand(rest, ctx, store, coordinator);
+      await handleConfigCommand(rest, ctx, store);
       updateStatus(ctx, store.get(), coordinator);
       return;
     default:
@@ -712,7 +701,7 @@ async function routeHunkCommand(
 }
 
 function acceptsNoArguments(
-  subcommand: "close" | "toggle" | "status" | "feedback" | "submit" | "next",
+  subcommand: "close" | "status" | "feedback" | "next",
   input: string,
   ctx: ExtensionContext,
 ): boolean {
@@ -728,8 +717,8 @@ export function formatManualFeedback(notes: HunkReviewNote[]): string {
   ].join("\n\n");
 }
 
-/** Force an immediate fresh-comment probe; normal hides do this automatically. */
-export async function handleReviewAction(
+/** Retry captured feedback after an earlier host delivery failed. */
+export async function handleFeedback(
   ctx: ExtensionCommandContext,
   gate: Pick<ReviewHandoffGate, "submit">,
 ): Promise<void> {
@@ -754,14 +743,6 @@ export async function handleReviewAction(
       ? "info"
       : "warning",
   );
-}
-
-/** Manual recovery alias for the same immediate probe used by /hunk submit. */
-export async function handleFeedback(
-  ctx: ExtensionCommandContext,
-  gate: Pick<ReviewHandoffGate, "submit">,
-): Promise<void> {
-  await handleReviewAction(ctx, gate);
 }
 
 async function handleNextRepository(
@@ -822,7 +803,7 @@ async function handleOpen(
   }
 }
 
-export type HunkPrefixAction = "toggle" | "show";
+export type HunkPrefixAction = "open" | "show";
 
 /** Capture the action key after Pi dispatches the dedicated Hunk prefix. */
 export async function readHunkPrefixAction(
@@ -833,13 +814,13 @@ export async function readHunkPrefixAction(
     render(width: number): string[] {
       return [
         truncateToWidth(
-          `${theme.fg("accent", theme.bold("Pi-hunk"))}  ${bindings.toggle} toggle · ${bindings.show} show last commit · esc cancel`,
+          `${theme.fg("accent", theme.bold("Pi-hunk"))}  ${bindings.open} open · ${bindings.show} show last commit · esc cancel`,
           width,
         ),
       ];
     },
     handleInput(data: string): void {
-      if (matchesKey(data, bindings.toggle)) done("toggle");
+      if (matchesKey(data, bindings.open)) done("open");
       else if (matchesKey(data, bindings.show)) done("show");
       else done(undefined);
     },
@@ -857,7 +838,7 @@ async function handlePrefix(
     return;
   }
   const action = await readHunkPrefixAction(ctx, store.get().bindings);
-  if (action === "toggle") await handleToggle(ctx, store, coordinator);
+  if (action === "open") await handleShortcutOpen(ctx, store, coordinator);
   else if (action === "show") await handleShow(ctx, store, coordinator);
 }
 
@@ -882,7 +863,7 @@ async function handleShow(
   }
 }
 
-async function handleToggle(
+async function handleShortcutOpen(
   ctx: ExtensionContext,
   store: ConfigStore,
   coordinator: ReviewCoordinator,
@@ -892,13 +873,12 @@ async function handleToggle(
     return;
   }
   const config = store.get();
-  // Toggle must work while the agent is busy (overlay is non-blocking) — no waitForIdle.
   try {
-    await coordinator.toggleOverlay(ctx, config, config.hunk.args, "shortcut");
+    await coordinator.ensureOpen(ctx, config, config.hunk.args, "shortcut");
     updateStatus(ctx, store.get(), coordinator);
   } catch (error) {
     ctx.ui.notify(
-      `Hunk toggle failed: ${error instanceof Error ? error.message : String(error)}`,
+      `Hunk failed: ${error instanceof Error ? error.message : String(error)}`,
       "error",
     );
   }
@@ -928,7 +908,7 @@ export function describeSettledDecision(decision: SettledDecision | null): strin
   return `${decision.action}(${decision.reason})`;
 }
 
-/** Support status: policy, active overlay, binary, open notes, and last auto-open decision. */
+/** Support status: policy, active takeover, binary, open notes, and last decision. */
 async function handleStatus(
   ctx: ExtensionContext,
   store: ConfigStore,
@@ -938,10 +918,8 @@ async function handleStatus(
 ): Promise<void> {
   const config = store.get();
   const info = coordinator.getActiveInfo();
-  const exclusiveStats = coordinator.getExclusiveFrameStats();
   const active = info
-    ? `overlay:${info.state}${info.detail ? `(${info.detail})` : ""}` +
-      ` launchCwd=${info.launchCwd}${info.repoRoot ? ` repoRoot=${info.repoRoot}` : ""}`
+    ? `takeover:${info.state} launchCwd=${info.launchCwd}${info.repoRoot ? ` repoRoot=${info.repoRoot}` : ""}`
     : "none";
   let openNotes = "no-live-session";
   try {
@@ -956,17 +934,9 @@ async function handleStatus(
   } catch (error) {
     openNotes = `unavailable(${error instanceof Error ? error.message : String(error)})`;
   }
-  const hostMode = resolveOverlayHostMode(config.overlay);
   ctx.ui.notify(
-    `Hunk: review=${config.review}, layout=${config.overlay.layout}, ` +
-      `host=${hostMode}, ` +
-      `active=${active}, command=${config.hunk.command}\n` +
-      `open-notes=${openNotes}, last-auto-open=${describeSettledDecision(diagnostics.decision)}` +
-      (exclusiveStats
-        ? `\nexclusive-frame: state=${exclusiveStats.state}, direct=${exclusiveStats.directFrames}, ` +
-          `rows=${exclusiveStats.directRows}, bytes=${exclusiveStats.directBytes}, ` +
-          `revocations=${exclusiveStats.revocations}, suppressed-input=${exclusiveStats.suppressedInputRenders}`
-        : ""),
+    `Hunk: review=${config.review}, mode=full-screen, active=${active}, command=${config.hunk.command}\n` +
+      `open-notes=${openNotes}, last-auto-open=${describeSettledDecision(diagnostics.decision)}`,
     "info",
   );
 }
@@ -988,10 +958,9 @@ async function handleReviewCommand(
     return;
   }
 
-  // The prefix and focused-overlay action keys were bound at session start.
-  // A sparse review write reloads the file and may discover a concurrent
-  // external binding edit, but it must not pretend those keys are live before
-  // Pi reloads extensions.
+  // The prefix action keys were bound at session start. A sparse review write
+  // may discover an external edit, but it must not pretend those keys are live
+  // before Pi reloads extensions.
   const runtimeBindings = store.get().bindings;
   try {
     await store.persist(ctx, "global", { review: value });
@@ -1003,7 +972,7 @@ async function handleReviewCommand(
     return;
   }
   if (
-    (["prefix", "toggle", "show"] as const).some(
+    (["prefix", "open", "show"] as const).some(
       (binding) => store.get().bindings[binding] !== runtimeBindings[binding],
     )
   ) {
@@ -1020,7 +989,6 @@ function updateStatus(
   const info = coordinator.getActiveInfo();
   let label: string | undefined;
   if (info?.state === "visible") label = "hunk: visible";
-  else if (info?.state === "hidden") label = "hunk: hidden";
   else if (info?.state === "starting") label = "hunk: starting";
   else if (config.review !== "off") label = `hunk: ${config.review}`;
   ctx.ui.setStatus(
@@ -1047,4 +1015,4 @@ export {
   shouldEarlyOpenOnMutation,
   explainSettledDecision,
 } from "./config.ts";
-export type { HunkConfig, OverlayLayout, ReviewPolicy, SettledDecision } from "./config.ts";
+export type { HunkConfig, ReviewPolicy, SettledDecision } from "./config.ts";

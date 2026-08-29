@@ -13,19 +13,9 @@ import {
 } from "./hunk-session.ts";
 import { resolve } from "node:path";
 import { canonicalizePotentialPath, pathIsInside, resolveLaunchDirectory } from "./path-routing.ts";
-import { argsKey, type SurfaceSessionInfo } from "./overlay/types.ts";
+import { argsKey, type HunkReviewNote, type SurfaceSessionInfo } from "./overlay/types.ts";
 
-/** The deliberately small, read-only note shape exposed to the agent. */
-export interface HunkReviewNote {
-  noteId: string;
-  file: string;
-  oldLine: number | null;
-  newLine: number | null;
-  oldRange: [number, number] | null;
-  newRange: [number, number] | null;
-  summary: string;
-  rationale: string;
-}
+export type { HunkReviewNote };
 
 export type HunkReviewResult =
   | { status: "no-live-session"; message: string; notes: [] }
@@ -66,7 +56,7 @@ export interface ReviewHandoffOptions {
   cwd: string;
   /** Pin subsequent probes to one exact Hunk session. */
   sessionId?: string;
-  /** OS pid of the managed Pi-owned PTY leader, when available. */
+  /** OS pid of the managed Pi-owned Hunk child, when available. */
   managedPid?: number;
   hunkBinary?: string;
   run?: HunkRunner;
@@ -319,14 +309,6 @@ export type LateReviewSubmissionHandler = (
 
 export type LateReviewProbeWarningHandler = (message: string) => void;
 
-interface LateProbeFailureState {
-  epoch: number;
-  surfaceKey: string;
-  lifecycle: number;
-  detail: string;
-  warned: boolean;
-}
-
 /** Pending notes deliberately handed back to the lifecycle owner at a boundary. */
 export interface ReviewSessionDrain {
   epoch: number;
@@ -339,8 +321,6 @@ interface LateDelivery {
   controller: AbortController;
   promise: Promise<void>;
 }
-
-const LATE_HIDE_RECHECK_MS = 150;
 
 /** One asynchronous comment handoff and repository queue per Pi session. */
 export class ReviewHandoffGate {
@@ -356,13 +336,8 @@ export class ReviewHandoffGate {
   private pendingReviewNotes = new Map<string, PendingReviewNote>();
   private lateSubmissionHandler: LateReviewSubmissionHandler | null = null;
   private lateProbeWarningHandler: LateReviewProbeWarningHandler | null = null;
-  private lateStateUnsubscribe: (() => void) | null = null;
-  private lateSurfaceSnapshot: { key: string; state: string } | null = null;
-  private lateSurfaceLifecycle = 0;
-  /** Recoverable automatic inspection failure, retained until a successful retry/reset. */
-  private lateProbeFailure: LateProbeFailureState | null = null;
+  private stateUnsubscribe: (() => void) | null = null;
   private lateDelivery: LateDelivery | null = null;
-  private lateHideRecheckTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly coordinator: ReviewCoordinator,
@@ -374,8 +349,8 @@ export class ReviewHandoffGate {
     // queued coordinator operation, so holding that queue while probing cannot
     // deadlock. User close/replace/release is fail-closed. Lifecycle teardown
     // and a child that has already exited are necessarily best-effort.
-    this.coordinator.setDestructiveTransitionGuard?.(async (transition, surface) => {
-      const result = await this.beforeDestructiveTransition(transition, surface);
+    this.coordinator.setDestructiveTransitionGuard?.(async (transition, surface, capturedNotes) => {
+      const result = await this.beforeDestructiveTransition(transition, surface, capturedNotes);
       if (result.status === "unavailable" && result.behavior === "block") {
         throw new ReviewTransitionBlockedError(result);
       }
@@ -390,6 +365,7 @@ export class ReviewHandoffGate {
   async beforeDestructiveTransition(
     transition: DestructiveSurfaceTransition,
     surface: SurfaceSessionInfo | null = this.coordinator.getActiveInfo(),
+    capturedNotes?: HunkReviewNote[],
   ): Promise<ReviewHandoffBarrierResult> {
     const behavior = this.barrierBehavior(transition);
     if (!surface) {
@@ -432,6 +408,21 @@ export class ReviewHandoffGate {
           "the exact active Hunk surface changed before its comments could be inspected",
         );
       }
+      if (capturedNotes !== undefined) {
+        const captureSessionId = target.sessionId ?? `pid:${target.managedPid}`;
+        const notes = this.unseenNotes(captureSessionId, capturedNotes);
+        if (notes.length > 0) {
+          this.submitDetectedNotes(captureSessionId, notes, capturedNotes.length);
+        }
+        return {
+          status: "ready",
+          transition,
+          sessionId: target.sessionId,
+          pid: target.managedPid,
+          notes,
+          retainedNotes: this.pendingReviewNotes.size,
+        };
+      }
 
       try {
         const review = await this.inspectTarget(target, undefined, allowClosing);
@@ -468,7 +459,6 @@ export class ReviewHandoffGate {
           );
         }
 
-        this.lateProbeFailure = null;
         const notes: HunkReviewNote[] = [];
         if (review.status === "reviewable") {
           notes.push(...this.unseenNotes(review.session.sessionId, review.notes));
@@ -542,32 +532,26 @@ export class ReviewHandoffGate {
     return result;
   }
 
-  /** Report a failed hide probe once, with `/hunk feedback` as its recovery action. */
+  /** Report a best-effort lifecycle probe failure. */
   onLateProbeWarning(handler: LateReviewProbeWarningHandler): () => void {
     this.lateProbeWarningHandler = handler;
-    this.emitLateProbeWarning();
     return () => {
       if (this.lateProbeWarningHandler === handler) this.lateProbeWarningHandler = null;
     };
   }
 
-  /** Deliver unseen comments whenever a managed Hunk surface is hidden. */
+  /** Deliver unseen comments collected by explicit probes or process exit. */
   onLateSubmission(handler: LateReviewSubmissionHandler): () => void {
     this.lateSubmissionHandler = handler;
-    if (!this.lateStateUnsubscribe) {
-      this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
-      this.lateStateUnsubscribe = this.coordinator.onStateChange(() =>
-        this.observeCoordinatorState(),
-      );
+    if (!this.stateUnsubscribe) {
+      this.stateUnsubscribe = this.coordinator.onStateChange(() => this.observeCoordinatorState());
     }
     void this.dispatchLateNotes();
     return () => {
       if (this.lateSubmissionHandler !== handler) return;
       this.lateSubmissionHandler = null;
-      this.lateStateUnsubscribe?.();
-      this.lateStateUnsubscribe = null;
-      this.lateSurfaceSnapshot = null;
-      this.clearLateHideRecheck();
+      this.stateUnsubscribe?.();
+      this.stateUnsubscribe = null;
     };
   }
 
@@ -587,12 +571,8 @@ export class ReviewHandoffGate {
     // returned snapshot is the explicit lifecycle handoff for failed,
     // unconfirmed, or aborted notes and can never join the new epoch's queue.
     this.pendingReviewNotes = new Map();
-    this.clearLateHideRecheck();
     this.evidenceRevision = 0;
     this.submittedNoteKeys.clear();
-    this.lateSurfaceSnapshot = this.currentSurfaceSnapshot();
-    this.lateSurfaceLifecycle = 0;
-    this.lateProbeFailure = null;
     this.resetPlan();
     return {
       epoch,
@@ -674,7 +654,7 @@ export class ReviewHandoffGate {
     }
   }
 
-  /** Force the same fresh-comment probe that normally runs on hide. */
+  /** Force a fresh comment probe while the managed Hunk process is active. */
   async submit(ctx: ExtensionContext): Promise<HunkFeedbackResult> {
     return this.runReviewAction(ctx);
   }
@@ -688,9 +668,8 @@ export class ReviewHandoffGate {
       return this.unresolved ? { status: "target-required" } : { status: "no-evidence" };
     }
 
-    // Probe even a still-visible review, then wait behind every inspection that
-    // was already queued by a hide. Replacing the process earlier could make
-    // its inline comments permanently unreachable.
+    // Probe the active review, then wait behind every inspection already
+    // queued by another lifecycle action before replacing its process.
     const actionEpoch = this.sessionEpoch;
     const routeOwnsUnregisteredSurface = Boolean(
       !this.current &&
@@ -834,14 +813,13 @@ export class ReviewHandoffGate {
       (before?.source === "manual" || before?.source === "shortcut") &&
       beforeLaunchCwd === launchCwd &&
       before.argsKey === desiredArgsKey;
-    const restoreManualSurface = reuseManualSurface && before?.state === "hidden";
     if (!reuseManualSurface) {
-      // Replacing a live manual/shortcut surface can permanently drop its inline
+      // Replacing a live manual/shortcut process can permanently drop its inline
       // comments unless we probe first (same guarantee as `/hunk next`).
       if (
         before &&
         (before.source === "manual" || before.source === "shortcut") &&
-        (before.state === "visible" || before.state === "hidden")
+        before.state === "visible"
       ) {
         if (!this.activeReviewTarget()) {
           return {
@@ -867,7 +845,7 @@ export class ReviewHandoffGate {
     }
     if (!isCurrentRoute()) return staleRoute();
     const info = this.coordinator.getActiveInfo();
-    if (!info || (info.state !== "visible" && info.state !== "hidden")) {
+    if (!info || info.state !== "visible") {
       return {
         status: "unavailable",
         reason: "surface-not-live",
@@ -956,11 +934,7 @@ export class ReviewHandoffGate {
     }
 
     const after = this.coordinator.getActiveInfo();
-    if (
-      !after ||
-      (after.state !== "visible" && after.state !== "hidden") ||
-      after.pid !== managedPid
-    ) {
+    if (!after || after.state !== "visible" || after.pid !== managedPid) {
       return {
         status: "unavailable",
         reason: "surface-changed",
@@ -1020,18 +994,6 @@ export class ReviewHandoffGate {
 
     if (lookup.status === "no-diff") {
       return { status: "no-diff", candidate };
-    }
-    if (
-      restoreManualSurface &&
-      !(await this.coordinator.showManagedSurface(repository.managedPid, repository.sessionId))
-    ) {
-      return {
-        status: "unavailable",
-        reason: "surface-changed",
-        detail: "The reused Hunk surface changed before it could be restored.",
-        candidate,
-        policy: "bounded",
-      };
     }
     if (!isCurrentRoute()) return staleRoute();
 
@@ -1126,7 +1088,7 @@ export class ReviewHandoffGate {
       signal,
     });
     // Comment-list is pinned to the refreshed session id, but delivery also
-    // requires that the coordinator still owns the same exact PTY afterward.
+    // requires that the coordinator still owns the same exact child afterward.
     if (!this.targetMatchesActiveSurface(target, allowClosing)) {
       return { status: "surface-changed" };
     }
@@ -1217,9 +1179,7 @@ export class ReviewHandoffGate {
         if (!this.adoptInspectedSession(target, inspected.session)) {
           return this.unavailable("surface-changed");
         }
-        // A fresh explicit probe is the recovery boundary for a failed hide
-        // inspection. Delivery remains independently queued/unconfirmed below.
-        this.lateProbeFailure = null;
+        // Explicit probes retry queued delivery and collect any new comments.
         if (inspected.status === "no-diff") {
           if (this.current === target) {
             const current = this.current;
@@ -1272,9 +1232,7 @@ export class ReviewHandoffGate {
     const info = this.coordinator.getActiveInfo();
     if (
       !info ||
-      (info.state !== "visible" &&
-        info.state !== "hidden" &&
-        !(allowClosing && info.state === "closing")) ||
+      (info.state !== "visible" && !(allowClosing && info.state === "closing")) ||
       info.pid !== target.managedPid
     ) {
       return false;
@@ -1321,7 +1279,7 @@ export class ReviewHandoffGate {
     const info = this.coordinator.getActiveInfo();
     if (
       !info ||
-      (info.state !== "visible" && info.state !== "hidden") ||
+      info.state !== "visible" ||
       info.pid === undefined ||
       !Number.isInteger(info.pid) ||
       info.pid <= 0
@@ -1337,190 +1295,9 @@ export class ReviewHandoffGate {
     };
   }
 
-  private currentSurfaceSnapshot(): { key: string; state: string } | null {
-    const info = this.coordinator.getActiveInfo();
-    if (!info) return null;
-    return {
-      // Session metadata may be adopted between visible and hidden without a
-      // distinct surface transition. The managed PID + argv identity remains
-      // stable for that same persistent review.
-      key: `${info.argsKey}\0${info.pid ?? ""}`,
-      state: info.state,
-    };
-  }
-
   private observeCoordinatorState(): void {
     if (this.current && !this.currentMatchesActiveTarget(this.activeReviewTarget())) {
       this.current = null;
-    }
-    this.observeLateSurface();
-  }
-
-  private observeLateSurface(): void {
-    const previous = this.lateSurfaceSnapshot;
-    const current = this.currentSurfaceSnapshot();
-    this.lateSurfaceSnapshot = current;
-    if (!previous || !current || previous.key !== current.key) {
-      this.clearLateHideRecheck();
-      return;
-    }
-
-    const hidden = previous.state === "visible" && current.state === "hidden";
-    const restored = previous.state === "hidden" && current.state === "visible";
-    const hadPendingEmptyRecheck = this.lateHideRecheckTimer !== null;
-    // Restore needs a fresh probe only when the successful hide probe found no
-    // notes and armed its persistence debounce. Failed probes retain their one
-    // warning; discovered notes retain their explicit delivery/retry semantics.
-    if (!hidden && !(restored && hadPendingEmptyRecheck)) return;
-
-    const target = this.activeReviewTarget();
-    if (!target) return;
-    const epoch = this.sessionEpoch;
-    const lifecycle = ++this.lateSurfaceLifecycle;
-    const probe = this.runInspection(() =>
-      this.probeLateTarget(target, epoch, current.key, lifecycle),
-    );
-
-    this.clearLateHideRecheck();
-    if (!hidden) {
-      void probe;
-      return;
-    }
-    // Hunk may persist a just-saved note shortly after Pi observes the hide.
-    // Recheck only when the immediate exact-session probe succeeded but found
-    // nothing; failures keep their one warning and discovered notes must not
-    // cause an unsolicited retry after a delivery failure.
-    void probe.then((result) => {
-      if (
-        result !== "empty" ||
-        epoch !== this.sessionEpoch ||
-        lifecycle !== this.lateSurfaceLifecycle
-      ) {
-        return;
-      }
-      const snapshot = this.currentSurfaceSnapshot();
-      if (!snapshot || snapshot.key !== current.key) return;
-      if (snapshot.state === "visible") {
-        const latest = this.activeReviewTarget();
-        if (latest) {
-          void this.runInspection(() =>
-            this.probeLateTarget(latest, epoch, current.key, lifecycle),
-          );
-        }
-        return;
-      }
-      if (snapshot.state !== "hidden") return;
-      this.lateHideRecheckTimer = setTimeout(() => {
-        this.lateHideRecheckTimer = null;
-        if (epoch !== this.sessionEpoch || lifecycle !== this.lateSurfaceLifecycle) return;
-        const latestSnapshot = this.currentSurfaceSnapshot();
-        if (
-          !latestSnapshot ||
-          latestSnapshot.key !== current.key ||
-          latestSnapshot.state !== "hidden"
-        ) {
-          return;
-        }
-        const latest = this.activeReviewTarget();
-        if (!latest) return;
-        void this.runInspection(() => this.probeLateTarget(latest, epoch, current.key, lifecycle));
-      }, LATE_HIDE_RECHECK_MS);
-      this.lateHideRecheckTimer.unref?.();
-    });
-  }
-
-  private clearLateHideRecheck(): void {
-    if (this.lateHideRecheckTimer) clearTimeout(this.lateHideRecheckTimer);
-    this.lateHideRecheckTimer = null;
-  }
-
-  private async probeLateTarget(
-    target: ManagedReviewTarget,
-    epoch: number,
-    surfaceKey: string,
-    lifecycle: number,
-  ): Promise<"empty" | "handled" | "failed" | "stale"> {
-    try {
-      const inspected = await this.inspectTarget(target);
-      if (epoch !== this.sessionEpoch) return "stale";
-      if (inspected.status === "not-found") {
-        this.recordLateProbeFailure(
-          epoch,
-          surfaceKey,
-          lifecycle,
-          "the managed Hunk session was not found",
-        );
-        return "failed";
-      }
-      if (inspected.status === "surface-changed") {
-        this.recordLateProbeFailure(
-          epoch,
-          surfaceKey,
-          lifecycle,
-          "the managed Hunk surface changed",
-        );
-        return "failed";
-      }
-      if (!this.adoptInspectedSession(target, inspected.session)) {
-        this.recordLateProbeFailure(
-          epoch,
-          surfaceKey,
-          lifecycle,
-          "the managed Hunk surface changed",
-        );
-        return "failed";
-      }
-      this.lateProbeFailure = null;
-      if (inspected.status === "no-diff") return "empty";
-      const sessionId = inspected.session.sessionId;
-      const unseen = this.unseenNotes(sessionId, inspected.notes);
-      if (unseen.length > 0) {
-        this.submitDetectedNotes(sessionId, unseen, inspected.notes.length);
-        return "handled";
-      }
-      return "empty";
-    } catch (error) {
-      if (epoch !== this.sessionEpoch) return "stale";
-      this.recordLateProbeFailure(
-        epoch,
-        surfaceKey,
-        lifecycle,
-        error instanceof Error ? error.message : String(error),
-      );
-      return "failed";
-    }
-  }
-
-  private recordLateProbeFailure(
-    epoch: number,
-    surfaceKey: string,
-    lifecycle: number,
-    detail: string,
-  ): void {
-    const existing = this.lateProbeFailure;
-    if (
-      existing?.epoch === epoch &&
-      existing.surfaceKey === surfaceKey &&
-      existing.lifecycle === lifecycle
-    ) {
-      return;
-    }
-    this.lateProbeFailure = { epoch, surfaceKey, lifecycle, detail, warned: false };
-    this.emitLateProbeWarning();
-  }
-
-  private emitLateProbeWarning(): void {
-    const failure = this.lateProbeFailure;
-    const handler = this.lateProbeWarningHandler;
-    if (!failure || failure.warned || !handler) return;
-    failure.warned = true;
-    try {
-      handler(
-        `Hunk comments were not inspected when the review was hidden (${failure.detail}); ` +
-          "run /hunk feedback to retry before closing or replacing Hunk.",
-      );
-    } catch {
-      // Notification failure must not affect probe recovery or create a retry loop.
     }
   }
 

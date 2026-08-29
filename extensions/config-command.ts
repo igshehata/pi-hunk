@@ -4,35 +4,11 @@ import {
   bindingIdentity,
   cloneConfig,
   globalConfigPath,
-  isOverlayLayout,
   isPrefixBinding,
   isHotkeyBinding,
   type ConfigStore,
   type HunkConfig,
-  type OverlayLayout,
 } from "./config.ts";
-import type { ReviewCoordinator } from "./coordinator.ts";
-
-const LAYOUT_CHOICES: Array<{ value: OverlayLayout; label: string }> = [
-  { value: "full", label: "Full — 100% terminal" },
-  { value: "left", label: "Left — 50% split pane" },
-  { value: "right", label: "Right — 50% split pane" },
-  { value: "float", label: "Float — centered 75% pane" },
-];
-
-export interface ConfigCommandSelection {
-  layout: OverlayLayout;
-}
-
-export function parseConfigCommand(input: string): ConfigCommandSelection | undefined {
-  const tokens = input.trim().split(/\s+/).filter(Boolean);
-  if (tokens.length !== 1 || !isOverlayLayout(tokens[0])) return undefined;
-  return { layout: tokens[0] };
-}
-
-function displayLayout(layout: OverlayLayout): string {
-  return LAYOUT_CHOICES.find((choice) => choice.value === layout)?.label ?? layout;
-}
 
 /** Report the durable review value separately from higher-precedence runtime layers. */
 export function reportPersistedReviewPolicy(
@@ -123,14 +99,8 @@ function buildPatch(before: HunkConfig, after: HunkConfig): Record<string, unkno
   if (before.review !== after.review) patch.review = after.review;
   if (before.followEdits !== after.followEdits) patch.followEdits = after.followEdits;
 
-  const overlay: Record<string, unknown> = {};
-  if (before.overlay.layout !== after.overlay.layout) {
-    overlay.layout = after.overlay.layout;
-  }
-  if (Object.keys(overlay).length > 0) patch.overlay = overlay;
-
   const bindings: Record<string, unknown> = {};
-  for (const action of ["prefix", "toggle", "show"] as const) {
+  for (const action of ["prefix", "open", "show"] as const) {
     if (before.bindings[action] !== after.bindings[action]) {
       bindings[action] = after.bindings[action];
     }
@@ -143,7 +113,6 @@ function buildPatch(before: HunkConfig, after: HunkConfig): Record<string, unkno
 async function persistGlobalChange(
   ctx: ExtensionCommandContext,
   store: ConfigStore,
-  coordinator: ReviewCoordinator,
   before: HunkConfig,
   after: HunkConfig,
   runtimeBindings: HunkConfig["bindings"],
@@ -164,32 +133,24 @@ async function persistGlobalChange(
     return undefined;
   }
 
-  const changedBindings = (["prefix", "toggle", "show"] as const).filter(
+  const changedBindings = (["prefix", "open", "show"] as const).filter(
     (binding) => before.bindings[binding] !== saved.bindings[binding],
   );
-  // Pi cannot unregister the old prefix, and a focused overlay has already
-  // captured its chord. Keep the whole runtime chord stable until /reload.
+  // Pi cannot unregister a shortcut. Keep the runtime chord stable until /reload.
   const loadedBindings = store.get().bindings;
   if (
-    (["prefix", "toggle", "show"] as const).some(
+    (["prefix", "open", "show"] as const).some(
       (binding) => loadedBindings[binding] !== runtimeBindings[binding],
     )
   ) {
     store.patchSession({ bindings: runtimeBindings });
   }
 
-  const overlayChanged = before.overlay.layout !== saved.overlay.layout;
   const messages: string[] = [];
   if (notifySaved) messages.push(`Hunk configuration updated in ${globalConfigPath()}.`);
-  if (overlayChanged && coordinator.hasLiveSurface()) {
-    messages.push("Close and reopen the current Hunk review to apply the new layout.");
-  }
   if (changedBindings.length > 0) {
-    const chord = `${saved.bindings.prefix} then ${saved.bindings.toggle}/${saved.bindings.show}`;
+    const chord = `${saved.bindings.prefix} then ${saved.bindings.open}/${saved.bindings.show}`;
     messages.push(`Run /reload to activate the Pi-hunk chord ${chord}.`);
-  }
-  if (notifySaved && overlayChanged) {
-    messages.push(`Layout: ${displayLayout(saved.overlay.layout)}.`);
   }
   if (before.review !== after.review) {
     reportPersistedReviewPolicy(ctx, store, after.review);
@@ -201,11 +162,10 @@ async function persistGlobalChange(
 async function configureInteractively(
   ctx: ExtensionCommandContext,
   store: ConfigStore,
-  coordinator: ReviewCoordinator,
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify(
-      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore | full|left|right|float",
+      "Interactive Hunk configuration requires TUI mode. Usage: /hunk config restore",
       "warning",
     );
     return;
@@ -219,9 +179,8 @@ async function configureInteractively(
       [
         `Review behavior: ${current.review}`,
         `Follow edits: ${current.followEdits ? "on" : "off"}`,
-        `Overlay layout: ${current.overlay.layout}`,
         `Hunk prefix: ${current.bindings.prefix}`,
-        `Toggle hotkey: ${current.bindings.toggle}`,
+        `Open hotkey: ${current.bindings.open}`,
         `Show hotkey: ${current.bindings.show}`,
         "Restore defaults…",
         "Done",
@@ -239,23 +198,19 @@ async function configureInteractively(
         await store.resetGlobal(ctx);
         const restored = store.getLoaded();
         if (
-          (["prefix", "toggle", "show"] as const).some(
+          (["prefix", "open", "show"] as const).some(
             (binding) => restored.bindings[binding] !== runtimeBindings[binding],
           )
         ) {
           store.patchSession({ bindings: runtimeBindings });
         }
-        const reloadMessage = (["prefix", "toggle", "show"] as const).some(
+        const reloadMessage = (["prefix", "open", "show"] as const).some(
           (binding) => current.bindings[binding] !== restored.bindings[binding],
         )
-          ? ` Run /reload to activate the restored Hunk chord; the current chord remains active until then.`
+          ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then."
           : "";
-        const overlayMessage =
-          coordinator.hasLiveSurface() && current.overlay.layout !== restored.overlay.layout
-            ? " Close and reopen the current Hunk review to apply the restored layout."
-            : "";
         ctx.ui.notify(
-          `Global Hunk overrides removed from ${globalConfigPath()}.${reloadMessage}${overlayMessage}`,
+          `Global Hunk overrides removed from ${globalConfigPath()}.${reloadMessage}`,
           "info",
         );
         current = restored;
@@ -277,35 +232,24 @@ async function configureInteractively(
       const follow = await ctx.ui.select("Follow successful edits in Hunk", ["on", "off"]);
       if (!follow) continue;
       next.followEdits = follow === "on";
-    } else if (choice.startsWith("Overlay layout:")) {
-      const selectedLabel = await ctx.ui.select(
-        "Hunk overlay layout",
-        LAYOUT_CHOICES.map((item) => item.label),
-      );
-      const selected = LAYOUT_CHOICES.find((item) => item.label === selectedLabel);
-      if (!selected) continue;
-      next.overlay.layout = selected.value;
     } else if (choice.startsWith("Hunk prefix:")) {
       const binding = await captureBinding(ctx, "prefix", current.bindings.prefix, "prefix", [
-        current.bindings.toggle,
+        current.bindings.open,
         current.bindings.show,
       ]);
       if (!binding) continue;
       next.bindings.prefix = binding;
-    } else if (choice.startsWith("Toggle hotkey:")) {
-      const binding = await captureBinding(
-        ctx,
-        "toggle hotkey",
-        current.bindings.toggle,
-        "hotkey",
-        [current.bindings.prefix, current.bindings.show],
-      );
+    } else if (choice.startsWith("Open hotkey:")) {
+      const binding = await captureBinding(ctx, "open hotkey", current.bindings.open, "hotkey", [
+        current.bindings.prefix,
+        current.bindings.show,
+      ]);
       if (!binding) continue;
-      next.bindings.toggle = binding;
+      next.bindings.open = binding;
     } else if (choice.startsWith("Show hotkey:")) {
       const binding = await captureBinding(ctx, "show hotkey", current.bindings.show, "hotkey", [
         current.bindings.prefix,
-        current.bindings.toggle,
+        current.bindings.open,
       ]);
       if (!binding) continue;
       next.bindings.show = binding;
@@ -313,15 +257,7 @@ async function configureInteractively(
       continue;
     }
 
-    const saved = await persistGlobalChange(
-      ctx,
-      store,
-      coordinator,
-      current,
-      next,
-      runtimeBindings,
-      false,
-    );
+    const saved = await persistGlobalChange(ctx, store, current, next, runtimeBindings, false);
     if (saved) current = saved;
   }
 }
@@ -330,47 +266,33 @@ export async function handleConfigCommand(
   input: string,
   ctx: ExtensionCommandContext,
   store: ConfigStore,
-  coordinator: ReviewCoordinator,
 ): Promise<void> {
   if (!input.trim()) {
-    await configureInteractively(ctx, store, coordinator);
+    await configureInteractively(ctx, store);
+    return;
+  }
+
+  if (input.trim() !== "restore") {
+    ctx.ui.notify("Usage: /hunk config restore", "warning");
     return;
   }
 
   const current = store.get();
-  if (input.trim() === "restore") {
-    try {
-      await store.resetGlobal(ctx);
-      const restored = store.getLoaded();
-      const shortcutsChanged = (["prefix", "toggle", "show"] as const).some(
-        (binding) => restored.bindings[binding] !== current.bindings[binding],
-      );
-      if (shortcutsChanged) store.patchSession({ bindings: current.bindings });
-      const overlayChanged = current.overlay.layout !== restored.overlay.layout;
-      ctx.ui.notify(
-        `Global Hunk overrides removed from ${globalConfigPath()}.${shortcutsChanged ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then." : ""}${overlayChanged && coordinator.hasLiveSurface() ? " Close and reopen the current Hunk review to apply the restored layout." : ""}`,
-        "info",
-      );
-    } catch (error) {
-      ctx.ui.notify(
-        `Could not restore Hunk defaults: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-    }
-    return;
+  try {
+    await store.resetGlobal(ctx);
+    const restored = store.getLoaded();
+    const shortcutsChanged = (["prefix", "open", "show"] as const).some(
+      (binding) => restored.bindings[binding] !== current.bindings[binding],
+    );
+    if (shortcutsChanged) store.patchSession({ bindings: current.bindings });
+    ctx.ui.notify(
+      `Global Hunk overrides removed from ${globalConfigPath()}.${shortcutsChanged ? " Run /reload to activate the restored Hunk chord; the current chord remains active until then." : ""}`,
+      "info",
+    );
+  } catch (error) {
+    ctx.ui.notify(
+      `Could not restore Hunk defaults: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
   }
-
-  const direct = parseConfigCommand(input);
-  if (!direct) {
-    ctx.ui.notify("Usage: /hunk config restore | full|left|right|float", "warning");
-    return;
-  }
-
-  const next = cloneConfig(current);
-  next.overlay.layout = direct.layout;
-  if (Object.keys(buildPatch(current, next)).length === 0) {
-    ctx.ui.notify("Hunk configuration is unchanged.", "info");
-    return;
-  }
-  await persistGlobalChange(ctx, store, coordinator, current, next, current.bindings, true);
 }

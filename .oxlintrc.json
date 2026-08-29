@@ -10,14 +10,8 @@
   "env": {
     "builtin": true
   },
-  "ignorePatterns": ["dist/**", "coverage/**", ".pi-subagents/**"],
+  "ignorePatterns": ["dist/**", ".pi-subagents/**"],
   "overrides": [
-    {
-      "files": ["extensions/overlay/input.ts", "test/render-buffer.test.ts"],
-      "rules": {
-        "no-control-regex": "off"
-      }
-    },
     {
       "files": ["extensions/coordinator.ts"],
       "rules": {

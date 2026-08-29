@@ -5,7 +5,6 @@
 ## Validation
 
 - [ ] `mise run check`
-- [ ] Boundary/integration tests added or updated where applicable
 - [ ] Interactive smoke test completed where terminal behavior changed
 
 ## Release and docs

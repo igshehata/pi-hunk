@@ -2,11 +2,15 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
 import type { AutoOpenSuppressionReason, HunkConfig } from "./config.ts";
 import { navigateHunkSession, type LiveHunkSession } from "./hunk-session.ts";
-import type { HunkExit } from "./overlay/embedded.ts";
 import { canonicalPathIsInside } from "./path-routing.ts";
-import type { ExclusiveFrameStats } from "./overlay/exclusive-frame.ts";
 import { OverlaySurface } from "./overlay/surface.ts";
-import type { LaunchSource, OpenRequest, SurfaceSessionInfo } from "./overlay/types.ts";
+import type {
+  HunkExit,
+  HunkReviewNote,
+  LaunchSource,
+  OpenRequest,
+  SurfaceSessionInfo,
+} from "./overlay/types.ts";
 
 export type DestructiveSurfaceTransition =
   | "close"
@@ -20,6 +24,7 @@ export type DestructiveSurfaceTransition =
 export type DestructiveTransitionGuard = (
   transition: DestructiveSurfaceTransition,
   surface: SurfaceSessionInfo,
+  capturedNotes?: HunkReviewNote[],
 ) => Promise<void>;
 
 export interface CoordinatorDeps {
@@ -131,9 +136,8 @@ function transitionRunState(
 }
 
 /**
- * Owns the single persistent overlay and serializes every lifecycle transition.
- * The small promise queue keeps concurrent lifecycle, command, and shortcut
- * events from opening or disposing two PTYs at once.
+ * Owns the single full-screen Hunk process and serializes every lifecycle
+ * transition so concurrent commands cannot launch competing terminal owners.
  */
 export class ReviewCoordinator {
   private readonly overlay: OverlaySurface;
@@ -160,14 +164,8 @@ export class ReviewCoordinator {
     this.overlay = deps.overlay ?? new OverlaySurface();
     this.navigateHunk = deps.navigateHunk ?? navigateHunkSession;
     this.overlay.setStateListener(() => this.onOverlayStateChange());
-    this.overlay.setChildExitListener?.((result) => this.onChildExit(result));
-    this.overlay.setTransitionScheduler?.((operation) => {
-      // A focused-component shortcut is an explicit user action; once queued,
-      // an early-live surface is no longer disposable as an unused run artifact.
-      this.transitionRun({ type: "early-surface", event: "adopt" });
-      return this.exclusive(operation);
-    });
-    this.overlay.setReplacementGuard?.(() => this.guardDestructiveTransition("replace"));
+    this.overlay.setChildExitListener((result) => this.onChildExit(result));
+    this.overlay.setReplacementGuard(() => this.guardDestructiveTransition("replace"));
   }
 
   onStateChange(listener: () => void): () => void {
@@ -176,10 +174,9 @@ export class ReviewCoordinator {
   }
 
   /**
-   * Install the one comment-preservation barrier for every transition that can
-   * destroy or replace the active PTY. The guard runs while the coordinator's
-   * transition queue owns the exact surface, except for natural exit where the
-   * surface itself is already in `closing` and waits for the returned promise.
+   * Install the comment-preservation barrier for every transition that can
+   * destroy or replace the active Hunk process. Natural exit is best-effort
+   * because the child has already terminated.
    */
   setDestructiveTransitionGuard(guard: DestructiveTransitionGuard | null): void {
     this.destructiveTransitionGuard = guard;
@@ -268,10 +265,6 @@ export class ReviewCoordinator {
     return this.active?.getInfo() ?? null;
   }
 
-  getExclusiveFrameStats(): ExclusiveFrameStats | null {
-    return this.active?.getExclusiveFrameStats() ?? null;
-  }
-
   getEarlyOpenPromise(): Promise<void> | null {
     return this.runState.earlyOpen.phase === "pending" ? this.runState.earlyOpen.promise : null;
   }
@@ -296,7 +289,7 @@ export class ReviewCoordinator {
           ? (this.active?.getInfo()?.launchCwd ?? launchCwd)
           : launchCwd;
       const request = this.buildRequest(config, args, source, requestCwd);
-      await this.overlay.ensure(ctx, request, config);
+      await this.overlay.ensure(ctx, request);
       if (!this.overlay.isLive()) {
         this.cancelPendingFollow();
         if (this.overlay.getState() === "closed") return;
@@ -328,74 +321,12 @@ export class ReviewCoordinator {
     return adopted;
   }
 
-  /** Restore one exact hidden managed review without changing its argv or source. */
-  async showManagedSurface(managedPid: number, sessionId?: string): Promise<boolean> {
-    const shown = await this.exclusive(async () => {
-      this.assertAlive();
-      const surface = this.active;
-      const info = surface?.getInfo();
-      if (
-        !surface?.isLive() ||
-        info?.pid !== managedPid ||
-        (sessionId !== undefined && info.sessionId !== sessionId)
-      ) {
-        return false;
-      }
-      await surface.show();
-      if (surface.getState() !== "visible") return false;
-      this.transitionRun({ type: "early-surface", event: "adopt" });
-      return true;
-    });
-    if (shown) this.notifyStateChange();
-    return shown;
-  }
-
   adoptEarlySurfaceForRun(): void {
     this.transitionRun({ type: "early-surface", event: "adopt" });
   }
 
   isEarlySurfaceOwnedForRun(): boolean {
     return this.runState.earlySurface === "owned";
-  }
-
-  async toggleOverlay(
-    ctx: ExtensionContext,
-    config: HunkConfig,
-    args: string[],
-    source: LaunchSource = "shortcut",
-  ): Promise<void> {
-    await this.exclusive(async () => {
-      this.assertAlive();
-      const priorIdentity = this.captureFollowIdentity();
-      const request = this.buildRequest(
-        config,
-        args,
-        source,
-        this.active?.isLive() ? (this.active.getInfo()?.launchCwd ?? ctx.cwd) : ctx.cwd,
-      );
-      if (this.active?.isLive()) {
-        await this.active.toggle(ctx, request, config);
-        const nextIdentity = this.captureFollowIdentity();
-        if (!nextIdentity || !this.sameFollowIdentity(priorIdentity, nextIdentity)) {
-          this.cancelPendingFollow();
-        }
-        this.transitionRun({ type: "early-surface", event: "adopt" });
-        return;
-      }
-
-      await this.overlay.toggle(ctx, request, config);
-      if (!this.overlay.isLive()) {
-        this.cancelPendingFollow();
-        if (this.overlay.getState() === "closed") return;
-        throw new Error("Hunk overlay did not become live.");
-      }
-      this.active = this.overlay;
-      // A cold user toggle cannot be the live preflight surface awaited by a
-      // null-identity follow request.
-      this.cancelPendingFollow();
-      this.transitionRun({ type: "early-surface", event: "adopt" });
-    });
-    this.notifyStateChange();
   }
 
   async closeActive(): Promise<boolean> {
@@ -661,25 +592,26 @@ export class ReviewCoordinator {
     this.cancelPendingFollow();
     this.naturalClosePending = this.active === this.overlay;
     try {
-      await this.guardDestructiveTransition("natural-exit");
+      await this.guardDestructiveTransition("natural-exit", result.notes);
     } catch {
       // The child has already exited, so the surface cannot remain alive on a
-      // failed probe. The handoff gate reports the explicit best-effort warning.
+      // failed handoff. The gate reports the explicit best-effort warning.
     }
-    if (result.exitCode === 0 && (result.signal ?? 0) === 0) {
+    if (result.exitCode === 0 && !result.signal) {
       this.suppressAutoOpenForRun("dismissed");
     }
   }
 
   private async guardDestructiveTransition(
     transition: DestructiveSurfaceTransition,
+    capturedNotes?: HunkReviewNote[],
   ): Promise<void> {
     const guard = this.destructiveTransitionGuard;
     const info = this.active?.getInfo();
     if (!guard || !info) return;
     // Copy the identity: adoption during the probe may enrich the live surface,
     // but it must never retarget this transition to a replacement.
-    await guard(transition, { ...info });
+    await guard(transition, { ...info }, capturedNotes);
   }
 
   private buildRequest(
@@ -693,7 +625,6 @@ export class ReviewCoordinator {
       command: config.hunk.command,
       args,
       source,
-      focus: source === "manual" || source === "shortcut",
     };
   }
 
