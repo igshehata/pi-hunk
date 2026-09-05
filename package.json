@@ -47,10 +47,6 @@
     "typecheck": "tsc --noEmit",
     "verify:package": "node scripts/verify-package.mjs"
   },
-  "dependencies": {
-    "@coder/libghostty-vt-node": "0.1.0-beta.1",
-    "zigpty": "0.2.1"
-  },
   "devDependencies": {
     "@changesets/cli": "2.31.1",
     "@earendil-works/pi-coding-agent": "0.80.6",
