@@ -1,18 +1,24 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 — 2026-08-29
 
 ### Major Changes
 
-- Reduce pi-hunk to one full-screen takeover. Pi stops its TUI, Hunk inherits the physical terminal,
-  and Pi restarts after Hunk exits.
-- Remove embedded, side-by-side, floating, hide/restore, and persistent-session behavior together
-  with the `overlay.layout` configuration.
-- Remove zigpty, libghostty, all native terminal rendering code, and every runtime dependency.
-- Capture saved user notes through a bundled Hunk extension before natural exit, then deliver them
-  after Pi resumes. Hunk 0.18.2 or newer is now required.
-- Remove the unit-test suite and unit-test tooling; release gates now verify formatting, lint,
-  types, bundles, package contents, and the clean consumer install.
+- Reduce pi-hunk to one manual full-screen takeover for both Pi and Oh My Pi. The host stops its
+  TUI, Hunk inherits the physical terminal directly, and the host restarts after Hunk exits.
+- Remove overlays, alternate layouts, automatic reviews, repository routing, hide/restore,
+  persistent sessions, native PTY/rendering code, and their configuration and commands.
+- Replace the runtime with one explicit tagged Effect state machine. Chooser, configuration, launch,
+  switching, feedback delivery, and shutdown now share one serialized lifecycle.
+- Limit global configuration to the prefix plus `diff`, `show`, and `stash` action keys. Writes are
+  cross-process serialized and atomically committed.
+- Capture the final authoritative saved-user-note set through the bundled Hunk extension and fail
+  closed rather than deliver stale notes. Hunk 0.20.1 or newer (extension API 8+) is required.
+- Make `effect` the sole production dependency; remove zigpty, libghostty, test-runner tooling, and
+  every speculative unit test.
+- Add independent black-box Herdr coverage against real Pi and OMP processes for all modes,
+  commands, host and in-Hunk chords, exact comment capture, deletion, cross-mode switching, and
+  shutdown.
 
 ## 0.2.0
 

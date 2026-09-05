@@ -38,16 +38,24 @@ removed globally to land one emergency update.
 
 ## Security model
 
-Pi extensions execute with the user's permissions. Installing pi-hunk therefore grants it the same
-filesystem and process access as Pi. Pi-hunk launches the globally configured Hunk command with
-inherited terminal stdio, loads its bundled feedback extension, reads Hunk's local session metadata,
-and writes `hunk.json` in Pi's global agent config directory. The feedback extension writes saved
-user notes to a private temporary path supplied by pi-hunk; the parent validates and deletes that
-snapshot after Hunk exits.
+Pi and OMP extensions execute with the user's permissions. Installing pi-hunk therefore grants it
+the same filesystem and process access as the host. Pi-hunk runs the fixed `hunk` executable from
+`PATH`, gives it inherited physical-terminal stdio, and loads the bundled feedback bridge. Hunk also
+loads extensions from its own trusted configuration; install the host, pi-hunk, Hunk, and other Hunk
+extensions only from trusted sources.
 
-Keep `hunk.command` as a trusted executable on `PATH` or a trusted absolute path; do not migrate a
-project-relative executable into global config. Hunk also loads extensions according to its own
-trusted configuration. Only install pi-hunk, Hunk, and Hunk extensions from sources you trust.
+The bridge reads the current Hunk process's review snapshot from Hunk's local broker. It writes only
+to a private temporary path created by the parent. The parent size-checks and schema-validates that
+file, deletes its directory after exit, and submits only a complete authoritative snapshot. Missing,
+pending, malformed, oversized, or failed snapshots are not converted into agent feedback.
 
-The published npm package is checked for unexpected source files, runtime dependency growth, and
-clean-consumer loading before release. npm provenance is enabled for published artifacts.
+The global config contains only four key bindings. Cross-process writes use an owner-only lock and
+temporary file beside the destination before atomic rename. `PI_HUNK_CONFIG` deliberately permits
+trusted automation and tests to select another path.
+
+Saved Hunk comments are sent to the coding agent as a user message. Treat comments from an untrusted
+review author as untrusted prompt content.
+
+The published npm package is checked for unexpected source files, production-dependency growth, both
+Pi and OMP entry points, and clean-consumer loading before release. `effect` is the sole production
+dependency. npm provenance is enabled for published artifacts.

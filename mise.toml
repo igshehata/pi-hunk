@@ -27,6 +27,10 @@ run = "npm run typecheck"
 description = "Build the Pi extension and Hunk feedback bridge"
 run = "npm run build"
 
+[tasks.e2e]
+description = "Herdr e2e against Pi and OMP (requires HERDR_ENV=1)"
+run = "node scripts/e2e-herdr.mjs"
+
 [tasks.pack]
 description = "Verify the exact npm package and a clean consumer install"
 run = "npm run verify:package"

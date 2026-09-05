@@ -1,7 +1,8 @@
 # Contributing
 
-Pi-hunk sits across Pi lifecycle events, child-process ownership, terminal handoff, repository
-routing, and Hunk's session API. Keep changes small and explicit about which boundary they affect.
+Pi-hunk sits across Pi/OMP lifecycle events, one Effect state machine, child-process ownership,
+physical-terminal handoff, and Hunk's extension/session APIs. Keep changes small and explicit about
+which boundary they affect.
 
 ## Setup
 
@@ -35,9 +36,9 @@ in [SECURITY.md](SECURITY.md).
    repository-only maintenance generally do not need one.
 7. Keep commits focused enough to review without rewriting working history solely for aesthetics.
 
-The project intentionally has no unit-test runner or unit-test suite. Do not add unit tests.
-Terminal and lifecycle claims must be verified through the real executable path, not parser-only
-substitutes.
+Do not build a speculative unit suite around implementation details. Add a regression only for an
+observed bug and defend an observable contract. Terminal, lifecycle, hotkey, and feedback claims
+must be verified through packaged real Pi and OMP processes under Herdr.
 
 ## Useful tasks
 
@@ -73,10 +74,10 @@ Both streams stay in `release.yml` because npm trusted publishing is bound to th
 
 ## Verification expectations
 
-For terminal or lifecycle changes, run a packaged Pi/Hunk smoke scenario in a real terminal or
-pseudo-terminal. Verify the exact transition changed: launch, Hunk interaction, child exit, Pi
-repaint, feedback delivery, or forced shutdown. Static checks and a successful bundle do not prove
-terminal ownership.
+For terminal or lifecycle changes, run the affected packaged Herdr scenarios against both real Pi
+and OMP hosts with Hunk 0.20.1 or newer. Verify the exact transition changed: launch, Hunk
+interaction, child exit, repaint, feedback delivery, or forced shutdown. Static checks and a
+successful bundle do not prove terminal ownership.
 
 ## Pull requests
 
@@ -92,13 +93,15 @@ Do not include generated `dist/` output; the package build creates it during pre
 
 ## Design constraints
 
-- Pi-hunk owns one full-screen child process; Pi and Hunk never render concurrently.
-- Hunk receives inherited stdio and remains authoritative for terminal behavior, diff presentation,
-  and comments.
+- One tagged Effect state machine owns every chooser, configuration, launch, running, switching,
+  delivery, and shutdown transition.
+- Pi-hunk owns one full-screen child process; the host and Hunk never render concurrently.
+- Hunk receives inherited physical-terminal stdio and remains authoritative for terminal behavior,
+  diff presentation, and comments.
 - The bundled Hunk extension may read saved user notes only. Pi-hunk must never create, edit, apply,
   resolve, remove, or clear comments.
-- Pi-hunk configuration is global; project-local `.pi/hunk.json` files are ignored.
-- The published package has no runtime dependencies and must not add PTY or terminal-emulator code.
+- Pi-hunk configuration is global and contains only four hotkeys; project-local files are ignored.
+- `effect` is the sole production dependency. Do not add a PTY or terminal-emulator dependency.
 - Run `mise run pack` after package, build, or dependency changes.
 
 By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).

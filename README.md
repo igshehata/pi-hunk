@@ -16,16 +16,17 @@ exits.
 
 </div>
 
-## What you get
+## What pi-hunk does
 
-- **One reliable presentation mode.** Hunk takes over the terminal at full size; no embedded, side,
-  floating, or multiplexer-specific renderer.
-- **Inline feedback.** Saved Hunk comments return to the agent as soon as the Hunk process exits.
-- **Optional automatic reviews.** Open after a change or watch edits live when you opt in.
-- **Multiple repositories.** Review each repository touched in the same agent run.
-- **Your VCS, your Hunk setup.** Git, Jujutsu, and Sapling work through Hunk's normal configuration.
+- Gives Hunk the physical terminal at full size. No overlay, embedded renderer, PTY proxy, or hidden
+  session.
+- Supports Pi and Oh My Pi through the same extension entry point and behavior.
+- Opens Hunk manually in `diff`, `show`, or `stash` mode.
+- Returns the final authoritative set of saved user notes after Hunk exits. A failed snapshot is
+  reported and never replaced with stale event data.
+- Leaves themes, navigation, VCS detection, and all other review behavior to Hunk.
 
-> Pi-hunk only reads saved Hunk comments. It never edits, resolves, applies, or deletes them.
+Pi-hunk does not open automatically, route across repositories, or modify Hunk comments.
 
 ## Install
 
@@ -33,11 +34,11 @@ Requirements:
 
 - [Pi](https://github.com/earendil-works/pi) 0.80+ or
   [Oh My Pi](https://github.com/can1357/oh-my-pi) 17.3.4+
-- [Hunk](https://github.com/modem-dev/hunk) 0.18.2+ on `PATH`
+- [Hunk](https://github.com/modem-dev/hunk) 0.20.1+ on `PATH` (extension API 8+)
 - Node.js 22.19+
 - macOS arm64, or glibc Linux x64/arm64
 
-Stable 1.x (`latest`, recommended):
+Stable 1.x:
 
 ```bash
 # Pi
@@ -47,7 +48,7 @@ pi install npm:pi-hunk@latest
 omp install pi-hunk@latest
 ```
 
-Canary is a rolling build from `main`, independent of the stable Changesets plan, and may regress:
+Rolling canary from `main`:
 
 ```bash
 # Pi
@@ -57,121 +58,83 @@ pi install npm:pi-hunk@canary
 omp install pi-hunk@canary
 ```
 
-Both streams use the same package; npm tags select the stream. Then run `/reload` in the active
-host.
-
-A managed `pi update --extensions` replaces its configured npm source in place. If Pi reports a
-duplicate `/hunk` command, run `pi list`: another local, project, or CLI extension source is also
-configured. Remove that source, keep the intended `npm:pi-hunk` source, then run `/reload`.
+Reload host plugins after installation or update: `/reload` in Pi, `/reload-plugins` in OMP. If Pi
+reports a duplicate `/hunk` command, use `pi list` and remove the unintended local, project, or npm
+extension source.
 
 ## Quick start
 
-1. Ask Pi or OMP to change some code.
-2. Press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> to open Hunk.
-3. Review the diff and save inline comments with Hunk.
-4. Quit Hunk with <kbd>q</kbd>. Pi resumes and receives the saved comments.
-
-Automatic opening is off by default. Run `/hunk review after-run` to open Hunk after successful
-changes, or `/hunk review live` to open on the first change attempt and follow edits. If feedback
-delivery cannot be confirmed after Hunk exits, run `/hunk feedback`; captured notes remain
-recoverable for the current Pi session.
+1. Ask Pi or OMP to change code.
+2. Press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> to open `hunk diff HEAD --watch`.
+3. Save inline comments in Hunk.
+4. Quit Hunk with <kbd>Q</kbd>. The host resumes and receives the final saved comments.
 
 ## Full-screen takeover
 
-Pi-hunk supports one lifecycle:
+Each launch has one lifecycle:
 
-1. Pi stops its TUI.
+1. Pi-hunk allocates a private feedback path and stops the host TUI.
 2. Hunk inherits the physical terminal's stdin, stdout, resize events, and terminal modes.
-3. Hunk exits.
-4. Pi restarts its TUI, repaints, and submits captured review notes.
+3. The bundled Hunk extension captures saved comments and the final authoritative review snapshot.
+4. Hunk exits naturally or pi-hunk terminates it during host shutdown.
+5. Pi-hunk restarts and repaints the host TUI, then submits captured comments.
 
-There is no hide or restore operation. Quitting Hunk ends that review process; reopening starts a
-new Hunk session. This removes the native PTY and terminal-emulation layer that earlier releases
-used.
+Hunk must own the physical TTY directly. Pi-hunk intentionally has no stdin proxy, hide/restore
+operation, background process, or alternate layout.
 
 ## Shortcuts
 
-Shortcuts apply while Pi owns the terminal:
+The default chord is available both while the host owns the terminal and while Hunk is open:
 
-| Shortcut                                            | Action                          |
-| --------------------------------------------------- | ------------------------------- |
-| <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> | Open the configured Hunk review |
-| <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>S</kbd> | Open `hunk show`                |
+| Shortcut                                            | Action              |
+| --------------------------------------------------- | ------------------- |
+| <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>H</kbd> | Toggle `diff`       |
+| <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>S</kbd> | Toggle `show`       |
+| <kbd>Ctrl</kbd>+<kbd>Space</kbd>, then <kbd>T</kbd> | Toggle `stash show` |
 
-Change the prefix or either action key from `/hunk config` by pressing the desired key.
-
-## Choose when Hunk opens
-
-| Policy      | Behavior                                                                  |
-| ----------- | ------------------------------------------------------------------------- |
-| `off`       | Never open automatically; commands and shortcuts still work. **Default.** |
-| `after-run` | Open after the agent successfully changes code.                           |
-| `live`      | Open on the first change attempt and follow successful edits.             |
-
-```text
-/hunk review live
-```
-
-Automatic review is triggered by the host's coding tools, not by conversation or read-only work.
+From Hunk, choosing another mode exits the current child and opens the selected mode without
+returning control to the host in between. Choosing the current mode exits Hunk.
 
 ## Commands
 
-| Command                             | Action                                      |
-| ----------------------------------- | ------------------------------------------- |
-| `/hunk`                             | Open the watched working-copy review        |
-| `/hunk <target>`                    | Review a ref or revset                      |
-| `/hunk show [target]`               | Review the latest or selected revision      |
-| `/hunk staged`                      | Review Git staged changes                   |
-| `/hunk stash show [ref]`            | Review a Git stash                          |
-| `/hunk feedback`                    | Retry delivery of captured comments         |
-| `/hunk next`                        | Open the next queued repository             |
-| `/hunk status`                      | Show policy, process state, and diagnostics |
-| `/hunk close`                       | Terminate the managed Hunk process          |
-| `/hunk review off\|after-run\|live` | Change the automatic-review policy          |
-| `/hunk config`                      | Open global settings                        |
-| `/hunk config restore`              | Remove global overrides                     |
+| Command                | Action                                       |
+| ---------------------- | -------------------------------------------- |
+| `/hunk`                | Open `hunk diff HEAD --watch`                |
+| `/hunk diff [target]`  | Open a watched diff; target defaults to HEAD |
+| `/hunk show [target]`  | Show a revision; target defaults to HEAD     |
+| `/hunk stash [ref]`    | Show the latest or selected stash            |
+| `/hunk config`         | Edit global hotkeys interactively            |
+| `/hunk config restore` | Remove global overrides                      |
+
+`/hunk stash show [ref]` is also accepted to mirror Hunk's command shape. Other subcommands and
+extra arguments are rejected with usage guidance.
 
 ## Configure
 
-Run `/hunk config` to change the review policy, follow-edits behavior, and shortcuts. Changes save
-in Pi's global agent directory (`~/.pi/agent/hunk.json` by default). `PI_CODING_AGENT_DIR` and
-`PI_HUNK_CONFIG` are respected. Project-local `.pi/hunk.json` files are ignored; trusted projects
-receive a migration warning.
-
-The configuration schema is intentionally small:
+`/hunk config` changes only the prefix and three action keys. It writes `~/.pi/agent/hunk.json` by
+default. `PI_CODING_AGENT_DIR` changes the host agent directory; `PI_HUNK_CONFIG` can select an
+isolated config path. Project-local config files are ignored.
 
 ```json
 {
-  "review": "off",
-  "followEdits": true,
-  "hunk": {
-    "command": "hunk",
-    "args": ["diff", "--watch"]
-  },
-  "bindings": {
+  "hotkeys": {
     "prefix": "ctrl+space",
-    "open": "h",
-    "show": "s"
+    "diff": "h",
+    "show": "s",
+    "stash": "t"
   }
 }
 ```
 
-`hunk.args` must not contain `--no-extensions`: pi-hunk loads a bundled Hunk extension that captures
-saved user notes before the process exits. Themes, presentation, and Hunk keybindings stay in Hunk's
-own [`config.toml`](https://github.com/modem-dev/hunk#configuration).
-
-`PI_HUNK_REVIEW` can override the saved review policy. Pi-hunk warns when that happens.
-
-## Multiple repositories
-
-Pi-hunk opens the repository containing the files Pi changed. If one run changes more than one
-repository, quit the current Hunk review and use `/hunk next` to open the next queued review.
-
-This works with Git, Jujutsu, and Sapling; Hunk chooses the backend using its normal settings.
+The prefix must be a safe modified key or function key and must not collide with an active host
+binding. All four bindings must be distinct. Writes are owner-only, cross-process serialized, and
+committed by same-directory atomic rename. Reload host plugins after changing bindings—`/reload` in
+Pi or `/reload-plugins` in OMP—so the host can register the new prefix.
 
 ## Support
 
-When reporting a terminal issue, include your platform, terminal, Pi version, Hunk version, and VCS.
+When reporting a terminal issue, include the platform, terminal, host version, Hunk version, launch
+mode, and exact key sequence.
 
 - [Report a bug](https://github.com/igshehata/pi-hunk/issues/new?template=bug.yml)
 - [Request a feature](https://github.com/igshehata/pi-hunk/issues/new?template=feature.yml)

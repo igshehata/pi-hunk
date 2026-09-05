@@ -1,6 +1,6 @@
 {
   "name": "pi-hunk",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Review Pi coding-agent changes in a full-screen Hunk takeover",
   "keywords": [
     "code-review",
@@ -43,6 +43,9 @@
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "verify:package": "node scripts/verify-package.mjs"
+  },
+  "dependencies": {
+    "effect": "3.22.1"
   },
   "devDependencies": {
     "@changesets/cli": "2.31.1",

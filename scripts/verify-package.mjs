@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const MAX_RUNTIME_BYTES = 1_000_000;
+const MAX_RUNTIME_BYTES = 45_000_000;
 const root = process.cwd();
 const scratch = mkdtempSync(join(tmpdir(), "pi-hunk-package-"));
 const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -35,16 +35,18 @@ try {
   }
   if (
     packageJson.main !== "./dist/index.js" ||
-    packageJson.pi?.extensions?.[0] !== "./dist/index.js"
+    packageJson.pi?.extensions?.[0] !== "./dist/index.js" ||
+    packageJson.omp?.extensions?.[0] !== "./dist/index.js"
   ) {
-    fail("package entry points must resolve to dist/index.js");
+    fail("main, Pi, and OMP entry points must resolve to dist/index.js");
   }
   if (packageJson.publishConfig?.access !== "public") fail("npm access must be public");
   if (packageJson.repository?.url !== "git+https://github.com/igshehata/pi-hunk.git") {
     fail("repository metadata does not match the public repository");
   }
-  if (packageJson.dependencies && Object.keys(packageJson.dependencies).length > 0) {
-    fail("the full-screen core must not ship runtime dependencies");
+  const runtimeDependencies = packageJson.dependencies ?? {};
+  if (Object.keys(runtimeDependencies).length !== 1 || runtimeDependencies.effect !== "3.22.1") {
+    fail("effect 3.22.1 must be the sole runtime dependency");
   }
 
   const pack = JSON.parse(
@@ -102,14 +104,10 @@ try {
     fail(`installed runtime is ${runtimeBytes} bytes; limit is ${MAX_RUNTIME_BYTES}`);
   }
   for (const forbidden of [
-    "effect",
-    "fast-check",
-    "pure-rand",
     "node-pty",
     "zigpty",
     "vitest",
     join("@coder", "libghostty-vt-node"),
-    join("@standard-schema", "spec"),
     join("@earendil-works", "pi-coding-agent"),
     join("@earendil-works", "pi-tui"),
   ]) {
@@ -118,16 +116,24 @@ try {
   if (!existsSync(join(modules, "pi-hunk"))) fail("pi-hunk is missing from the runtime install");
 
   const entry = join(modules, "pi-hunk", "dist", "index.js");
-  const pi = resolve(root, "node_modules", ".bin", "pi");
-  const rpc = spawnSync(pi, ["--mode", "rpc", "--no-session", "--no-extensions", "-e", entry], {
-    cwd: consumer,
-    encoding: "utf8",
-    input: `${JSON.stringify({ type: "prompt", message: "/hunk status" })}\n`,
-  });
-  if (rpc.status !== 0) fail(`Pi RPC load exited ${rpc.status}: ${rpc.stderr}`);
-  if (!/statusKey":"hunk|Hunk status|hunk:/.test(rpc.stdout)) {
-    fail("packed extension did not register Hunk status");
-  }
+  const verifyRpcLoad = (binary, label) => {
+    const rpc = spawnSync(
+      binary,
+      ["--mode", "rpc", "--no-session", "--no-extensions", "-e", entry],
+      {
+        cwd: consumer,
+        encoding: "utf8",
+        input: `${JSON.stringify({ type: "prompt", message: "/hunk config" })}\n`,
+      },
+    );
+    if (rpc.error) fail(`${label} RPC could not start: ${rpc.error.message}`);
+    if (rpc.status !== 0) fail(`${label} RPC load exited ${rpc.status}: ${rpc.stderr}`);
+    if (!/Interactive Pi-hunk configuration requires TUI mode|Pi-hunk/.test(rpc.stdout)) {
+      fail(`packed extension did not register the Hunk command in ${label}`);
+    }
+  };
+  verifyRpcLoad(resolve(root, "node_modules", ".bin", "pi"), "Pi");
+  verifyRpcLoad(process.env.OMP_BIN ?? "omp", "OMP");
 
   console.log(
     JSON.stringify(
@@ -137,9 +143,10 @@ try {
         packedFiles: pack.entryCount,
         installedRuntimeBytes: runtimeBytes,
         runtimeLimitBytes: MAX_RUNTIME_BYTES,
-        runtimeDependencies: 0,
+        runtimeDependencies: ["effect"],
         piPeersAutoInstalled: false,
         piRpcLoad: true,
+        ompRpcLoad: true,
       },
       null,
       2,
