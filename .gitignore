@@ -5,6 +5,7 @@ bugs/
 tasks/
 coverage/
 .pi/
+.omp/
 .claude/
 mise.local.toml
 .env
@@ -15,3 +16,4 @@ mise.local.toml
 .DS_Store
 
 sandbox/
+/architecture.md

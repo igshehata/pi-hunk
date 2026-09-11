@@ -23,5 +23,5 @@ jobs:
         with:
           cache: true
           install: true
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: mise run check
