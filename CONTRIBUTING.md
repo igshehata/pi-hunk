@@ -55,12 +55,12 @@ in [SECURITY.md](SECURITY.md).
 
 Pi-hunk has two npm streams:
 
-- **Stable 1.x** uses the `latest` npm tag. Add Changesets normally (a `major` entry is required
-  to reach 1.0.0 from 0.2.0; existing minor/patch entries are not enough). Merge the generated
-  version PR only when `package.json`, the lockfile, and `CHANGELOG.md` show the exact stable
-  version, approve the package staged by `.github/workflows/release.yml`, then run
-  `finalize-release.yml` with that exact version. Finalization creates the immutable `vX.Y.Z` tag
-  and GitHub Release and rejects prerelease versions.
+- **Stable 1.x** uses the `latest` npm tag. Add Changesets normally (a `major` entry is required to
+  reach 1.0.0 from 0.2.0; existing minor/patch entries are not enough). Merge the generated version
+  PR only when `package.json`, the lockfile, and `CHANGELOG.md` show the exact stable version,
+  approve the package staged by `.github/workflows/release.yml`, then run `finalize-release.yml`
+  with that exact version. Finalization creates the immutable `vX.Y.Z` tag and GitHub Release and
+  rejects prerelease versions.
 - **Canary** is the rolling `canary` npm tag, independent of the stable Changesets plan. Preview its
   deterministic identity with `mise run release:canary:preview`, then dispatch the **Release**
   workflow from `main` (or run `gh workflow run release.yml --ref main`). Users always select
