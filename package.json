@@ -1,6 +1,6 @@
 {
   "name": "pi-hunk",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Review changes and commits in full-screen Hunk from Pi and OMP",
   "keywords": [
     "code-review",
