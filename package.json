@@ -1,13 +1,12 @@
 {
   "name": "pi-hunk",
   "version": "0.2.0",
-  "description": "Review Pi coding-agent changes in a native, persistent Hunk overlay",
+  "description": "Review changes and commits in full-screen Hunk from Pi and OMP",
   "keywords": [
     "code-review",
     "coding-agent",
     "diff",
     "hunk",
-    "overlay",
     "pi-extension",
     "pi-package",
     "tui"
@@ -24,12 +23,12 @@
   },
   "files": [
     "dist",
+    "assets/hero.svg",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "type": "module",
-  "main": "./dist/index.js",
   "publishConfig": {
     "access": "public"
   },
@@ -42,17 +41,20 @@
     "lint": "oxlint .",
     "prepare": "npm run build",
     "test": "vitest run",
-    "test:critical": "vitest run test/auto-review-integration.test.ts test/overlay-embedded-integration.test.ts test/exclusive-embedded-integration.test.ts test/experimental-pi-wrap.test.ts test/exclusive-frame.test.ts test/direct-rectangle.test.ts test/overlay-controller.test.ts test/embedded-visibility.test.ts test/takeover.test.ts test/takeover-resume-integration.test.ts test/config-command.test.ts test/extension-toggle.test.ts test/omp-compatibility.test.ts test/zigpty-adapter.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "verify:package": "node scripts/verify-package.mjs"
   },
   "devDependencies": {
     "@changesets/cli": "2.31.1",
-    "@earendil-works/pi-coding-agent": "0.80.6",
-    "@earendil-works/pi-tui": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "@oh-my-pi/pi-coding-agent": "18.0.10",
+    "@oh-my-pi/pi-tui": "18.0.10",
     "@types/node": "24.13.3",
+    "effect": "4.0.0-rc.112",
     "esbuild": "0.28.1",
+    "hunkdiff": "0.20.0",
     "oxfmt": "0.59.0",
     "oxlint": "1.74.0",
     "typescript": "5.9.3",
@@ -60,13 +62,25 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "@oh-my-pi/pi-coding-agent": "*",
+    "@oh-my-pi/pi-tui": "*",
+    "hunkdiff": ">=0.21.1"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
       "optional": true
     },
     "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "@oh-my-pi/pi-coding-agent": {
+      "optional": true
+    },
+    "@oh-my-pi/pi-tui": {
+      "optional": true
+    },
+    "hunkdiff": {
       "optional": true
     }
   },
@@ -76,12 +90,12 @@
   "packageManager": "npm@11.17.0",
   "omp": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/omp.js"
     ]
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/pi.js"
     ]
   }
 }

@@ -2,7 +2,11 @@
 "pi-hunk": patch
 ---
 
-Prevent full-screen Hunk from hanging on “Restoring Hunk…” after it is toggled off and back on.
+Rebuild Pi and OMP review integration around one shared full-screen Hunk lifecycle.
 
-Restore Oh My Pi compatibility by registering config-backed shortcuts before OMP snapshots
-extensions and treating only terminal `agent_end` events as settled runs.
+Review completion restores the host terminal. Session replacement and shutdown settle the owned
+review before the next session can take over.
+
+The teardown now signals and settles the complete owned launcher tree before terminal handoff. Fix
+Effect-only bundle validation for hoisted installations. Teardown verifies process identity and
+surfaces bounded cleanup failures instead of silently handing off.

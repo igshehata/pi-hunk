@@ -1,144 +1,170 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
-  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-// libghostty's ABI-stable package currently carries three platform prebuilds.
-// Keep bounded headroom over the measured 15.9 MB clean consumer install.
-const MAX_RUNTIME_BYTES = 19_000_000;
 const root = process.cwd();
 const scratch = mkdtempSync(join(tmpdir(), "pi-hunk-package-"));
-const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-
-function logicalBytes(path) {
-  let total = 0;
-  for (const entry of readdirSync(path, { withFileTypes: true })) {
-    const child = join(path, entry.name);
-    total += entry.isDirectory() ? logicalBytes(child) : entry.isFile() ? statSync(child).size : 0;
-  }
-  return total;
-}
-
-function fail(message) {
-  throw new Error(`Package verification failed: ${message}`);
-}
+// Use the host runtime, not a transitive npm Bun installer's uninitialized stub.
+const hostEnvironment = {
+  ...process.env,
+  PATH: (process.env.PATH ?? "")
+    .split(delimiter)
+    .filter((path) => !path.endsWith("node_modules/.bin"))
+    .join(delimiter),
+};
+const hostEntries = {
+  pi: {
+    file: "pi.js",
+    runtime: process.execPath,
+    sdks: ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"],
+  },
+  omp: {
+    file: "omp.js",
+    runtime: "bun",
+    sdks: ["@oh-my-pi/pi-coding-agent", "@oh-my-pi/pi-tui"],
+  },
+  hunk: { file: "pi-hunk-review.js", runtime: process.execPath, sdks: ["hunkdiff"] },
+};
+const optionalPeers = {
+  "@earendil-works/pi-coding-agent": true,
+  "@earendil-works/pi-tui": true,
+  "@oh-my-pi/pi-coding-agent": true,
+  "@oh-my-pi/pi-tui": true,
+  hunkdiff: true,
+};
 
 try {
-  if (packageJson.name !== "pi-hunk" || packageJson.private === true) {
-    fail("package must be publishable as pi-hunk");
-  }
-  if (
-    packageJson.main !== "./dist/index.js" ||
-    packageJson.pi?.extensions?.[0] !== "./dist/index.js"
-  ) {
-    fail("package entry points must resolve to dist/index.js");
-  }
-  if (packageJson.publishConfig?.access !== "public") fail("npm access must be public");
-  if (packageJson.repository?.url !== "git+https://github.com/igshehata/pi-hunk.git") {
-    fail("repository metadata does not match the public repository");
-  }
-
+  // Verify the existing build: packing must not silently rebuild different bytes.
   const pack = JSON.parse(
-    execFileSync("npm", ["pack", "--json", "--pack-destination", scratch], {
+    execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", scratch], {
       cwd: root,
       encoding: "utf8",
     }),
   )[0];
   const paths = new Set(pack.files.map((file) => file.path));
   for (const required of [
-    "dist/index.js",
+    "dist/pi.js",
+    "dist/omp.js",
+    "dist/pi-hunk-review.js",
     "package.json",
     "README.md",
-    "CHANGELOG.md",
+    "assets/hero.svg",
     "LICENSE",
   ]) {
-    if (!paths.has(required)) fail(`missing ${required}`);
+    assert(paths.has(required), `Packed artifact is missing ${required}`);
   }
-  if (
-    [...paths].some(
-      (path) =>
-        path === "docs" ||
-        path.startsWith("docs/") ||
-        path === "extensions" ||
-        path.startsWith("extensions/") ||
-        path === "test" ||
-        path.startsWith("test/"),
-    )
-  ) {
-    fail("source extensions or tests leaked into the package");
-  }
-
-  const nativeChunks = [...paths].filter((path) => /^dist\/chunks\/.*\.js$/.test(path));
-  if (nativeChunks.length === 0) fail("lazy embedded-terminal chunk is missing");
-  const entrySource = readFileSync(join(root, "dist", "index.js"), "utf8");
-  if (entrySource.includes("zigpty") || entrySource.includes("@coder/libghostty-vt-node")) {
-    fail("native terminal dependencies leaked into the eager extension entry");
-  }
-  const chunkSource = nativeChunks.map((path) => readFileSync(join(root, path), "utf8")).join("\n");
-  if (!chunkSource.includes("zigpty") || !chunkSource.includes("@coder/libghostty-vt-node")) {
-    fail("lazy embedded-terminal chunk does not contain both native adapters");
+  const allowedDocuments = {
+    "package.json": true,
+    "README.md": true,
+    "assets/hero.svg": true,
+    "CHANGELOG.md": true,
+    LICENSE: true,
+  };
+  for (const path of paths) {
+    assert(
+      allowedDocuments[path] || /^dist\/(?:chunks\/)?[^/]+\.js$/.test(path),
+      `Unexpected packed file: ${path}`,
+    );
   }
 
   const consumer = join(scratch, "consumer");
   mkdirSync(consumer);
-  execFileSync("npm", ["init", "-y"], { cwd: consumer, stdio: "ignore" });
-  execFileSync("npm", ["install", "--no-audit", "--no-fund", join(scratch, pack.filename)], {
-    cwd: consumer,
-    stdio: "ignore",
-  });
+  writeFileSync(join(consumer, "package.json"), '{"private":true,"type":"module"}\n');
+  execFileSync(
+    "npm",
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund", join(scratch, pack.filename)],
+    { cwd: consumer, stdio: "pipe" },
+  );
 
   const modules = join(consumer, "node_modules");
-  const runtimeBytes = logicalBytes(modules);
-  if (runtimeBytes > MAX_RUNTIME_BYTES) {
-    fail(`installed runtime is ${runtimeBytes} bytes; limit is ${MAX_RUNTIME_BYTES}`);
-  }
-  for (const forbidden of [
-    "effect",
-    "fast-check",
-    "pure-rand",
-    "node-pty",
-    join("@standard-schema", "spec"),
-    join("@earendil-works", "pi-coding-agent"),
-    join("@earendil-works", "pi-tui"),
+  assert.deepEqual(
+    readdirSync(modules).filter((name) => name !== ".package-lock.json"),
+    ["pi-hunk"],
+    "A clean consumer must install pi-hunk alone, without runtime dependencies or automatic peers",
+  );
+  const installed = join(modules, "pi-hunk");
+  const manifest = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
+  assert.equal(manifest.name, "pi-hunk");
+  assert.notEqual(manifest.private, true);
+  assert.equal(manifest.type, "module");
+  assert.equal(manifest.license, "MIT");
+  assert.equal(manifest.publishConfig?.access, "public");
+  assert.equal(manifest.repository?.url, "git+https://github.com/igshehata/pi-hunk.git");
+  assert.deepEqual(manifest.pi?.extensions, ["./dist/pi.js"]);
+  assert.deepEqual(manifest.omp?.extensions, ["./dist/omp.js"]);
+  assert.equal(manifest.main, undefined, "Hosts must use their independent manifest entrypoints");
+  for (const field of [
+    "dependencies",
+    "optionalDependencies",
+    "bundledDependencies",
+    "bundleDependencies",
   ]) {
-    if (existsSync(join(modules, forbidden))) fail(`${forbidden} was installed at runtime`);
+    assert.equal(Object.keys(manifest[field] ?? {}).length, 0, `Unexpected ${field}`);
   }
-  for (const required of ["pi-hunk", "zigpty", join("@coder", "libghostty-vt-node")]) {
-    if (!existsSync(join(modules, required)))
-      fail(`${required} is missing from the runtime install`);
+  for (const name of Object.keys(manifest.peerDependencies ?? {})) {
+    assert(optionalPeers[name], `Unexpected peer: ${name}`);
+    assert.equal(
+      manifest.peerDependenciesMeta?.[name]?.optional,
+      true,
+      `Peer ${name} must be host-provided`,
+    );
   }
 
-  const entry = join(modules, "pi-hunk", "dist", "index.js");
-  const pi = resolve(root, "node_modules", ".bin", "pi");
-  const rpc = spawnSync(pi, ["--mode", "rpc", "--no-session", "--no-extensions", "-e", entry], {
-    cwd: consumer,
-    encoding: "utf8",
-    input: `${JSON.stringify({ type: "prompt", message: "/hunk status" })}\n`,
-  });
-  if (rpc.status !== 0) fail(`Pi RPC load exited ${rpc.status}: ${rpc.stderr}`);
-  if (!/statusKey":"hunk|Hunk status|hunk:/.test(rpc.stdout))
-    fail("packed extension did not register Hunk status");
+  // Prove each packed entry loads with only its own real host SDK packages available.
+  // Symlinks provide the development SDK, not mocks or consumer dependencies.
+  const imports = [];
+  for (const [host, { file, runtime, sdks }] of Object.entries(hostEntries)) {
+    const sdkLinks = sdks.map((sdk) => {
+      const link = join(modules, sdk);
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(resolve(root, "node_modules", sdk), link, "dir");
+      return link;
+    });
+    try {
+      const url = pathToFileURL(join(installed, "dist", file)).href;
+      execFileSync(
+        runtime,
+        [
+          "--input-type=module",
+          "-e",
+          `
+        const extension = await import(${JSON.stringify(url)});
+        if (typeof extension.default !== "function") throw new Error("Missing extension factory");
+      `,
+        ],
+        { cwd: consumer, env: hostEnvironment, stdio: "pipe", timeout: 30_000 },
+      );
+      imports.push(host);
+    } finally {
+      for (const link of sdkLinks) rmSync(link);
+    }
+  }
 
+  const bundledBytes = pack.files
+    .filter((file) => file.path.startsWith("dist/"))
+    .reduce((total, file) => total + statSync(join(installed, file.path)).size, 0);
   console.log(
     JSON.stringify(
       {
         status: "passed",
         packedBytes: pack.size,
+        unpackedBytes: pack.unpackedSize,
+        bundledBytes,
         packedFiles: pack.entryCount,
-        installedRuntimeBytes: runtimeBytes,
-        runtimeLimitBytes: MAX_RUNTIME_BYTES,
-        effectInstalled: false,
-        piPeersAutoInstalled: false,
-        piRpcLoad: true,
-        lazyNativeChunk: true,
+        separatelyInstalledRuntimeDependencies: 0,
+        hostImports: imports,
       },
       null,
       2,

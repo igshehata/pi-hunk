@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="800" viewBox="0 0 1600 800" role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">pi-hunk — Review in Hunk. Return with context.</title>
+  <desc id="hero-desc">A terminal-inspired illustration of pi-hunk for Pi and OMP. Press Ctrl+Space, then h for a diff or s for the latest commit. Review a code change and save a comment in Hunk. Closing Hunk brings the current saved comments back to your agent.</desc>
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#111d32"/>
+      <stop offset=".55" stop-color="#0b1323"/>
+      <stop offset="1" stop-color="#0b1722"/>
+    </linearGradient>
+    <radialGradient id="mint-glow">
+      <stop stop-color="#61dfbc" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#61dfbc" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="blue-glow">
+      <stop stop-color="#859afc" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#859afc" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="terminal" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#152137"/>
+      <stop offset="1" stop-color="#101a2b"/>
+    </linearGradient>
+    <linearGradient id="note" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#20352f"/>
+      <stop offset="1" stop-color="#162a29"/>
+    </linearGradient>
+    <filter id="shadow" x="-15%" y="-20%" width="130%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#020711" flood-opacity=".3"/>
+    </filter>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+      .mono { font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace; }
+      .label { font-size: 20px; font-weight: 600; letter-spacing: 2px; }
+      .muted { fill: #9baec7; }
+    </style>
+  </defs>
+
+  <!-- Quiet depth, with all important content inside an 80 px safe area. -->
+  <rect width="1600" height="800" rx="28" fill="url(#canvas)"/>
+  <ellipse cx="1390" cy="700" rx="600" ry="430" fill="url(#mint-glow)"/>
+  <ellipse cx="840" cy="20" rx="740" ry="400" fill="url(#blue-glow)"/>
+  <rect x="1" y="1" width="1598" height="798" rx="27" fill="none" stroke="#a4bddb" stroke-opacity=".12"/>
+
+  <!-- Brand and headline stay prominent when GitHub scales the image down. -->
+  <g transform="translate(80 62)">
+    <path d="M2 13 17 26 2 39 M27 39h19" fill="none" stroke="#9bf0cf" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="64" y="44" font-size="52" font-weight="700" letter-spacing="-2" fill="#edf4fc">pi-hunk</text>
+  </g>
+  <g transform="translate(1301 63)">
+    <rect width="219" height="54" rx="27" fill="#17243a" stroke="#344661"/>
+    <text x="109.5" y="36" text-anchor="middle" font-size="25" font-weight="600" fill="#c4cef8">Pi + OMP</text>
+  </g>
+  <text x="80" y="206" font-size="78" font-weight="700" letter-spacing="-3" fill="#f0f5fc">Review in Hunk.</text>
+  <text x="80" y="292" font-size="78" font-weight="700" letter-spacing="-3" fill="#9bf0cf">Return with context.</text>
+
+  <!-- A prefix followed by a mode key, not a simultaneous three-key chord. -->
+  <g transform="translate(83 328)">
+    <rect width="197" height="43" rx="9" fill="#1a2940" stroke="#475771"/>
+    <text class="mono" x="98.5" y="29" text-anchor="middle" font-size="23" fill="#e4ebf6">Ctrl+Space</text>
+    <text x="216" y="29" font-size="22" class="muted">then</text>
+    <rect x="278" width="43" height="43" rx="9" fill="#203a35" stroke="#548779"/>
+    <text class="mono" x="299.5" y="29" text-anchor="middle" font-size="24" fill="#adf5db">h</text>
+    <text x="335" y="29" font-size="23" fill="#c2d0e1">diff</text>
+    <text x="395" y="29" font-size="23" fill="#5c708c">/</text>
+    <rect x="428" width="43" height="43" rx="9" fill="#282d47" stroke="#63658a"/>
+    <text class="mono" x="449.5" y="29" text-anchor="middle" font-size="24" fill="#d0c9fa">s</text>
+    <text x="485" y="29" font-size="23" fill="#c2d0e1">latest commit</text>
+  </g>
+
+  <!-- Original illustrative code, intentionally not a screenshot of Hunk. -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="407" width="880" height="311" rx="17" fill="url(#terminal)" stroke="#374761"/>
+  </g>
+  <path d="M81 465h878" stroke="#31425b"/>
+  <text x="110" y="444" class="mono label" fill="#b8c8df">HUNK <tspan fill="#526984">/</tspan> DIFF</text>
+  <text x="929" y="443" text-anchor="end" class="mono" font-size="20" fill="#9aaac4">src/greeting.ts</text>
+  <g class="mono" font-size="25">
+    <text x="112" y="504" fill="#8397b5">@@ greeting @@</text>
+    <text x="112" y="548" fill="#617896">1</text>
+    <text x="171" y="548" fill="#d6dff0"><tspan fill="#c3b9fa">function</tspan> greet(name: string) {</text>
+    <rect x="98" y="562" width="844" height="40" rx="5" fill="#e698a7" fill-opacity=".09"/>
+    <text x="112" y="590" fill="#e4a4b4">−</text>
+    <text x="171" y="590" fill="#e6b7c2">  return `Hello, ${name}`;</text>
+    <rect x="98" y="606" width="844" height="40" rx="5" fill="#8be6c4" fill-opacity=".10"/>
+    <rect x="98" y="606" width="3" height="40" rx="1.5" fill="#9bf0cf"/>
+    <text x="112" y="634" fill="#9bf0cf">+</text>
+    <text x="171" y="634" fill="#b5f0d7">  return `Hello, ${name.trim()}`;</text>
+    <text x="112" y="680" fill="#617896">3</text>
+    <text x="171" y="680" fill="#d6dff0">}</text>
+  </g>
+
+  <!-- The note is a conceptual annotation, not an invented UI control. -->
+  <path d="M950 625h24q20 0 20-20v-94q0-20 20-20h16" fill="none" stroke="#77bda9" stroke-width="2"/>
+  <circle cx="950" cy="625" r="5" fill="#9bf0cf"/>
+  <g filter="url(#shadow)">
+    <rect x="1030" y="423" width="490" height="175" rx="17" fill="url(#note)" stroke="#487867"/>
+  </g>
+  <g transform="translate(1058 448)">
+    <path d="M0 3h20v15H9l-6 5v-5H0Z" fill="none" stroke="#9bf0cf" stroke-width="2" stroke-linejoin="round"/>
+    <text x="36" y="20" class="label" fill="#a5e5cc">SAVED REVIEW NOTE</text>
+    <text x="0" y="69" font-size="27" font-weight="500" fill="#e4f4ec">Handle blank names before</text>
+    <text x="0" y="106" font-size="27" font-weight="500" fill="#e4f4ec">building the greeting.</text>
+  </g>
+  <path d="M1069 598v33" stroke="#77bda9" stroke-width="2"/>
+  <path d="m1063 625 6 6 6-6" fill="none" stroke="#9bf0cf" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="1092" y="628" font-size="21" fill="#a6bac9">Close Hunk</text>
+  <text x="1030" y="677" font-size="31" font-weight="600" letter-spacing="-.5" fill="#e6edf8">Back to your agent.</text>
+  <text x="1030" y="711" font-size="22" fill="#a6bac9">With your current saved comments.</text>
+</svg>

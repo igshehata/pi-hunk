@@ -1,6 +1,7 @@
 [tools]
 node = "22.19.0"
 npm = "11.17.0"
+bun = "1.4.1"
 
 [tasks.setup]
 description = "Install dependencies and activate repository Git hooks"
@@ -26,12 +27,8 @@ run = "npm run typecheck"
 description = "Run the full automated test suite"
 run = "npm test"
 
-[tasks."test:critical"]
-description = "Run the release-blocking boundary suite"
-run = "npm run test:critical"
-
 [tasks.build]
-description = "Build the distributable Pi extension"
+description = "Build the Pi, OMP, and Hunk extensions"
 run = "npm run build"
 
 [tasks.pack]
