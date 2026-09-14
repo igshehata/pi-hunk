@@ -16,14 +16,14 @@ export interface ConfigUI {
   notify(message: string, type?: "info" | "warning" | "error"): void;
 }
 
-type KeyField = "prefix" | "diff" | "show";
+type KeyField = "prefix" | "diff" | "show" | "log";
 type EditorState =
   | { readonly _tag: "Menu" }
   | { readonly _tag: "Key"; readonly field: KeyField }
   | { readonly _tag: "Delivery" }
   | { readonly _tag: "Save" };
 
-const keyFields: readonly KeyField[] = ["prefix", "diff", "show"];
+const keyFields: readonly KeyField[] = ["prefix", "diff", "show", "log"];
 const deliveryChoices: readonly { value: Delivery; label: string }[] = [
   { value: "steer", label: "steer — deliver during the current response" },
   { value: "followUp", label: "followUp — wait until the current response finishes" },
@@ -55,7 +55,7 @@ export function editConfig(path: string, ui: ConfigUI): Effect.Effect<Config | u
           const index = options.indexOf(choice);
           if (index >= 0 && index < keyFields.length) {
             state = { _tag: "Key", field: keyFields[index]! };
-          } else if (choice === options[3]) {
+          } else if (choice === options[keyFields.length]) {
             state = { _tag: "Delivery" };
           } else if (choice === "Save") {
             state = { _tag: "Save" };

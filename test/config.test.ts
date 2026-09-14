@@ -21,6 +21,13 @@ describe("shared shortcut configuration", () => {
     expect(() => parseConfig({ show: "shift+1" })).toThrow(Error);
   });
 
+  it("rejects ambiguous or unreachable history triggers", () => {
+    expect(() => parseConfig({ log: "h" })).toThrow(Error);
+    expect(() => parseConfig({ log: "s" })).toThrow(Error);
+    expect(() => parseConfig({ log: "escape" })).toThrow(Error);
+    expect(() => parseConfig({ diff: "l" })).toThrow(Error);
+  });
+
   it("preserves literal symbols and uppercase trigger semantics", () => {
     const config = parseConfig({ prefix: "ctrl+g", diff: "!", show: "H" });
     expect(matchesKey("\u0007", config.prefix as KeyId)).toBe(true);

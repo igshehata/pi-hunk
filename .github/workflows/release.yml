@@ -17,11 +17,7 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      should-stage: ${{ steps.stable.outputs.should_stage || steps.canary.outputs.should_stage }}
-      reason: ${{ steps.stable.outputs.reason || steps.canary.outputs.reason }}
-      version: ${{ steps.stable.outputs.version || steps.canary.outputs.version }}
-      stream: ${{ steps.stable.outputs.stream || steps.canary.outputs.stream }}
-      tag: ${{ steps.stable.outputs.tag || steps.canary.outputs.tag }}
+      releases: ${{ steps.plan.outputs.releases }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -41,6 +37,24 @@ jobs:
         if: github.event_name == 'push'
         name: Determine whether this commit contains an unpublished stable release
         run: node scripts/release-state.mjs
+      - id: canary
+        name: Prepare the rolling canary identity without changing the stable manifest
+        run: node scripts/prepare-canary-version.mjs
+      - id: plan
+        name: Plan the release streams
+        env:
+          CANARY_VERSION: ${{ steps.canary.outputs.version }}
+          STABLE_SHOULD_STAGE: ${{ steps.stable.outputs.should_stage }}
+          STABLE_VERSION: ${{ steps.stable.outputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+          const releases = [{ version: process.env.CANARY_VERSION, stream: "canary", tag: "canary" }];
+          if (process.env.GITHUB_EVENT_NAME === "push" && process.env.STABLE_SHOULD_STAGE === "true") {
+            releases.push({ version: process.env.STABLE_VERSION, stream: "stable", tag: "latest" });
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `releases=${JSON.stringify(releases)}\n`);
+          NODE
       - name: Create or update the version pull request
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
         if: github.event_name == 'push'
@@ -50,15 +64,14 @@ jobs:
           title: "chore: version package"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - id: canary
-        if: github.event_name == 'workflow_dispatch'
-        name: Prepare the rolling canary identity
-        run: node scripts/prepare-canary-version.mjs --write
 
   verify:
-    name: Verify pi-hunk@${{ needs.version.outputs.version }}
+    name: Verify pi-hunk@${{ matrix.release.version }}
     needs: version
-    if: needs.version.outputs.should-stage == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ${{ fromJSON(needs.version.outputs.releases) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -72,15 +85,15 @@ jobs:
           install: true
       - run: npm ci --ignore-scripts
       - name: Apply the selected ephemeral canary version
-        if: needs.version.outputs.stream == 'canary'
+        if: matrix.release.stream == 'canary'
         env:
-          CANARY_VERSION: ${{ needs.version.outputs.version }}
+          CANARY_VERSION: ${{ matrix.release.version }}
         run: node scripts/prepare-canary-version.mjs --write --version "$CANARY_VERSION"
       - name: Verify selected release identity
         env:
-          RELEASE_STREAM: ${{ needs.version.outputs.stream }}
-          RELEASE_TAG: ${{ needs.version.outputs.tag }}
-          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_STREAM: ${{ matrix.release.stream }}
+          RELEASE_TAG: ${{ matrix.release.tag }}
+          RELEASE_VERSION: ${{ matrix.release.version }}
         run: |
           test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
           case "$RELEASE_STREAM:$RELEASE_TAG" in
@@ -90,7 +103,7 @@ jobs:
       - run: mise run check
       - name: Pack the verified release without lifecycle scripts
         env:
-          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_VERSION: ${{ matrix.release.version }}
         run: |
           mkdir release
           npm pack --ignore-scripts --pack-destination release
@@ -98,7 +111,7 @@ jobs:
       - name: Preserve the exact verified tarball
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: npm-package-${{ needs.version.outputs.version }}
+          name: npm-package-${{ matrix.release.version }}
           path: release/*.tgz
           if-no-files-found: error
           retention-days: 7
@@ -118,14 +131,18 @@ jobs:
       - name: Upload the pinned npm CLI
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: npm-cli-11.17.0
+          name: npm-cli-11.17.0-${{ matrix.release.stream }}
           path: release-tools/npm-cli-11.17.0.tgz
           if-no-files-found: error
           retention-days: 7
 
   stage:
-    name: Stage pi-hunk@${{ needs.version.outputs.version }}
+    name: Stage pi-hunk@${{ matrix.release.version }}
     needs: [version, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ${{ fromJSON(needs.version.outputs.releases) }}
     runs-on: ubuntu-latest
     environment: npm-release
     permissions:
@@ -134,9 +151,9 @@ jobs:
     env:
       NPM_CONFIG_PROVENANCE: true
       RELEASE_COMMIT: ${{ github.sha }}
-      RELEASE_VERSION: ${{ needs.version.outputs.version }}
-      RELEASE_STREAM: ${{ needs.version.outputs.stream }}
-      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      RELEASE_VERSION: ${{ matrix.release.version }}
+      RELEASE_STREAM: ${{ matrix.release.stream }}
+      RELEASE_TAG: ${{ matrix.release.tag }}
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -144,12 +161,12 @@ jobs:
       - name: Download the exact verified tarball
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: npm-package-${{ needs.version.outputs.version }}
+          name: npm-package-${{ matrix.release.version }}
           path: release
       - name: Download the pinned npm CLI
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: npm-cli-11.17.0
+          name: npm-cli-11.17.0-${{ matrix.release.stream }}
           path: release-tools
       - name: Stage the verified package through npm OIDC
         run: |
