@@ -167,9 +167,10 @@ function git(cwd: string, args: string[]) {
   return result.stdout.trim();
 }
 
-function writePackedTarball(dir: string, version: string) {
+function writePackedTarball(dir: string, version: string, source = "export default 'verified';\n") {
   const packageDir = join(dir, "package");
   mkdirSync(packageDir, { recursive: true });
+  writeFileSync(join(packageDir, "index.js"), source);
   writeFileSync(
     join(packageDir, "package.json"),
     `${JSON.stringify({ name: "pi-hunk", version }, null, 2)}\n`,
@@ -484,7 +485,11 @@ describe("release:canary", () => {
   it("refuses a stage checksum that does not match the workflow artifact", () => {
     const checkout = createCheckout();
     const staged = writePackedTarball(checkout.scratch, VERSION);
-    const artifact = writePackedTarball(join(checkout.scratch, "artifact"), VERSION);
+    const artifact = writePackedTarball(
+      join(checkout.scratch, "artifact"),
+      VERSION,
+      "export default 'different artifact';\n",
+    );
     const result = runCanary(checkout, {
       dispatchStdout: `https://github.com/${REPO}/actions/runs/${RUN_ID}\n`,
       runs: { [RUN_ID]: successfulRun(checkout.sha) },
