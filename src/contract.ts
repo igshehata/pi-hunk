@@ -1,4 +1,4 @@
-export type View = "diff" | "show";
+export type View = "diff" | "show" | "log";
 
 export type Delivery = "steer" | "followUp" | "interrupt";
 
@@ -6,6 +6,7 @@ export interface Config {
   readonly prefix: string;
   readonly diff: string;
   readonly show: string;
+  readonly log: string;
   readonly delivery: Delivery;
 }
 
@@ -24,6 +25,8 @@ export interface ReviewNote {
   readonly parentId?: string;
   /** The view where this comment was first saved. */
   readonly view: View;
+  /** Hunk's original changeset context for a history-selected review. */
+  readonly source?: { readonly title: string; readonly label: string };
   readonly path: string;
   readonly oldRange?: readonly [number, number];
   readonly newRange?: readonly [number, number];

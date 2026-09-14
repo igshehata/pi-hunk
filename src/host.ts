@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -94,6 +94,49 @@ class HunkTeardownError extends Error {
     super(cause === undefined ? message : message + ": " + asError(cause).message);
     this.name = "HunkTeardownError";
   }
+}
+
+const HUNK_INSTALL =
+  "Install Hunk 0.22.0 or newer from https://hunk.dev; pi-hunk does not install or upgrade Hunk.";
+
+function requireHunk(): Effect.Effect<void, Error> {
+  return Effect.tryPromise({
+    try: (signal) =>
+      new Promise<void>((resolve, reject) => {
+        execFile(
+          "hunk",
+          ["--version"],
+          { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024, signal },
+          (error, stdout, stderr) => {
+            if (error) {
+              if ("code" in error && error.code === "ENOENT") {
+                reject(new Error(`hunk was not found on PATH. ${HUNK_INSTALL}`));
+                return;
+              }
+              reject(
+                new Error(
+                  `Cannot run hunk: ${(stderr && stderr.trim()) || error.message}. pi-hunk requires Hunk 0.22.0 or newer. ${HUNK_INSTALL}`,
+                ),
+              );
+              return;
+            }
+            const match = /(\d+)\.(\d+)\.(\d+)/.exec(stdout);
+            if (match && Number(match[1]) === 0 && Number(match[2]) < 22) {
+              reject(
+                new Error(
+                  `pi-hunk requires Hunk 0.22.0 or newer; PATH hunk reports ${match[0]}. ${HUNK_INSTALL}`,
+                ),
+              );
+              return;
+            }
+            // Successful --version without x.y.z is not treated as outdated.
+            // Launch continues; the bridge still throws if apiVersion < 25.
+            resolve();
+          },
+        );
+      }),
+    catch: asError,
+  });
 }
 
 function isMissingProcess(error: unknown): boolean {
@@ -452,7 +495,9 @@ export function createHost(bindings: HostBindings) {
           ? "diff"
           : bindings.matchesKey(data, session.config.show)
             ? "show"
-            : undefined;
+            : bindings.matchesKey(data, session.config.log)
+              ? "log"
+              : undefined;
         if (!view) return;
         listening.unsubscribe();
         launch(session, view);
@@ -469,6 +514,7 @@ export function createHost(bindings: HostBindings) {
     const active = () => state === reviewing && !operation.cancel.signal.aborted;
     const program = Effect.gen(function* () {
       yield* Effect.tryPromise({ try: () => access(bindings.bridge), catch: asError });
+      yield* requireHunk();
       const directory = yield* Effect.tryPromise({
         try: () => mkdtemp(join(tmpdir(), "pi-hunk-")),
         catch: asError,

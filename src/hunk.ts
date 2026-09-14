@@ -18,6 +18,7 @@ import {
   type ReviewNote,
   type View,
 } from "./contract.js";
+import { parseConfig } from "./config.js";
 
 type ReviewState =
   | { readonly _tag: "Reviewing"; readonly view: View }
@@ -30,6 +31,7 @@ interface Review {
   readonly launch: ReviewLaunch;
   state: ReviewState;
   sessionId?: string;
+  source?: ReviewNote["source"];
   /** Public saved-note lifecycle payloads supply paths before note_changed fires. */
   readonly paths: Map<string, string>;
   readonly notes: Map<string, ReviewNote>;
@@ -190,6 +192,7 @@ function saveMutation(review: Review, note: ExtensionReviewSnapshotNote): void {
     ...(note.parentId === undefined ? {} : { parentId: note.parentId }),
     view: existing?.view ?? review.state.view,
     path,
+    ...((existing?.source ?? review.source) ? { source: existing?.source ?? review.source } : {}),
     ...(note.anchor.oldRange === undefined ? {} : { oldRange: note.anchor.oldRange }),
     ...(note.anchor.newRange === undefined ? {} : { newRange: note.anchor.newRange }),
     body,
@@ -199,17 +202,27 @@ function saveMutation(review: Review, note: ExtensionReviewSnapshotNote): void {
 }
 
 export default function hunkBridge(hunk: HunkExtensionAPI): void {
+  if (hunk.apiVersion < 25) {
+    throw new Error(
+      `pi-hunk requires Hunk 0.22.0 (extension API 25) or newer; this Hunk reports API ${hunk.apiVersion}`,
+    );
+  }
   const raw = process.env[REVIEW_ENV];
   if (!raw) throw new Error("pi-hunk's review extension must be launched by its host integration");
-  const launch = JSON.parse(raw) as ReviewLaunch;
+  const parsed = JSON.parse(raw) as ReviewLaunch;
   if (
-    !launch.journal ||
-    !launch.cwd ||
-    (launch.view !== "diff" && launch.view !== "show") ||
-    !launch.config
+    !parsed.journal ||
+    !parsed.cwd ||
+    (parsed.view !== "diff" && parsed.view !== "show" && parsed.view !== "log")
   ) {
     throw new Error("Invalid pi-hunk review launch");
   }
+  const launch: ReviewLaunch = {
+    journal: parsed.journal,
+    cwd: parsed.cwd,
+    view: parsed.view,
+    config: parseConfig(parsed.config),
+  };
   if (!ownedReview) {
     ownedReview = {
       launch,
@@ -225,11 +238,11 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const prefix = compileHunkKey(launch.config.prefix);
   const diff = compileHunkKey(launch.config.diff);
   const show = compileHunkKey(launch.config.show);
+  const log = compileHunkKey(launch.config.log);
 
   hunk.on("startup", (_event, context) => {
     instance = "Running";
     try {
-      if (hunk.apiVersion < 16) throw new Error("pi-hunk requires Hunk extension API 16 or newer");
       if (review.state._tag === "Failed") {
         context.notify(review.state.message, "error");
         return;
@@ -240,7 +253,10 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     }
   });
 
-  hunk.on("changeset_loaded", () => {
+  hunk.on("changeset_loaded", ({ changeset }) => {
+    if (instance === "Running" && launch.view === "log") {
+      review.source = { title: changeset.title, label: changeset.sourceLabel };
+    }
     if (instance === "Running" && review.state._tag === "Switching") {
       review.state.view = review.state.target;
     }
@@ -274,6 +290,22 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
       // Exit before passing unknown input through to native Hunk commands.
       // Escape is owned and canceled by Hunk before this callback runs.
       context.keyboardModes.exitMode();
+      if (launch.view === "log") {
+        if (log.matches(key)) {
+          if (instance === "Running" && review.state._tag !== "Failed") {
+            context.commands.execute("hunk.app.quit");
+          }
+          return "handled";
+        }
+        if (diff.matches(key) || show.matches(key)) {
+          context.notify(
+            "Diff/show switching is unavailable in history-selected reviews. Use the log key to return to history.",
+            "info",
+          );
+          return "handled";
+        }
+        return "pass";
+      }
       const target = diff.matches(key) ? "diff" : show.matches(key) ? "show" : undefined;
       if (!target) return "pass";
       if (instance === "Running") switchView(review, target, context);

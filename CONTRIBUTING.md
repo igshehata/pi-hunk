@@ -38,43 +38,70 @@ in [SECURITY.md](SECURITY.md).
 
 ## Useful tasks
 
-| Task                              | Purpose                                                    |
-| --------------------------------- | ---------------------------------------------------------- |
-| `mise run format`                 | Format supported files with Oxfmt                          |
-| `mise run format:check`           | Check formatting without writes                            |
-| `mise run lint`                   | Run Oxlint                                                 |
-| `mise run typecheck`              | Run TypeScript without emitting                            |
-| `mise run test`                   | Run the full Vitest suite                                  |
-| `mise run build`                  | Bundle `dist/index.js`                                     |
-| `mise run pack`                   | Validate the npm tarball and clean consumer install        |
-| `mise run check`                  | Run all release gates                                      |
-| `mise run changeset`              | Describe a release-worthy change                           |
-| `mise run release:canary:preview` | Preview the rolling canary identity without changing files |
+| Task                              | Purpose                                                      |
+| --------------------------------- | ------------------------------------------------------------ |
+| `mise run format`                 | Format supported files with Oxfmt                            |
+| `mise run format:check`           | Check formatting without writes                              |
+| `mise run lint`                   | Run Oxlint                                                   |
+| `mise run typecheck`              | Run TypeScript without emitting                              |
+| `mise run test`                   | Run the full Vitest suite                                    |
+| `mise run build`                  | Bundle `dist/index.js`                                       |
+| `mise run pack`                   | Validate the npm tarball and clean consumer install          |
+| `mise run check`                  | Run all release gates                                        |
+| `mise run changeset`              | Describe a release-worthy change                             |
+| `mise run release:canary`         | Dispatch canary from matching main and stop at the npm stage |
+| `mise run release:canary:preview` | Preview the rolling canary identity without changing files   |
 
 ## Release streams
 
 Pi-hunk has two npm streams:
 
-- **Stable 1.x** uses the `latest` npm tag. Add Changesets normally (a `major` entry is required to
-  reach 1.0.0 from 0.2.0; existing minor/patch entries are not enough). Merge the generated version
-  PR only when `package.json`, the lockfile, and `CHANGELOG.md` show the exact stable version,
-  approve the package staged by `.github/workflows/release.yml`, then run `finalize-release.yml`
-  with that exact version. Finalization creates the immutable `vX.Y.Z` tag and GitHub Release and
-  rejects prerelease versions.
-- **Canary** is the rolling `canary` npm tag, independent of the stable Changesets plan. Preview its
-  deterministic identity with `mise run release:canary:preview`, then dispatch the **Release**
-  workflow from `main` (or run `gh workflow run release.yml --ref main`). Users always select
-  `pi-hunk@canary`; npm's immutable package registry requires each underlying artifact to use a
-  unique `0.0.0-canary.<run-number>.<run-attempt>` SemVer. The workflow verifies and stages that
-  exact tarball and waits for npm 2FA approval. Do not run the finalization workflow for a canary.
+- **Stable 1.x** uses the `latest` npm tag. Add Changesets normally. Each push to `main` creates or
+  updates the Changesets version PR when changesets are pending; it does not stage the old stable
+  version. Review and merge that PR only when `package.json`, the lockfile, and `CHANGELOG.md` show
+  the intended stable version. The merge push stages stable only when no changesets remain and the
+  registry preflight confirms that version is unpublished. An already-published stable version is
+  not staged again. Inspect and explicitly approve the staged package, then run
+  `finalize-release.yml` with that exact version. Finalization creates the immutable `vX.Y.Z` tag
+  and GitHub Release and rejects prerelease versions.
+- **Canary** is the rolling `canary` npm tag, independent of the stable Changesets plan. Every push
+  to `main` automatically verifies and stages a canary, including pushes with pending changesets or
+  an already-published stable version. There is no separate canary branch. For an optional on-demand
+  canary, from a clean checkout whose HEAD matches `origin/main`, run `mise run release:canary`. It
+  dispatches `release.yml` as `workflow_dispatch` on `main`, correlates only the run id returned by
+  that dispatch, waits through `npm-release` environment protection without bypassing it, and stops
+  at the exact staged tarball. Remaining npm 2FA approval is `npm stage approve <stage-id>`; this
+  command never approves, publishes, tags, or creates a GitHub Release. Optional
+  `mise run release:canary -- --dry-run` checks the git identity and prints that plan.
+  `mise run release:canary:preview` only shows the `0.0.0-canary.<run-number>.<run-attempt>`
+  formula. Users install `pi-hunk@canary`. Do not run the finalization workflow for a canary.
+  Requires authenticated `gh` and `npm` with access to the repository and its staged packages, and a
+  GitHub CLI/API combination that returns the dispatched run ID. If no ID is returned, the command
+  stops rather than guessing. Commit and merge the desired code into `main` before running it; this
+  command does not commit, push, or merge changes. This is a user-invoked dispatch helper, never
+  called from CI, and does not inspect push-triggered runs. Manual `workflow_dispatch` on `main`
+  stages canary only, not stable.
 
 Both streams stay in `release.yml` because npm trusted publishing is bound to that workflow and the
-`npm-release` environment. Canary releases never create Git tags or GitHub Releases.
+`npm-release` environment. When a push plans both streams, both verifications must succeed before
+either can stage. Staging still honors the GitHub environment gate; it is not npm publication.
+Inspect the exact stage (package, version, tag, source commit, and tarball), then explicitly run
+`npm stage approve <stage-id>` with npm 2FA to publish. Neither automatic push staging nor the
+manual helper approves npm stages. Canary releases never create Git tags or GitHub Releases.
 
 ## Testing expectations
 
 Unit tests are useful for contracts, but overlay, PTY, input, lifecycle, and review-handoff changes
 need integration coverage and an interactive smoke test where practical.
+
+Process fixtures must isolate `PATH`, `HOME`, and XDG directories from the real Hunk installation.
+Register cleanup for test completion, including timeouts, and await `host.stop()` before restoring
+the environment or removing fixture executables. A test timeout does not cancel its asynchronous
+work; a pending launch must never fall through to a real `hunk` or leave a shared daemon running.
+
+When investigating an installed-host failure, reproduce it with normal extension discovery and the
+actual terminal environment before switching to isolated fixtures. Report those checks separately;
+an isolated handoff does not prove the installed environment works.
 
 ## Pull requests
 

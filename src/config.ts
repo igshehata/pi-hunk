@@ -8,6 +8,7 @@ export const DEFAULT_CONFIG: Config = Object.freeze({
   prefix: "ctrl+space",
   diff: "h",
   show: "s",
+  log: "l",
   delivery: "steer",
 });
 
@@ -55,15 +56,17 @@ export function parseConfig(value: unknown): Config {
   );
   const diff = key(supplied.diff === undefined ? DEFAULT_CONFIG.diff : supplied.diff, "diff");
   const show = key(supplied.show === undefined ? DEFAULT_CONFIG.show : supplied.show, "show");
+  const log = key(supplied.log === undefined ? DEFAULT_CONFIG.log : supplied.log, "log");
   const delivery = supplied.delivery === undefined ? DEFAULT_CONFIG.delivery : supplied.delivery;
-  if (diff === show) throw new Error("diff and show must use different trigger keys");
-  if (diff === "escape" || show === "escape") {
+  if (diff === show || diff === log || show === log)
+    throw new Error("diff, show, and log must use different trigger keys");
+  if (diff === "escape" || show === "escape" || log === "escape") {
     throw new Error("Escape is reserved for canceling the prefix");
   }
   if (delivery !== "steer" && delivery !== "followUp" && delivery !== "interrupt") {
     throw new Error("delivery must be steer, followUp, or interrupt");
   }
-  return { prefix, diff, show, delivery };
+  return { prefix, diff, show, log, delivery };
 }
 
 export function loadConfig(path: string): Effect.Effect<Config, Error> {

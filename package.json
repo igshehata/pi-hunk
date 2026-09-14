@@ -65,7 +65,7 @@
     "@earendil-works/pi-tui": "*",
     "@oh-my-pi/pi-coding-agent": "*",
     "@oh-my-pi/pi-tui": "*",
-    "hunkdiff": ">=0.21.1"
+    "hunkdiff": ">=0.22.0"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
