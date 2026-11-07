@@ -55,6 +55,18 @@ describe("review launch config boundary", () => {
       const context: ExtensionContext = { cwd: directory, notify() {} };
       api.emit("startup", { cwd: directory }, context);
       api.emit(
+        "changeset_loaded",
+        {
+          changeset: {
+            id: "changeset-1",
+            sourceLabel: directory,
+            title: "working tree",
+            files: [],
+          },
+        },
+        context,
+      );
+      api.emit(
         "note_created",
         {
           note: {
@@ -91,6 +103,7 @@ describe("review launch config boundary", () => {
         {
           id: "note-1",
           view: "diff",
+          revision: { kind: "working-tree" },
           path: "working.ts",
           newRange: [4, 4],
           body: "Need a guard",

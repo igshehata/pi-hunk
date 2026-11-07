@@ -20,14 +20,37 @@ export interface ReviewLaunch {
 
 export const REVIEW_ENV = "PI_HUNK_REVIEW";
 
+/** The exact code version a comment's line ranges refer to. */
+export type Revision =
+  /** `hunk diff`: old side is the index (staged content), new side is the working tree. */
+  | { readonly kind: "working-tree" }
+  | {
+      readonly kind: "commit";
+      /** Full commit SHA. */
+      readonly commit: string;
+      /** Full parent SHA; absent for a root commit. */
+      readonly parent?: string;
+    }
+  | {
+      readonly kind: "range";
+      /** Full `from` SHA; absent when the range starts at the empty tree (root commit). */
+      readonly from?: string;
+      /** Full `to` SHA. */
+      readonly to: string;
+    }
+  /** Hunk's own description, verbatim, when the revision could not be verified. */
+  | { readonly kind: "unresolved"; readonly description: string };
+
 export interface ReviewNote {
   readonly id: string;
   readonly parentId?: string;
   /** The view where this comment was first saved. */
   readonly view: View;
-  /** Hunk's original changeset context for a history-selected review. */
-  readonly source?: { readonly title: string; readonly label: string };
+  /** The revision recorded when this comment was first saved, kept across later edits. */
+  readonly revision: Revision;
   readonly path: string;
+  /** The path this file had in the reviewed revision, for a renamed file. */
+  readonly previousPath?: string;
   readonly oldRange?: readonly [number, number];
   readonly newRange?: readonly [number, number];
   readonly body: string;
