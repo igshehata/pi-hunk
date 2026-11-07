@@ -53,6 +53,8 @@ export interface ReviewNote {
   readonly previousPath?: string;
   readonly oldRange?: readonly [number, number];
   readonly newRange?: readonly [number, number];
+  /** Unified-diff lines of the reviewed patch around this comment. */
+  readonly excerpt?: string;
   readonly body: string;
 }
 

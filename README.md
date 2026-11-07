@@ -7,8 +7,9 @@
 **Full-screen code review, right inside your agent’s terminal.**
 
 Open [Hunk](https://hunk.dev) from [Pi](https://github.com/earendil-works/pi) or
-[Oh My Pi](https://omp.sh), review the changes, and leave comments. Close Hunk and your feedback
-goes back to the agent—with file, line, and view context. No copy/paste.
+[Oh My Pi](https://omp.sh), review the changes, and leave comments. Close Hunk and the agent
+receives a readable review: comments grouped by the exact revision they refer to, each showing its
+file, old and new lines, and the reviewed diff lines. No copy/paste.
 
 [Install](#install) · [Use it](#use-it) · [Configure](#configure)
 
@@ -111,13 +112,19 @@ today’s files, even if the code or file was later removed or renamed. Renames 
 previous path. When Hunk’s revision cannot be verified with Git, the comment records Hunk’s own text
 as unresolved instead of guessing.
 
+The handoff is readable on its own. Comments are grouped by the exact revision they refer to, each
+shows its file, old and new lines, and the reviewed diff lines around the comment, and replies
+appear directly under the comment they answer. pi-hunk adds no instructions of its own: how a review
+should be handled is your choice, so put that guidance in `AGENTS.md` or a skill.
+
 The prefix is not active on the history screen. Diff/show switching is intentionally unavailable
 inside history-selected reviews; those chords show a notice and leave the selection unchanged. The
 log chord does not switch a standalone diff/show review to history—close that review and launch log
 from the agent.
 
-**Only saved comments are sent.** Unsaved drafts are not submitted, deleted notes are omitted, and
-closing an empty review sends no message. Each new review starts fresh.
+**Only saved comments are sent.** Unsaved drafts are not submitted, deleted notes are omitted, a
+reply whose comment was deleted is marked as such, and closing an empty review sends no message.
+Each new review starts fresh.
 
 ## Configure
 
