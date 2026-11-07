@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import * as Effect from "effect/Effect";
-import type {} from "./hunk-api.js";
 import {
   matchesKeyChord,
   parseKeyChord,
