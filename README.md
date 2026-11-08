@@ -203,11 +203,14 @@ never dropped and the review keys come back.
 
 Nonempty reviews retain a local temporary journal, including after handoff: calling the host’s send
 API is not a delivery receipt. If capture or handoff fails, pi-hunk reports the journal path for
-recovery rather than silently discarding your work. Stopping the host while a review is open keeps
-its journal too; the path is printed as the host exits, because the review UI is already gone when
-that happens. An interrupt (<kbd>Ctrl</kbd> + <kbd>C</kbd>) counts as a stop: pi-hunk closes Hunk,
-prints the journal path, and the host exits the way it would without the review. Journals contain
-comment text and file paths; treat them as local review data.
+recovery rather than silently discarding your work. A comment that cannot be recorded leaves Hunk
+open with an error notice, so the review and any drafts on screen survive; closing that review
+reports the cause and the journal path instead of handing off a partial review. Only when the
+journal itself cannot take the failure notice does Hunk exit at once. Stopping the host while a
+review is open keeps its journal too; the path is printed as the host exits, because the review UI
+is already gone when that happens. An interrupt (<kbd>Ctrl</kbd> + <kbd>C</kbd>) counts as a stop:
+pi-hunk closes Hunk, prints the journal path, and the host exits the way it would without the
+review. Journals contain comment text and file paths; treat them as local review data.
 
 A journal is appended one record at a time, so a kill or a full disk can leave the last record
 half-written. That unfinished final record is reported by journal path and line number and skipped;

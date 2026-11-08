@@ -249,3 +249,61 @@ describe("changeset revision resolution", () => {
     }
   });
 });
+
+describe("capture failure", () => {
+  // Guards the note-save failure that used to end in process.exit: Hunk died mid-render with
+  // the review, drafts included, and left the terminal in its alternate screen.
+  it("keeps Hunk open and journals the cause when a saved note cannot be captured", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-hunk-capture-failure-"));
+    const journal = join(directory, "notes.jsonl");
+    await writeFile(journal, "", { flag: "wx" });
+    process.env[REVIEW_ENV] = JSON.stringify({ cwd: directory, view: "diff", journal, config: {} });
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const notices: string[] = [];
+    try {
+      // The bridge keeps its review in module state; resetModules needs a fresh factory load.
+      const { default: hunkBridge } = await import("../src/hunk.js");
+      const api = createHunk();
+      hunkBridge(api.hunk);
+      const context: ExtensionContext = {
+        cwd: directory,
+        notify(message) {
+          notices.push(message);
+        },
+      };
+      api.emit("startup", { cwd: directory }, context);
+      // Hunk committed a note it never announced through note_created, so its path is unknown
+      // and the save cannot be journaled.
+      api.emit(
+        "note_changed",
+        {
+          kind: "created",
+          note: {
+            id: "note-1",
+            source: "user",
+            fileKey: "working.ts",
+            anchor: { newRange: [4, 4] },
+            summary: "Need a guard",
+            editable: true,
+            resolution: "active",
+          },
+        },
+        context,
+      );
+      // Saves run on the serialized journal queue, so the failure lands after the event returns.
+      await vi.waitFor(() => expect(notices).toHaveLength(1));
+      // The review stays on screen; the user closes it when they are done.
+      expect(exit).not.toHaveBeenCalled();
+      expect(notices[0]).toContain(
+        "pi-hunk cannot capture review feedback: Hunk did not provide a public file path for saved note note-1",
+      );
+      // The recorded failure is what makes the host refuse to submit the journal.
+      await expect(readFeedback(journal)).rejects.toThrow(
+        "pi-hunk cannot capture review feedback: Hunk did not provide a public file path",
+      );
+    } finally {
+      exit.mockRestore();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
