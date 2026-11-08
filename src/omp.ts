@@ -17,5 +17,10 @@ export default function ompHunk(omp: ExtensionAPI): void {
   omp.on("session_switch", (_event, ctx) => host.start(ctx));
   omp.on("session_branch", (_event, ctx) => host.start(ctx));
   omp.on("session_tree", (_event, ctx) => host.start(ctx));
-  omp.on("session_shutdown", () => host.stop());
+  // OMP restores the terminal only after this handler settles, and exits through the native
+  // primitive without an `exit` event, so the recovery notice is written once teardown is done.
+  omp.on("session_shutdown", async () => {
+    await host.stop();
+    host.announceAbandoned();
+  });
 }

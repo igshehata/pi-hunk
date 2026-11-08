@@ -190,8 +190,9 @@ turn.
 
 Nonempty reviews retain a local temporary journal, including after handoff: calling the host’s send
 API is not a delivery receipt. If capture or handoff fails, pi-hunk reports the journal path for
-recovery rather than silently discarding your work. Journals contain comment text and file paths;
-treat them as local review data.
+recovery rather than silently discarding your work. Stopping the host while a review is open keeps
+its journal too; the path is printed as the host exits, because the review UI is already gone when
+that happens. Journals contain comment text and file paths; treat them as local review data.
 
 ## Development
 
