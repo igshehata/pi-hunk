@@ -1,0 +1,10 @@
+# Bun installs dependencies for local development and CI. npm is reserved for
+# operations only the npm registry understands: `npm pack`, staging/publishing
+# with provenance, and trusted publishing in the release workflows.
+
+[install]
+# Supply-chain policy (previously `.npmrc` min-release-age): resolve only package
+# versions published at least seven days ago. 7 days = 604800 seconds. Bun also
+# runs no dependency lifecycle scripts unless a package is listed in
+# `trustedDependencies`, so no explicit `ignore-scripts` setting is needed.
+minimumReleaseAge = 604800

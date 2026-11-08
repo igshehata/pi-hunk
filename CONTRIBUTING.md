@@ -17,13 +17,14 @@ mise run setup
 mise run check
 ```
 
-`mise run setup` installs the locked npm dependencies and points `core.hooksPath` at `.githooks/`.
+`mise run setup` installs the locked Bun dependencies and points `core.hooksPath` at `.githooks/`.
 The pre-commit hook runs formatting, lint, and type checks. The pre-push hook runs all release
 gates. Hooks are a safety net, not a replacement for running the relevant task while developing.
 
-Run `mise run` to list available tasks. npm dependency resolution applies the repository's seven-day
-minimum release age; do not bypass it except for a reviewed emergency security update as described
-in [SECURITY.md](SECURITY.md).
+Run `mise run` to list available tasks. Bun dependency resolution applies the repository's seven-day
+minimum release age from `bunfig.toml`; do not bypass it except for a reviewed emergency security
+update as described in [SECURITY.md](SECURITY.md). npm is used only for registry operations
+(`npm pack`, staging, and publishing with provenance); installs and scripts run through Bun.
 
 ## Development workflow
 

@@ -39,10 +39,10 @@ These instructions install the current source implementation, rather than the pr
 ```sh
 git clone https://github.com/igshehata/pi-hunk.git
 cd pi-hunk
-npm ci
+bun install --frozen-lockfile
 ```
 
-`npm ci` also builds the extension through its `prepare` hook.
+`bun install` also builds the extension through the `prepare` script.
 
 <details>
 <summary>Replacing an existing pi-hunk installation?</summary>
@@ -186,11 +186,11 @@ treat them as local review data.
 
 ## Development
 
-After changing runtime source, run `npm run build` and restart your host. To run formatting, lint,
+After changing runtime source, run `bun run build` and restart your host. To run formatting, lint,
 type, regression, and packed-install checks:
 
 ```sh
-npm run check
+bun run check
 ```
 
 The extension is for interactive TUI sessions, targeting macOS and Linux. Native smoke coverage:

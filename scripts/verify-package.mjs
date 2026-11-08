@@ -16,7 +16,7 @@ import { pathToFileURL } from "node:url";
 
 const root = process.cwd();
 const scratch = mkdtempSync(join(tmpdir(), "pi-hunk-package-"));
-// Use the host runtime, not a transitive npm Bun installer's uninitialized stub.
+// Use the host runtime, not a `bun` shim that a dependency may install into node_modules/.bin.
 const hostEnvironment = {
   ...process.env,
   PATH: (process.env.PATH ?? "")
@@ -83,14 +83,14 @@ try {
   mkdirSync(consumer);
   writeFileSync(join(consumer, "package.json"), '{"private":true,"type":"module"}\n');
   execFileSync(
-    "npm",
-    ["install", "--ignore-scripts", "--no-audit", "--no-fund", join(scratch, pack.filename)],
+    "bun",
+    ["install", "--ignore-scripts", "--no-progress", join(scratch, pack.filename)],
     { cwd: consumer, stdio: "pipe" },
   );
 
   const modules = join(consumer, "node_modules");
   assert.deepEqual(
-    readdirSync(modules).filter((name) => name !== ".package-lock.json"),
+    readdirSync(modules),
     ["pi-hunk"],
     "A clean consumer must install pi-hunk alone, without runtime dependencies or automatic peers",
   );

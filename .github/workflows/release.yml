@@ -27,7 +27,8 @@ jobs:
         with:
           cache: true
           install: true
-      - run: npm ci --ignore-scripts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
       - name: Require main for an on-demand canary
         if: github.event_name == 'workflow_dispatch'
         run: test "$GITHUB_REF" = refs/heads/main
@@ -83,7 +84,8 @@ jobs:
         with:
           cache: true
           install: true
-      - run: npm ci --ignore-scripts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
       - name: Apply the selected ephemeral canary version
         if: matrix.release.stream == 'canary'
         env:
