@@ -114,6 +114,7 @@ process.exit(typeof result.status === "number" ? result.status : 1);
 function context(
   onInput: (handler: (data: string) => { consume?: boolean } | undefined) => void,
   events: string[],
+  notices: { type: string | undefined; message: string }[] = [],
   beforeFactory: () => Promise<void> = async () => {},
 ): HostContext {
   const tui = {
@@ -124,7 +125,7 @@ function context(
   const ui: HostContext["ui"] = {
     select: async () => undefined,
     input: async () => undefined,
-    notify: () => {},
+    notify: (message, type) => notices.push({ type, message }),
     onTerminalInput: (handler) => {
       onInput(handler);
       return () => {};
@@ -156,6 +157,7 @@ async function withHost(
     paths: Paths;
     host: ReturnType<typeof createHost>;
     events: string[];
+    notices: { type: string; message: string }[];
     open(beforeFactory?: () => Promise<void>): Promise<void>;
   }) => Promise<void>,
 ): Promise<void> {
@@ -173,6 +175,7 @@ async function withHost(
   };
   const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
   const events: string[] = [];
+  const notices: { type: string; message: string }[] = [];
   let handler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   const host = createHost({
     bridge: paths.native,
@@ -221,6 +224,7 @@ async function withHost(
       paths,
       host,
       events,
+      notices,
       open: async (beforeFactory) => {
         await host.start(
           context(
@@ -228,6 +232,7 @@ async function withHost(
               handler = next;
             },
             events,
+            notices,
             beforeFactory,
           ),
         );
@@ -289,6 +294,53 @@ describe("native Hunk process ownership", () => {
           /Owned Hunk processes did not exit|Hunk process teardown/,
         );
         expect(events).toEqual(["terminal-stop", "terminal-start"]);
+      });
+    },
+    15_000,
+  );
+  it.skipIf(process.platform === "win32")(
+    "starts the replacement session after a failed previous teardown",
+    async (test) => {
+      await withHost(test, async ({ paths, host, events, notices, open }) => {
+        await open();
+        const previousReview = await waitForNative(paths.nativePid, test.signal);
+        const previousLauncher = Number(await readFile(paths.launcherPid, "utf8"));
+        const originalKill = process.kill.bind(process);
+        vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+          if (signal === "SIGKILL")
+            throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+          return originalKill(pid, signal);
+        });
+        let replacement: ((data: string) => { consume?: boolean } | undefined) | undefined;
+        await host.start(
+          context(
+            (next) => {
+              replacement = next;
+            },
+            events,
+            notices,
+          ),
+        );
+        const previousLate = Number(await readFile(paths.latePid, "utf8"));
+        // The failed teardown is reported, and the new session owns the chord.
+        expect(replacement).toBeDefined();
+        expect(notices).toHaveLength(1);
+        expect(notices[0]).toMatchObject({ type: "error" });
+        expect(notices[0]?.message).toMatch(/^Previous Hunk review cleanup failed: /);
+        vi.restoreAllMocks();
+        replacement!("\0");
+        replacement!("h");
+        const deadline = Date.now() + 4_000;
+        for (;;) {
+          const launched = await readNative(paths.nativePid);
+          if (launched !== undefined && launched.pid !== previousReview.pid) break;
+          if (Date.now() > deadline) throw new Error("the replacement chord launched no review");
+          await delay(20);
+        }
+        // The deliberately unfinished teardown left its tree alive; it is this test's.
+        for (const pid of [previousReview.pid, previousLauncher, previousLate]) {
+          if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
+        }
       });
     },
     15_000,

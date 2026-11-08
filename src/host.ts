@@ -887,9 +887,16 @@ export function createHost(bindings: HostBindings) {
   async function start(ctx: HostContext): Promise<void> {
     const mine: Request = { _tag: "Start" };
     request = mine;
-    await stopCurrent();
+    // A previous teardown can fail on unverifiable process cleanup. That error belongs to
+    // `stop()`; the replacement session still needs its keyboard, so report it and load.
+    const teardown = await stopCurrent().then(
+      () => undefined,
+      (error: unknown) => asError(error),
+    );
     // A later start or stop supersedes this request while teardown is awaited.
     if (request !== mine || ctx.mode !== "tui") return;
+    if (teardown !== undefined)
+      ctx.ui.notify(`Previous Hunk review cleanup failed: ${teardown.message}`, "error");
     const { promise: settled, resolve } = Promise.withResolvers<void>();
     const loading: State = { _tag: "Loading", settled };
     state = loading;
