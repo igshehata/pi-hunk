@@ -216,12 +216,38 @@ interface ProcessIdentity {
   readonly start: string;
 }
 
+const PS_ARGUMENTS = ["-axo", "pid=,ppid=,pgid=,sess=,tty=,lstart=,command="] as const;
+/** `ps` has no fixed location: NixOS and busybox put it on `PATH` only. */
+const PS_CANDIDATES = ["ps", "/bin/ps", "/usr/bin/ps"] as const;
+/** The binary that last worked; a resolved `ps` is not searched for again. */
+let psBinary: string | undefined;
+
+function readProcessTable(): string {
+  let missing: unknown;
+  for (const binary of psBinary === undefined ? PS_CANDIDATES : [psBinary]) {
+    try {
+      const output = execFileSync(binary, PS_ARGUMENTS, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        // The parser reads fixed-width fields, so the table must never be localized.
+        env: { ...process.env, LC_ALL: "C", LANG: "C" },
+        // Long command lines on a busy host exceed Node's 1 MiB default.
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      psBinary = binary;
+      return output;
+    } catch (error) {
+      // A ps that ran and failed is the answer; only a missing binary earns another candidate.
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      missing ??= error;
+    }
+  }
+  throw missing ?? new Error("No ps binary found on PATH");
+}
+
 function processTable(): Map<number, ProcessIdentity> {
   if (process.platform === "win32") return new Map();
-  const output = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,pgid=,sess=,tty=,lstart=,command="], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
+  const output = readProcessTable();
   const processes = new Map<number, ProcessIdentity>();
   for (const line of output.split("\n")) {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.{24})\s+(.*)$/.exec(line);
@@ -302,7 +328,11 @@ function liveProcesses(
   });
 }
 
-async function waitForProcesses(processes: ReadonlyMap<number, ProcessIdentity>): Promise<void> {
+/** A table that stops being readable ends verification instead of failing the teardown. */
+async function waitForProcesses(
+  processes: ReadonlyMap<number, ProcessIdentity>,
+  onUnavailable: (error: Error) => void,
+): Promise<void> {
   if (processes.size === 0) return;
   const deadline = Date.now() + 2_000;
   for (;;) {
@@ -310,7 +340,8 @@ async function waitForProcesses(processes: ReadonlyMap<number, ProcessIdentity>)
     try {
       current = processTable();
     } catch (error) {
-      throw new HunkTeardownError("Cannot verify owned Hunk process termination", error);
+      onUnavailable(asError(error));
+      return;
     }
     const live = liveProcesses(processes, current);
     if (live.length === 0) return;
@@ -350,7 +381,18 @@ function startChild(launch: ReviewLaunch, bridge: string): OwnedChild {
   return owned;
 }
 
-async function closeChild(child: OwnedChild): Promise<void> {
+/** True when `settled` finished before the deadline; the wait itself never rejects. */
+async function settledWithin(settled: Promise<unknown>, milliseconds: number): Promise<boolean> {
+  return Promise.race([
+    settled.then(
+      () => true,
+      () => true,
+    ),
+    delay(milliseconds).then(() => false),
+  ]);
+}
+
+async function closeChild(child: OwnedChild, warn: (message: string) => void): Promise<void> {
   if (child.lifecycle._tag === "Exited") return;
   const rootPid = child.process.pid;
   if (rootPid === undefined) {
@@ -362,6 +404,31 @@ async function closeChild(child: OwnedChild): Promise<void> {
   const descendants = new Map<number, ProcessIdentity>();
   const terminated = new Set<number>();
   let root: ProcessIdentity | undefined;
+  /** Set once the process table cannot be read; teardown then owns only the direct child. */
+  let unenumerable: Error | undefined;
+  let warned = false;
+  /** Warned once per teardown: a host without a readable table is not a per-tick event. */
+  const reportUnenumerable = (error: Error): void => {
+    if (warned) return;
+    warned = true;
+    warn(
+      `Cannot read the process table (${error.message}); stopping only the Hunk process itself. Processes it started may survive.`,
+    );
+  };
+  /**
+   * Without a table no descendant can be enumerated or identity-checked, so the launcher
+   * pi-hunk spawned is the only handle. It is stopped directly and the teardown is not
+   * failed for processes it could not see.
+   */
+  const stopDirect = async (): Promise<void> => {
+    // A frozen launcher still has to be let go before a signal can reach it.
+    signalChild(child.process, "SIGCONT");
+    signalChild(child.process, "SIGTERM");
+    if (await settledWithin(child.closed, 1_000)) return;
+    signalChild(child.process, "SIGKILL");
+    if (!(await settledWithin(child.closed, 2_000)))
+      throw new HunkTeardownError("Hunk process teardown did not settle");
+  };
   /** First failure any teardown step saw; later failures never replace it. */
   const failure: { current: Failure } = { current: { _tag: "None" } };
   const remember = (error: unknown) => {
@@ -410,7 +477,8 @@ async function closeChild(child: OwnedChild): Promise<void> {
       }
       return table;
     } catch (error) {
-      remember(error);
+      // A host without a usable ps still has to be able to close its own child.
+      unenumerable ??= asError(error);
       return undefined;
     }
   };
@@ -447,7 +515,13 @@ async function closeChild(child: OwnedChild): Promise<void> {
 
   // Freeze the launcher before rescanning so its captured descendants remain
   // traversal anchors until the owned tree is drained.
-  sendRoot("SIGSTOP", refresh());
+  const initial = refresh();
+  if (unenumerable) {
+    reportUnenumerable(unenumerable);
+    await stopDirect();
+    return;
+  }
+  sendRoot("SIGSTOP", initial);
   sendDescendants(refresh());
 
   const startedAt = Date.now();
@@ -503,17 +577,28 @@ async function closeChild(child: OwnedChild): Promise<void> {
   try {
     await Promise.race([child.closed, monitor]);
     const atSettle: Failure = failure.current;
-    if (child.lifecycle._tag === "Running")
+    if (child.lifecycle._tag === "Running") {
+      // The table can disappear mid-teardown; the launcher is still ours to stop.
+      if (unenumerable) {
+        reportUnenumerable(unenumerable);
+        await stopDirect();
+        return;
+      }
       throw new HunkTeardownError(
         "Hunk process teardown did not settle",
         atSettle._tag === "Failed" ? atSettle.error : undefined,
       );
+    }
     await child.closed;
     await monitor;
     const atVerify: Failure = failure.current;
     if (atVerify._tag === "Failed")
       throw new HunkTeardownError("Hunk process teardown could not be verified", atVerify.error);
-    await waitForProcesses(descendants);
+    // Nothing captured before the table went away can be verified afterwards.
+    await waitForProcesses(descendants, (error) => {
+      unenumerable ??= error;
+    });
+    if (unenumerable) reportUnenumerable(unenumerable);
   } finally {
     monitorRun.abort();
     clearTimeout(escalation);
@@ -527,10 +612,11 @@ async function runChild(
   launch: ReviewLaunch,
   bridge: string,
   signal: AbortSignal,
+  warn: (message: string) => void,
 ): Promise<ReviewOutcome> {
   try {
     tui.stop();
-    return await ownChild(launch, bridge, signal);
+    return await ownChild(launch, bridge, signal, warn);
   } catch (error) {
     return { _tag: "Failed", error: asError(error) };
   } finally {
@@ -544,6 +630,7 @@ async function ownChild(
   launch: ReviewLaunch,
   bridge: string,
   signal: AbortSignal,
+  warn: (message: string) => void,
 ): Promise<ReviewOutcome> {
   const child = startChild(launch, bridge);
   try {
@@ -552,7 +639,7 @@ async function ownChild(
     if (exit === undefined) return { _tag: "Cancelled" };
     return { _tag: "Exited", exit };
   } finally {
-    await closeChild(child);
+    await closeChild(child, warn);
   }
 }
 
@@ -673,12 +760,27 @@ export function createHost(bindings: HostBindings) {
       };
       // The async factory does not mount a replacement editor. `done` closes it
       // after the child and terminal have both finished restoring.
+      let teardownWarning: string | undefined;
       const outcome = await session.ctx.ui.custom<ReviewOutcome>(
         async (tui, _theme, _keys, done) => {
-          done(await runChild(tui, launchData, bindings.bridge, signal));
+          done(
+            await runChild(tui, launchData, bindings.bridge, signal, (message) => {
+              teardownWarning ??= message;
+            }),
+          );
           return emptyComponent;
         },
       );
+      // A teardown that could not enumerate processes is reported once the terminal is back,
+      // including while the host is stopping: the survivor outlives the review.
+      const warning = teardownWarning;
+      if (warning !== undefined) {
+        try {
+          session.ctx.ui.notify(warning, "warning");
+        } catch {
+          // A dying host UI must not turn a reported teardown warning into an exit.
+        }
+      }
       if (outcome._tag === "Cancelled") return { _tag: "Finished" };
       if (outcome._tag === "Failed") throw outcome.error;
       const childExit = outcome.exit;

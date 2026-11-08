@@ -32,6 +32,11 @@ You need **Node.js 22.19+**, **Pi or OMP**, and **Hunk 0.22.0+** available as `h
 missing, older than 0.22.0, or cannot be run, the host shows a warning and does not take over the
 terminal. pi-hunk never installs or upgrades Hunk for you.
 
+pi-hunk finds `ps` on your `PATH` (falling back to `/bin/ps` and `/usr/bin/ps`) to stop Hunk and the
+processes it started when a review ends. Where no process table can be read, it stops the Hunk
+process it launched, warns that processes Hunk started may survive, and still closes the review
+normally.
+
 ### Build this checkout
 
 These instructions install the current source implementation, rather than the previous npm release.
