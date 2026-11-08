@@ -1,4 +1,3 @@
-import * as Effect from "effect/Effect";
 import { loadConfig, saveConfig } from "./config.js";
 import type { Config, Delivery } from "./contract.js";
 
@@ -17,11 +16,22 @@ export interface ConfigUI {
 }
 
 type KeyField = "prefix" | "diff" | "show" | "log";
+
+// The unsaved draft travels inside the state: no second mutable "current config" lives beside it.
 type EditorState =
-  | { readonly _tag: "Menu" }
-  | { readonly _tag: "Key"; readonly field: KeyField }
-  | { readonly _tag: "Delivery" }
-  | { readonly _tag: "Save" };
+  | { readonly _tag: "Menu"; readonly draft: Config }
+  | { readonly _tag: "Key"; readonly draft: Config; readonly field: KeyField }
+  | { readonly _tag: "Delivery"; readonly draft: Config }
+  | { readonly _tag: "Save"; readonly draft: Config };
+
+// Each menu row carries the transition it selects, so no index arithmetic or label matching decides it.
+type MenuChoice =
+  | { readonly _tag: "Key"; readonly field: KeyField; readonly label: string }
+  | { readonly _tag: "Delivery"; readonly label: string }
+  | { readonly _tag: "Save"; readonly label: string }
+  | { readonly _tag: "Cancel"; readonly label: string };
+
+type Answer<T> = { readonly _tag: "Answer"; readonly value: T } | { readonly _tag: "Aborted" };
 
 const keyFields: readonly KeyField[] = ["prefix", "diff", "show", "log"];
 const deliveryChoices: readonly { value: Delivery; label: string }[] = [
@@ -30,80 +40,123 @@ const deliveryChoices: readonly { value: Delivery; label: string }[] = [
   { value: "interrupt", label: "interrupt — stop the current response and deliver" },
 ];
 
-function dialogError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+// A dialog that settles because the caller cancelled is cancellation, not an answer, and the
+// rejection it may raise on cancellation must not become a configuration failure.
+async function answer<T>(signal: AbortSignal, dialog: () => Promise<T>): Promise<Answer<T>> {
+  try {
+    const value = await dialog();
+    return signal.aborted ? { _tag: "Aborted" } : { _tag: "Answer", value };
+  } catch (error) {
+    if (signal.aborted) return { _tag: "Aborted" };
+    throw error instanceof Error ? error : new Error(String(error));
+  }
 }
 
-export function editConfig(path: string, ui: ConfigUI): Effect.Effect<Config | undefined, Error> {
-  return Effect.gen(function* () {
-    let draft = yield* loadConfig(path);
-    let state: EditorState = { _tag: "Menu" };
-    while (true) {
-      switch (state._tag) {
-        case "Menu": {
-          const options = [
-            ...keyFields.map((field) => `${field}: ${draft[field]}`),
-            `delivery: ${draft.delivery}`,
-            "Save",
-            "Cancel",
-          ];
-          const choice = yield* Effect.tryPromise({
-            try: (signal) => ui.select(`Hunk configuration — ${path}`, options, { signal }),
-            catch: dialogError,
-          });
-          if (choice === undefined || choice === "Cancel") return undefined;
-          const index = options.indexOf(choice);
-          if (index >= 0 && index < keyFields.length) {
-            state = { _tag: "Key", field: keyFields[index]! };
-          } else if (choice === options[keyFields.length]) {
-            state = { _tag: "Delivery" };
-          } else if (choice === "Save") {
-            state = { _tag: "Save" };
-          }
-          break;
+export async function editConfig(
+  path: string,
+  ui: ConfigUI,
+  signal: AbortSignal,
+): Promise<Config | undefined> {
+  const loaded = await loadConfig(path);
+  let state: EditorState = { _tag: "Menu", draft: loaded };
+  while (true) {
+    // Covers the save, the one await that has no follow-up check: an abort during it must not reopen
+    // a menu the caller has already cancelled.
+    if (signal.aborted) return undefined;
+    switch (state._tag) {
+      case "Menu": {
+        const draft: Config = state.draft;
+        const menu: readonly MenuChoice[] = [
+          ...keyFields.map((field) => ({
+            _tag: "Key" as const,
+            field,
+            label: `${field}: ${draft[field]}`,
+          })),
+          { _tag: "Delivery", label: `delivery: ${draft.delivery}` },
+          { _tag: "Save", label: "Save" },
+          { _tag: "Cancel", label: "Cancel" },
+        ];
+        const answered: Answer<string | undefined> = await answer(
+          signal,
+          (): Promise<string | undefined> =>
+            ui.select(
+              `Hunk configuration — ${path}`,
+              menu.map(({ label }) => label),
+              { signal },
+            ),
+        );
+        if (answered._tag === "Aborted" || answered.value === undefined) return undefined;
+        const choice: MenuChoice | undefined = menu.find(({ label }) => label === answered.value);
+        // An unknown row is not an answer: re-render the same menu.
+        if (choice === undefined) break;
+        switch (choice._tag) {
+          case "Cancel":
+            return undefined;
+          case "Key":
+            state = { _tag: "Key", draft, field: choice.field };
+            break;
+          case "Delivery":
+            state = { _tag: "Delivery", draft };
+            break;
+          case "Save":
+            state = { _tag: "Save", draft };
+            break;
         }
-        case "Key": {
-          const field = state.field;
-          const value = yield* Effect.tryPromise({
-            try: (signal) =>
-              ui.input(
-                `${field} key binding (current: ${draft[field]}; blank keeps it)`,
-                "e.g. ctrl+space, h, shift+h",
-                { signal },
-              ),
-            catch: dialogError,
-          });
-          if (value !== undefined && value.trim() !== "") {
-            draft = { ...draft, [field]: value.trim() };
-          }
-          state = { _tag: "Menu" };
-          break;
+        break;
+      }
+      case "Key": {
+        const field: KeyField = state.field;
+        const current: Config = state.draft;
+        const answered: Answer<string | undefined> = await answer(
+          signal,
+          (): Promise<string | undefined> =>
+            ui.input(
+              `${field} key binding (current: ${current[field]}; blank keeps it)`,
+              "e.g. ctrl+space, h, shift+h",
+              { signal },
+            ),
+        );
+        if (answered._tag === "Aborted") return undefined;
+        const value: string | undefined = answered.value;
+        const draft: Config =
+          value !== undefined && value.trim() !== ""
+            ? { ...current, [field]: value.trim() }
+            : current;
+        state = { _tag: "Menu", draft };
+        break;
+      }
+      case "Delivery": {
+        const current: Config = state.draft;
+        const answered: Answer<string | undefined> = await answer(
+          signal,
+          (): Promise<string | undefined> =>
+            ui.select(
+              `Comment delivery (current: ${current.delivery})`,
+              deliveryChoices.map(({ label }) => label),
+              { signal },
+            ),
+        );
+        if (answered._tag === "Aborted") return undefined;
+        const selected: { value: Delivery; label: string } | undefined = deliveryChoices.find(
+          ({ label }) => label === answered.value,
+        );
+        state = {
+          _tag: "Menu",
+          draft: selected ? { ...current, delivery: selected.value } : current,
+        };
+        break;
+      }
+      case "Save": {
+        // Validate the complete draft here, allowing intermediate trigger-key collisions.
+        const draft: Config = state.draft;
+        try {
+          return await saveConfig(path, draft);
+        } catch (error) {
+          ui.notify(error instanceof Error ? error.message : String(error), "error");
         }
-        case "Delivery": {
-          const choice = yield* Effect.tryPromise({
-            try: (signal) =>
-              ui.select(
-                `Comment delivery (current: ${draft.delivery})`,
-                deliveryChoices.map(({ label }) => label),
-                { signal },
-              ),
-            catch: dialogError,
-          });
-          const selected = deliveryChoices.find(({ label }) => label === choice);
-          if (selected) draft = { ...draft, delivery: selected.value };
-          state = { _tag: "Menu" };
-          break;
-        }
-        case "Save": {
-          // Validate the complete draft here, allowing intermediate trigger-key collisions.
-          const saved = yield* saveConfig(path, draft).pipe(
-            Effect.catch((error) => Effect.sync(() => ui.notify(error.message, "error"))),
-          );
-          if (saved !== undefined) return saved;
-          state = { _tag: "Menu" };
-          break;
-        }
+        state = { _tag: "Menu", draft };
+        break;
       }
     }
-  });
+  }
 }

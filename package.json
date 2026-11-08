@@ -52,7 +52,6 @@
     "@oh-my-pi/pi-coding-agent": "18.18.0",
     "@oh-my-pi/pi-tui": "18.18.0",
     "@types/node": "24.13.3",
-    "effect": "4.0.0-rc.112",
     "esbuild": "0.28.1",
     "hunkdiff": "0.24.1",
     "oxfmt": "0.59.0",

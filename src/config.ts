@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import * as Effect from "effect/Effect";
 import type { Config } from "./contract.js";
 
 export const DEFAULT_CONFIG: Config = Object.freeze({
@@ -69,60 +68,61 @@ export function parseConfig(value: unknown): Config {
   return { prefix, diff, show, log, delivery };
 }
 
-export function loadConfig(path: string): Effect.Effect<Config, Error> {
-  return Effect.tryPromise({
-    try: async () => {
-      let text: string;
-      try {
-        text = await readFile(path, "utf8");
-      } catch (error) {
-        if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-          return DEFAULT_CONFIG;
-        }
-        throw error;
-      }
-      return parseConfig(JSON.parse(text));
-    },
-    catch: (error) =>
-      new Error(`Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`),
-  });
+export async function loadConfig(path: string): Promise<Config> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return DEFAULT_CONFIG;
+    }
+    throw new Error(
+      `Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    return parseConfig(JSON.parse(text));
+  } catch (error) {
+    throw new Error(
+      `Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
-export function saveConfig(path: string, value: unknown): Effect.Effect<Config, Error> {
-  // An accepted save must settle before an interrupted session can reload this path.
-  return Effect.uninterruptible(
-    Effect.tryPromise({
-      try: async () => {
-        const config = parseConfig(value);
-        const text = `${JSON.stringify(config, null, 2)}\n`;
-        const directory = dirname(path);
-        await mkdir(directory, { recursive: true, mode: 0o700 });
-        const temporary = join(directory, `.pi-hunk-${randomUUID()}.tmp`);
-        const file = await open(temporary, "wx", 0o600);
-        try {
-          try {
-            await file.writeFile(text, "utf8");
-            await file.sync();
-          } finally {
-            await file.close();
-          }
-          await rename(temporary, path);
-        } catch (error) {
-          try {
-            await rm(temporary, { force: true });
-          } catch (cleanupError) {
-            throw new AggregateError(
-              [error, cleanupError],
-              `Save failed and temporary file could not be removed: ${temporary}`,
-            );
-          }
-          throw error;
-        }
-        // Rename consumes the temporary file; no fallible cleanup follows the commit.
-        return config;
-      },
-      catch: (error) =>
-        new Error(`Cannot save ${path}: ${error instanceof Error ? error.message : String(error)}`),
-    }),
-  );
+export async function saveConfig(path: string, value: unknown): Promise<Config> {
+  // An accepted save must settle before an interrupted session can reload this path, so there is no
+  // cancellation signal to observe: once this promise starts writing, it runs to completion.
+  try {
+    const config = parseConfig(value);
+    const text = `${JSON.stringify(config, null, 2)}\n`;
+    const directory = dirname(path);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const temporary = join(directory, `.pi-hunk-${randomUUID()}.tmp`);
+    const file = await open(temporary, "wx", 0o600);
+    try {
+      try {
+        await file.writeFile(text, "utf8");
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      await rename(temporary, path);
+    } catch (error) {
+      try {
+        await rm(temporary, { force: true });
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Save failed and temporary file could not be removed: ${temporary}`,
+        );
+      }
+      throw error;
+    }
+    // Rename consumes the temporary file; no fallible cleanup follows the commit.
+    return config;
+  } catch (error) {
+    throw new Error(
+      `Cannot save ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }

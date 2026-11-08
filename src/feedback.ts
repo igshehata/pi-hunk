@@ -1,57 +1,66 @@
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import * as Effect from "effect/Effect";
 import type { ReviewEvent, ReviewNote, Revision } from "./contract.js";
 
+/**
+ * Replay lifecycle of the journal: the bridge announces itself with `Ready`;
+ * only then may notes be recorded. A `Ready` seen while already recording is a
+ * restarted bridge and changes nothing, so retained notes stay authoritative.
+ */
 type JournalState =
   | { readonly _tag: "AwaitingBridge" }
   | { readonly _tag: "Recording"; readonly notes: Map<string, ReviewNote> };
 
-export function readFeedback(journal: string): Effect.Effect<readonly ReviewNote[], Error> {
-  return Effect.tryPromise({
-    try: async (signal) => {
-      const stream = createReadStream(journal, { encoding: "utf8", signal });
-      const lines = createInterface({ input: stream, crlfDelay: Infinity });
-      let state: JournalState = { _tag: "AwaitingBridge" };
-      try {
-        for await (const line of lines) {
-          if (line.length === 0) continue;
-          const event = JSON.parse(line) as ReviewEvent;
-          switch (event._tag) {
-            case "Ready":
-              if (state._tag === "AwaitingBridge") {
-                state = { _tag: "Recording", notes: new Map() };
-              }
-              break;
-            case "Upsert":
-              if (state._tag !== "Recording")
-                throw new Error("Comment arrived before bridge initialization");
-              state.notes.set(event.note.id, event.note);
-              break;
-            case "Remove":
-              if (state._tag !== "Recording")
-                throw new Error("Comment removal arrived before bridge initialization");
-              state.notes.delete(event.id);
-              break;
-            case "Failure":
-              throw new Error(event.message);
-            default:
-              throw new Error("Unrecognized review journal entry");
-          }
-        }
-        if (state._tag !== "Recording")
-          throw new Error("The Hunk review bridge did not initialize");
-        return [...state.notes.values()];
-      } finally {
-        lines.close();
-        stream.destroy();
-      }
-    },
-    catch: (error) =>
-      new Error(
-        `Cannot collect review feedback from ${journal}: ${error instanceof Error ? error.message : String(error)}`,
-      ),
-  });
+/** The single place where a journal event advances the replay state. */
+function replay(state: JournalState, event: ReviewEvent): JournalState {
+  switch (event._tag) {
+    case "Ready":
+      return state._tag === "Recording" ? state : { _tag: "Recording", notes: new Map() };
+    case "Upsert":
+      if (state._tag !== "Recording")
+        throw new Error("Comment arrived before bridge initialization");
+      state.notes.set(event.note.id, event.note);
+      return state;
+    case "Remove":
+      if (state._tag !== "Recording")
+        throw new Error("Comment removal arrived before bridge initialization");
+      state.notes.delete(event.id);
+      return state;
+    case "Failure":
+      throw new Error(event.message);
+    default:
+      throw new Error("Unrecognized review journal entry");
+  }
+}
+
+/** A journal that never reached `Recording` is a failed capture, not an empty review. */
+function recordedNotes(state: JournalState): readonly ReviewNote[] {
+  if (state._tag !== "Recording") throw new Error("The Hunk review bridge did not initialize");
+  return [...state.notes.values()];
+}
+
+export async function readFeedback(
+  journal: string,
+  signal?: AbortSignal,
+): Promise<readonly ReviewNote[]> {
+  const stream = createReadStream(journal, { encoding: "utf8", signal });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    let state: JournalState = { _tag: "AwaitingBridge" };
+    for await (const line of lines) {
+      if (line.length === 0) continue;
+      const event = JSON.parse(line) as ReviewEvent;
+      state = replay(state, event);
+    }
+    return recordedNotes(state);
+  } catch (error) {
+    throw new Error(
+      `Cannot collect review feedback from ${journal}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
 }
 
 /** Group notes by exact revision, not by equal-looking display text. */

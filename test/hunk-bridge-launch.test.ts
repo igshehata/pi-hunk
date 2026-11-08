@@ -1,7 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as Effect from "effect/Effect";
 import type { ExtensionContext, HunkExtensionAPI } from "hunkdiff/extension";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { REVIEW_ENV } from "../src/contract.js";
@@ -98,7 +97,7 @@ describe("review launch config boundary", () => {
         },
         context,
       );
-      const notes = await Effect.runPromise(readFeedback(journal));
+      const notes = await readFeedback(journal);
       expect(notes).toEqual([
         {
           id: "note-1",

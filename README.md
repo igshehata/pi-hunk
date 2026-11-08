@@ -22,8 +22,8 @@ file, old and new lines, and the reviewed diff lines. No copy/paste.
   replace old text, and deleted notes stay deleted.
 - **Your agent’s workflow.** Steer an active turn, queue a follow-up, or interrupt it. The same
   controls work in Pi and OMP.
-- **A small integration.** Effect is bundled; the SDKs come from the hosts. No separately installed
-  runtime npm dependencies.
+- **A small integration.** No runtime dependencies: the SDKs come from the hosts, and nothing else
+  is bundled.
 
 ## Install
 

@@ -2,7 +2,7 @@ import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_pro
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Cause, Effect, Exit } from "effect";
+import { setTimeout as delay } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { editConfig, type ConfigUI } from "./config-ui.js";
 import {
@@ -48,29 +48,57 @@ export interface HostBindings {
   sendUserMessage(message: string, options?: { deliverAs: "steer" | "followUp" }): void;
 }
 
-type Chord = "Idle" | "Armed";
 interface Session {
   readonly ctx: HostContext;
   readonly config: Config;
 }
-interface Operation {
-  readonly cancel: AbortController;
-  settled: Promise<void>;
-  journal?: string;
-  teardownError?: Error;
-}
+/** Where an edit hands the keyboard back; only a listening session owns the key handler. */
+type Restore =
+  | { readonly _tag: "None" }
+  | { readonly _tag: "Listening"; readonly session: Session };
+/**
+ * One host lifecycle. Every phase a stop can interrupt owns its `cancel` and the `settled` promise
+ * that tells `stop` when the phase is really over; nothing is filled in after the phase starts.
+ */
 type State =
   | { readonly _tag: "Inactive" }
-  | { readonly _tag: "Loading"; readonly operation: Operation }
-  | { readonly _tag: "Configuring"; readonly operation: Operation }
+  | { readonly _tag: "Loading"; readonly settled: Promise<void> }
   | {
-      readonly _tag: "Listening";
-      readonly session: Session;
-      readonly unsubscribe: () => void;
-      chord: Chord;
+      readonly _tag: "Configuring";
+      readonly cancel: AbortController;
+      readonly settled: Promise<void>;
+      readonly restore: Restore;
     }
-  | { readonly _tag: "Reviewing"; readonly session: Session; readonly operation: Operation }
+  | { readonly _tag: "Listening"; readonly session: Session; readonly unsubscribe: () => void }
+  | { readonly _tag: "Armed"; readonly session: Session; readonly unsubscribe: () => void }
+  | {
+      readonly _tag: "Reviewing";
+      readonly session: Session;
+      readonly cancel: AbortController;
+      readonly settled: Promise<LaunchResult>;
+    }
   | { readonly _tag: "Stopping"; readonly settled: Promise<void> };
+
+/** The newest `start`/`stop` request, compared by identity so only the latest may proceed. */
+type Request = { readonly _tag: "Start" } | { readonly _tag: "Stop" };
+
+/** How far a launch got; only a phase that owns a journal can quote a recovery path. */
+type Recovery =
+  | { readonly _tag: "Preparing" }
+  | { readonly _tag: "Journaled"; readonly journal: string };
+/**
+ * How a review ended. Only a teardown failure is surfaced from `stop()`; every other ending has
+ * already been reported (or is deliberately silent) and sends nothing.
+ */
+type LaunchResult =
+  | { readonly _tag: "Finished" }
+  | { readonly _tag: "TeardownFailed"; readonly error: Error };
+
+/** How one interactive configuration edit ended; only a save replaces the active session. */
+type ConfigOutcome =
+  | { readonly _tag: "Saved"; readonly config: Config }
+  | { readonly _tag: "Discarded" }
+  | { readonly _tag: "Failed"; readonly error: Error };
 
 type ChildExit =
   | {
@@ -79,11 +107,31 @@ type ChildExit =
       readonly signal: NodeJS.Signals | null;
     }
   | { readonly _tag: "SpawnError"; readonly error: Error };
+/** The child's lifecycle; `closed` settles with the exit this records. */
+type ChildLifecycle =
+  | { readonly _tag: "Running" }
+  | { readonly _tag: "Exited"; readonly exit: ChildExit };
 interface OwnedChild {
   readonly process: ChildProcess;
   readonly closed: Promise<ChildExit>;
-  state: { readonly _tag: "Running" } | { readonly _tag: "Closed" };
+  /** Written by the `close` listener alone; the synchronous view for the monitor loop. */
+  lifecycle: ChildLifecycle;
 }
+
+/** What the owned child and terminal handoff produced. */
+type ReviewOutcome =
+  | { readonly _tag: "Exited"; readonly exit: ChildExit }
+  | { readonly _tag: "Cancelled" }
+  | { readonly _tag: "Failed"; readonly error: Error };
+
+/** The first failure a teardown step saw; later failures never replace it. */
+type Failure = { readonly _tag: "None" } | { readonly _tag: "Failed"; readonly error: Error };
+/** The one-shot release of a frozen launcher. */
+type RootRelease = { readonly _tag: "Held" } | { readonly _tag: "Released" };
+/** First observation that the child closed; the teardown grace window runs from that tick. */
+type ClosedWatch =
+  | { readonly _tag: "Running" }
+  | { readonly _tag: "Observed"; readonly at: number };
 
 const consumed = { consume: true };
 const emptyComponent: Component = { render: () => [], invalidate: () => {} };
@@ -99,44 +147,60 @@ class HunkTeardownError extends Error {
 const HUNK_INSTALL =
   "Install Hunk 0.22.0 or newer from https://hunk.dev; pi-hunk does not install or upgrade Hunk.";
 
-function requireHunk(): Effect.Effect<void, Error> {
-  return Effect.tryPromise({
-    try: (signal) =>
-      new Promise<void>((resolve, reject) => {
-        execFile(
-          "hunk",
-          ["--version"],
-          { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024, signal },
-          (error, stdout, stderr) => {
-            if (error) {
-              if ("code" in error && error.code === "ENOENT") {
-                reject(new Error(`hunk was not found on PATH. ${HUNK_INSTALL}`));
-                return;
-              }
-              reject(
-                new Error(
-                  `Cannot run hunk: ${(stderr && stderr.trim()) || error.message}. pi-hunk requires Hunk 0.22.0 or newer. ${HUNK_INSTALL}`,
-                ),
-              );
-              return;
-            }
-            const match = /(\d+)\.(\d+)\.(\d+)/.exec(stdout);
-            if (match && Number(match[1]) === 0 && Number(match[2]) < 22) {
-              reject(
-                new Error(
-                  `pi-hunk requires Hunk 0.22.0 or newer; PATH hunk reports ${match[0]}. ${HUNK_INSTALL}`,
-                ),
-              );
-              return;
-            }
-            // Successful --version without x.y.z is not treated as outdated.
-            // Launch continues; the bridge still throws if apiVersion < 25.
-            resolve();
-          },
+/**
+ * Waits `ms`, returning as soon as `signal` aborts. Callers re-check `signal.aborted`; an abort is
+ * never an error, because a cancelled operation sends nothing.
+ */
+async function idleTick(ms: number, signal: AbortSignal): Promise<void> {
+  try {
+    await delay(ms, undefined, { signal });
+  } catch (error) {
+    if (!signal.aborted) throw error;
+  }
+}
+
+/** Resolves when `signal` aborts; never settles while the operation runs, and never rejects. */
+function untilAborted(signal: AbortSignal): Promise<undefined> {
+  const { promise, resolve } = Promise.withResolvers<undefined>();
+  if (signal.aborted) resolve(undefined);
+  else signal.addEventListener("abort", () => resolve(undefined), { once: true });
+  return promise;
+}
+
+async function requireHunk(signal: AbortSignal): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  execFile(
+    "hunk",
+    ["--version"],
+    { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024, signal },
+    (error, stdout, stderr) => {
+      if (error) {
+        if ("code" in error && error.code === "ENOENT") {
+          reject(new Error(`hunk was not found on PATH. ${HUNK_INSTALL}`));
+          return;
+        }
+        reject(
+          new Error(
+            `Cannot run hunk: ${(stderr && stderr.trim()) || error.message}. pi-hunk requires Hunk 0.22.0 or newer. ${HUNK_INSTALL}`,
+          ),
         );
-      }),
-    catch: asError,
-  });
+        return;
+      }
+      const match = /(\d+)\.(\d+)\.(\d+)/.exec(stdout);
+      if (match && Number(match[1]) === 0 && Number(match[2]) < 22) {
+        reject(
+          new Error(
+            `pi-hunk requires Hunk 0.22.0 or newer; PATH hunk reports ${match[0]}. ${HUNK_INSTALL}`,
+          ),
+        );
+        return;
+      }
+      // Successful --version without x.y.z is not treated as outdated.
+      // Launch continues; the bridge still throws if apiVersion < 25.
+      resolve();
+    },
+  );
+  await promise;
 }
 
 function isMissingProcess(error: unknown): boolean {
@@ -255,7 +319,7 @@ async function waitForProcesses(processes: ReadonlyMap<number, ProcessIdentity>)
         "Owned Hunk processes did not exit: " + live.map((process) => process.pid).join(", "),
       );
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    await delay(20);
   }
 }
 
@@ -265,231 +329,291 @@ function startChild(launch: ReviewLaunch, bridge: string): OwnedChild {
     env: { ...process.env, [REVIEW_ENV]: JSON.stringify(launch) },
     stdio: "inherit",
   });
-  let spawnError: Error | undefined;
+  // A spawn failure arrives as an `error` event before `close`; it replaces the exit.
+  let failed: { readonly _tag: "Running" } | { readonly _tag: "Failed"; readonly error: Error } = {
+    _tag: "Running",
+  };
   const { promise, resolve } = Promise.withResolvers<ChildExit>();
-  const owned: OwnedChild = { process: child, state: { _tag: "Running" }, closed: promise };
+  const owned: OwnedChild = { process: child, lifecycle: { _tag: "Running" }, closed: promise };
   child.once("error", (error) => {
-    spawnError = error;
+    failed = { _tag: "Failed", error };
   });
   // `exit` precedes stdio closure; only `close` is the handoff boundary.
   child.once("close", (code, signal) => {
-    owned.state = { _tag: "Closed" };
-    resolve(
-      spawnError ? { _tag: "SpawnError", error: spawnError } : { _tag: "Closed", code, signal },
-    );
+    const exit: ChildExit =
+      failed._tag === "Failed"
+        ? { _tag: "SpawnError", error: failed.error }
+        : { _tag: "Closed", code, signal };
+    owned.lifecycle = { _tag: "Exited", exit };
+    resolve(exit);
   });
   return owned;
 }
 
-function closeChild(child: OwnedChild): Effect.Effect<void> {
-  return Effect.promise(async () => {
-    if (child.state._tag === "Closed") return;
-    const rootPid = child.process.pid;
-    if (rootPid === undefined) {
-      signalChild(child.process, "SIGTERM");
-      await child.closed;
+async function closeChild(child: OwnedChild): Promise<void> {
+  if (child.lifecycle._tag === "Exited") return;
+  const rootPid = child.process.pid;
+  if (rootPid === undefined) {
+    signalChild(child.process, "SIGTERM");
+    await child.closed;
+    return;
+  }
+
+  const descendants = new Map<number, ProcessIdentity>();
+  const terminated = new Set<number>();
+  let root: ProcessIdentity | undefined;
+  /** First failure any teardown step saw; later failures never replace it. */
+  const failure: { current: Failure } = { current: { _tag: "None" } };
+  const remember = (error: unknown) => {
+    if (failure.current._tag === "None")
+      failure.current = { _tag: "Failed", error: asError(error) };
+  };
+  const capture = (
+    table: Map<number, ProcessIdentity>,
+    anchorPid: number,
+    expected: ProcessIdentity,
+  ) => {
+    if (!root) return;
+    const currentAnchor = table.get(anchorPid);
+    if (
+      !currentAnchor ||
+      !sameProcess(expected, currentAnchor) ||
+      !sameProcessGroup(root, currentAnchor)
+    )
       return;
+    for (const process of descendantsOf(anchorPid, table, root)) {
+      const known = descendants.get(process.pid);
+      if (!known) descendants.set(process.pid, process);
+      else if (!sameProcess(known, process)) terminated.add(process.pid);
     }
-
-    const descendants = new Map<number, ProcessIdentity>();
-    const terminated = new Set<number>();
-    let root: ProcessIdentity | undefined;
-    let failure: Error | undefined;
-    let table: Map<number, ProcessIdentity> | undefined;
-    const remember = (error: unknown) => {
-      failure ??= asError(error);
-    };
-    const refresh = (): Map<number, ProcessIdentity> | undefined => {
-      try {
-        table = processTable();
-        const currentRoot = table.get(rootPid);
-        const capture = (anchorPid: number, expected: ProcessIdentity) => {
-          if (!root) return;
-          const currentAnchor = table!.get(anchorPid);
-          if (
-            !currentAnchor ||
-            !sameProcess(expected, currentAnchor) ||
-            !sameProcessGroup(root, currentAnchor)
-          )
-            return;
-          for (const process of descendantsOf(anchorPid, table!, root)) {
-            const known = descendants.get(process.pid);
-            if (!known) descendants.set(process.pid, process);
-            else if (!sameProcess(known, process)) terminated.add(process.pid);
-          }
-        };
-        if (currentRoot && (root === undefined || sameProcess(root, currentRoot))) {
-          root ??= currentRoot;
-          capture(rootPid, currentRoot);
-        }
-        // A launcher may exit before a captured child spawns its own child. Keep each
-        // live, identity-checked descendant as an anchor without widening ownership.
-        if (root) {
-          for (const known of descendants.values()) {
-            const currentAnchor = table.get(known.pid);
-            if (
-              currentAnchor &&
-              sameProcess(known, currentAnchor) &&
-              sameProcessGroup(root, currentAnchor)
-            )
-              capture(known.pid, known);
-          }
-        }
-        return table;
-      } catch (error) {
-        table = undefined;
-        remember(error);
-        return undefined;
-      }
-    };
-    const send = (
-      process: ProcessIdentity,
-      signal: NodeJS.Signals,
-      current: Map<number, ProcessIdentity> | undefined,
-    ): boolean => {
-      if (!current) return false;
-      try {
-        return signalIdentity(process, signal, current);
-      } catch (error) {
-        remember(error);
-        return false;
-      }
-    };
-    const sendDescendants = (current: Map<number, ProcessIdentity> | undefined) => {
-      if (!current) return;
-      for (const process of descendants.values()) {
-        if (terminated.has(process.pid)) continue;
-        if (send(process, "SIGTERM", current)) terminated.add(process.pid);
-      }
-    };
-    const sendRoot = (
-      signal: NodeJS.Signals,
-      current: Map<number, ProcessIdentity> | undefined,
-    ) => {
-      if (root && current) send(root, signal, current);
-      else {
-        try {
-          signalChild(child.process, signal);
-        } catch (error) {
-          remember(error);
-        }
-      }
-    };
-
-    // Freeze the launcher before rescanning so its captured descendants remain
-    // traversal anchors until the owned tree is drained.
-    refresh();
-    sendRoot("SIGSTOP", table);
-    refresh();
-    sendDescendants(table);
-
-    let monitoring = true;
-    let released = false;
-    let closedAt: number | undefined;
-    const startedAt = Date.now();
-    const releaseRoot = (current: Map<number, ProcessIdentity>) => {
-      if (released) return;
-      released = true;
-      sendRoot("SIGTERM", current);
-      sendRoot("SIGCONT", current);
-    };
-    const escalation = setTimeout(() => {
-      const current = refresh();
-      if (current) {
-        for (const process of descendants.values()) send(process, "SIGKILL", current);
-        if (root) send(root, "SIGKILL", current);
-      } else {
-        try {
-          signalChild(child.process, "SIGKILL");
-        } catch (error) {
-          remember(error);
-        }
-      }
-    }, 500);
-    const monitor = (async () => {
-      while (monitoring) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 20));
-        if (!monitoring) break;
-        if (child.state._tag === "Closed") closedAt ??= Date.now();
-        const current = refresh();
-        sendDescendants(current);
-        const live = current === undefined ? undefined : liveProcesses(descendants, current);
-        if (
-          !released &&
-          child.state._tag === "Running" &&
-          current !== undefined &&
-          live !== undefined &&
-          live.length === 0
-        )
-          releaseRoot(current);
-        if (child.state._tag === "Closed") {
-          if (live?.length === 0) break;
-          if (closedAt !== undefined && Date.now() - closedAt >= 2_000) break;
-        } else if (Date.now() - startedAt >= 2_000) {
-          break;
-        }
-      }
-    })().catch((error) => {
-      remember(error);
-    });
+  };
+  const refresh = (): Map<number, ProcessIdentity> | undefined => {
     try {
-      await Promise.race([child.closed, monitor]);
-      if (child.state._tag === "Running")
-        throw new HunkTeardownError("Hunk process teardown did not settle", failure);
-      await child.closed;
-      await monitor;
-      if (failure)
-        throw new HunkTeardownError("Hunk process teardown could not be verified", failure);
-      await waitForProcesses(descendants);
-    } finally {
-      monitoring = false;
-      clearTimeout(escalation);
-      await monitor;
+      const table = processTable();
+      const currentRoot = table.get(rootPid);
+      if (currentRoot && (root === undefined || sameProcess(root, currentRoot))) {
+        root ??= currentRoot;
+        capture(table, rootPid, currentRoot);
+      }
+      // A launcher may exit before a captured child spawns its own child. Keep each
+      // live, identity-checked descendant as an anchor without widening ownership.
+      if (root) {
+        for (const known of descendants.values()) {
+          const currentAnchor = table.get(known.pid);
+          if (
+            currentAnchor &&
+            sameProcess(known, currentAnchor) &&
+            sameProcessGroup(root, currentAnchor)
+          )
+            capture(table, known.pid, known);
+        }
+      }
+      return table;
+    } catch (error) {
+      remember(error);
+      return undefined;
     }
+  };
+  const send = (
+    process: ProcessIdentity,
+    signal: NodeJS.Signals,
+    current: Map<number, ProcessIdentity> | undefined,
+  ): boolean => {
+    if (!current) return false;
+    try {
+      return signalIdentity(process, signal, current);
+    } catch (error) {
+      remember(error);
+      return false;
+    }
+  };
+  const sendDescendants = (current: Map<number, ProcessIdentity> | undefined) => {
+    if (!current) return;
+    for (const process of descendants.values()) {
+      if (terminated.has(process.pid)) continue;
+      if (send(process, "SIGTERM", current)) terminated.add(process.pid);
+    }
+  };
+  const sendRoot = (signal: NodeJS.Signals, current: Map<number, ProcessIdentity> | undefined) => {
+    if (root && current) send(root, signal, current);
+    else {
+      try {
+        signalChild(child.process, signal);
+      } catch (error) {
+        remember(error);
+      }
+    }
+  };
+
+  // Freeze the launcher before rescanning so its captured descendants remain
+  // traversal anchors until the owned tree is drained.
+  sendRoot("SIGSTOP", refresh());
+  sendDescendants(refresh());
+
+  const startedAt = Date.now();
+  let release: RootRelease = { _tag: "Held" };
+  let observed: ClosedWatch = { _tag: "Running" };
+  const releaseRoot = (current: Map<number, ProcessIdentity>) => {
+    if (release._tag === "Released") return;
+    release = { _tag: "Released" };
+    sendRoot("SIGTERM", current);
+    sendRoot("SIGCONT", current);
+  };
+  const escalation = setTimeout(() => {
+    const current = refresh();
+    if (current) {
+      for (const process of descendants.values()) send(process, "SIGKILL", current);
+      if (root) send(root, "SIGKILL", current);
+    } else {
+      try {
+        signalChild(child.process, "SIGKILL");
+      } catch (error) {
+        remember(error);
+      }
+    }
+  }, 500);
+  const monitorRun = new AbortController();
+  const monitor = (async () => {
+    while (!monitorRun.signal.aborted) {
+      await idleTick(20, monitorRun.signal);
+      if (monitorRun.signal.aborted) break;
+      if (child.lifecycle._tag === "Exited" && observed._tag === "Running")
+        observed = { _tag: "Observed", at: Date.now() };
+      const current = refresh();
+      sendDescendants(current);
+      const live = current === undefined ? undefined : liveProcesses(descendants, current);
+      if (
+        release._tag === "Held" &&
+        child.lifecycle._tag === "Running" &&
+        current !== undefined &&
+        live !== undefined &&
+        live.length === 0
+      )
+        releaseRoot(current);
+      if (child.lifecycle._tag === "Exited") {
+        if (live?.length === 0) break;
+        if (observed._tag === "Observed" && Date.now() - observed.at >= 2_000) break;
+      } else if (Date.now() - startedAt >= 2_000) {
+        break;
+      }
+    }
+  })().catch((error) => {
+    remember(error);
   });
+  try {
+    await Promise.race([child.closed, monitor]);
+    const atSettle: Failure = failure.current;
+    if (child.lifecycle._tag === "Running")
+      throw new HunkTeardownError(
+        "Hunk process teardown did not settle",
+        atSettle._tag === "Failed" ? atSettle.error : undefined,
+      );
+    await child.closed;
+    await monitor;
+    const atVerify: Failure = failure.current;
+    if (atVerify._tag === "Failed")
+      throw new HunkTeardownError("Hunk process teardown could not be verified", atVerify.error);
+    await waitForProcesses(descendants);
+  } finally {
+    monitorRun.abort();
+    clearTimeout(escalation);
+    await monitor;
+  }
+}
+
+/** The child is closed first, then the terminal comes back, on every exit path. */
+async function runChild(
+  tui: Terminal,
+  launch: ReviewLaunch,
+  bridge: string,
+  signal: AbortSignal,
+): Promise<ReviewOutcome> {
+  try {
+    tui.stop();
+    return await ownChild(launch, bridge, signal);
+  } catch (error) {
+    return { _tag: "Failed", error: asError(error) };
+  } finally {
+    tui.start();
+    tui.requestRender(true);
+  }
+}
+
+/** The child is closed before this settles, including on cancellation and on errors. */
+async function ownChild(
+  launch: ReviewLaunch,
+  bridge: string,
+  signal: AbortSignal,
+): Promise<ReviewOutcome> {
+  const child = startChild(launch, bridge);
+  try {
+    // A cancelled review stops waiting for a child that would never exit by itself.
+    const exit = await Promise.race([child.closed, untilAborted(signal)]);
+    if (exit === undefined) return { _tag: "Cancelled" };
+    return { _tag: "Exited", exit };
+  } finally {
+    await closeChild(child);
+  }
 }
 
 /** One lifecycle shared by the native Pi and OMP entrypoints. */
 export function createHost(bindings: HostBindings) {
   let state: State = { _tag: "Inactive" };
-  let generation = 0;
+  /** The newest start or stop request; identity decides which one may still take over. */
+  let request: Request = { _tag: "Stop" };
 
   function stopCurrent(): Promise<void> {
-    if (state._tag === "Stopping") return state.settled;
-    if (state._tag === "Inactive") return Promise.resolve();
-    if (state._tag === "Listening") {
-      state.unsubscribe();
-      state = { _tag: "Inactive" };
-      return Promise.resolve();
+    switch (state._tag) {
+      case "Inactive":
+        return Promise.resolve();
+      case "Stopping":
+        return state.settled;
+      case "Listening":
+      case "Armed":
+        state.unsubscribe();
+        state = { _tag: "Inactive" };
+        return Promise.resolve();
+      case "Loading":
+      case "Configuring":
+      case "Reviewing": {
+        const previous = state;
+        // Only a review can end in a teardown failure, and `stop` must surface exactly that.
+        const failure: Promise<Error | undefined> =
+          previous._tag === "Reviewing"
+            ? previous.settled.then((result) =>
+                result._tag === "TeardownFailed" ? result.error : undefined,
+              )
+            : previous.settled.then(() => undefined);
+        // Invalidate ownership before cancellation so a closing child cannot send.
+        const stopping: State = {
+          _tag: "Stopping",
+          settled: failure.then((error) => {
+            if (state === stopping) state = { _tag: "Inactive" };
+            if (error) throw error;
+          }),
+        };
+        state = stopping;
+        if (previous._tag !== "Loading") previous.cancel.abort();
+        return stopping.settled;
+      }
     }
-    const operation = state.operation;
-    // Invalidate ownership before cancellation so a closing child cannot send.
-    const stopping: State = {
-      _tag: "Stopping",
-      settled: operation.settled.then(() => {
-        if (state === stopping) state = { _tag: "Inactive" };
-        if (operation.teardownError) throw operation.teardownError;
-      }),
-    };
-    state = stopping;
-    operation.cancel.abort();
-    return stopping.settled;
   }
 
   function listen(session: Session): void {
     const listening: Extract<State, { _tag: "Listening" }> = {
       _tag: "Listening",
       session,
-      chord: "Idle",
       unsubscribe: session.ctx.ui.onTerminalInput((data) => {
-        // No Effects, fibers, closures, or objects on ordinary inactive input.
-        if (state !== listening || bindings.isKeyRelease(data)) return;
-        if (listening.chord === "Idle") {
+        // Ordinary inactive input allocates nothing and touches no state.
+        if (bindings.isKeyRelease(data)) return;
+        if (state === listening) {
           if (!bindings.matchesKey(data, session.config.prefix)) return;
-          listening.chord = "Armed";
+          state = { _tag: "Armed", session, unsubscribe: listening.unsubscribe };
           return consumed;
         }
-        listening.chord = "Idle";
+        // Only the armed handler of this session may launch; a stale one owns nothing.
+        if (state._tag !== "Armed" || state.session !== session) return;
+        state = listening;
         if (bindings.matchesKey(data, "escape")) return consumed;
         const view = bindings.matchesKey(data, session.config.diff)
           ? "diff"
@@ -508,107 +632,80 @@ export function createHost(bindings: HostBindings) {
   }
 
   function launch(session: Session, view: View): void {
-    const operation: Operation = { cancel: new AbortController(), settled: Promise.resolve() };
-    const reviewing: State = { _tag: "Reviewing", session, operation };
+    const cancel = new AbortController();
+    const { promise: settled, resolve } = Promise.withResolvers<LaunchResult>();
+    const reviewing: State = { _tag: "Reviewing", session, cancel, settled };
     state = reviewing;
-    const active = () => state === reviewing && !operation.cancel.signal.aborted;
-    const program = Effect.gen(function* () {
-      yield* Effect.tryPromise({ try: () => access(bindings.bridge), catch: asError });
-      yield* requireHunk();
-      const directory = yield* Effect.tryPromise({
-        try: () => mkdtemp(join(tmpdir(), "pi-hunk-")),
-        catch: asError,
-      });
-      operation.journal = join(directory, "notes.jsonl");
-      yield* Effect.tryPromise({
-        try: () => writeFile(operation.journal!, "", { mode: 0o600, flag: "wx" }),
-        catch: asError,
-      });
+    const active = () => state === reviewing && !cancel.signal.aborted;
+    const finish = (result: LaunchResult) => {
+      // Ownership comes back before `settled` resolves, as the old finalizer order required.
+      if (active()) listen(session);
+      resolve(result);
+    };
+    void runReview(session, view, cancel.signal, active)
+      .then(finish, () => finish({ _tag: "Finished" }))
+      // A host UI failure while restoring ownership must never leave `stop` waiting forever.
+      .catch(() => resolve({ _tag: "Finished" }));
+  }
+
+  async function runReview(
+    session: Session,
+    view: View,
+    signal: AbortSignal,
+    active: () => boolean,
+  ): Promise<LaunchResult> {
+    let recovery: Recovery = { _tag: "Preparing" };
+    try {
+      await access(bindings.bridge);
+      signal.throwIfAborted();
+      await requireHunk(signal);
+      const directory = await mkdtemp(join(tmpdir(), "pi-hunk-"));
+      const journal = join(directory, "notes.jsonl");
+      // From here a failure still names the journal, so saved comments stay recoverable.
+      recovery = { _tag: "Journaled", journal };
+      await writeFile(journal, "", { mode: 0o600, flag: "wx" });
+      signal.throwIfAborted();
       const launchData: ReviewLaunch = {
         cwd: session.ctx.cwd,
         view,
         config: session.config,
-        journal: operation.journal,
+        journal,
       };
       // The async factory does not mount a replacement editor. `done` closes it
-      // after the scoped child and terminal have both finished restoring.
-      const outcome = yield* Effect.uninterruptible(
-        Effect.tryPromise({
-          try: () =>
-            session.ctx.ui.custom<Exit.Exit<ChildExit, Error>>(async (tui, _theme, _keys, done) => {
-              const childProgram = Effect.scoped(
-                Effect.gen(function* () {
-                  yield* Effect.acquireRelease(Effect.succeed(tui), () =>
-                    Effect.sync(() => {
-                      tui.start();
-                      tui.requestRender(true);
-                    }),
-                  );
-                  yield* Effect.sync(() => {
-                    tui.stop();
-                  });
-                  const child = yield* Effect.acquireRelease(
-                    Effect.try({
-                      try: () => startChild(launchData, bindings.bridge),
-                      catch: asError,
-                    }),
-                    closeChild,
-                  );
-                  return yield* Effect.promise(() => child.closed);
-                }),
-              );
-              const exit = await Effect.runPromiseExit(childProgram, {
-                signal: operation.cancel.signal,
-              });
-              if (Exit.isFailure(exit)) {
-                const error = Cause.squash(exit.cause);
-                if (error instanceof HunkTeardownError) operation.teardownError = error;
-              }
-              done(exit);
-              return emptyComponent;
-            }),
-          catch: asError,
-        }),
+      // after the child and terminal have both finished restoring.
+      const outcome = await session.ctx.ui.custom<ReviewOutcome>(
+        async (tui, _theme, _keys, done) => {
+          done(await runChild(tui, launchData, bindings.bridge, signal));
+          return emptyComponent;
+        },
       );
-      if (Exit.isFailure(outcome)) {
-        const error = Cause.squash(outcome.cause);
-        if (error instanceof HunkTeardownError) operation.teardownError = error;
-        if (!active()) return;
-        return yield* Effect.fail(error);
-      }
-      if (!active()) return;
-      const childExit = outcome.value;
-      if (childExit._tag === "SpawnError") return yield* Effect.fail(childExit.error);
-      if (childExit.code === CAPTURE_FAILURE_EXIT_CODE) {
-        return yield* Effect.fail(
-          new Error(
-            "Hunk comment capture failed; the recovery journal may be incomplete and was not submitted.",
-          ),
+      if (outcome._tag === "Cancelled") return { _tag: "Finished" };
+      if (outcome._tag === "Failed") throw outcome.error;
+      const childExit = outcome.exit;
+      if (childExit._tag === "SpawnError") throw childExit.error;
+      if (childExit.code === CAPTURE_FAILURE_EXIT_CODE)
+        throw new Error(
+          "Hunk comment capture failed; the recovery journal may be incomplete and was not submitted.",
         );
-      }
       const abnormal = childExit.code !== 0 || childExit.signal !== null;
       if (abnormal)
         session.ctx.ui.notify(
-          `Hunk exited ${childExit.signal ?? `with code ${childExit.code}`}; saved comments will still be handed off. Recovery: ${operation.journal}`,
+          `Hunk exited ${childExit.signal ?? `with code ${childExit.code}`}; saved comments will still be handed off. Recovery: ${journal}`,
           "warning",
         );
-      const notes = yield* readFeedback(operation.journal);
-      if (!active()) return;
+      const notes = await readFeedback(journal, signal);
+      if (!active()) return { _tag: "Finished" };
       if (notes.length === 0) {
-        if (!abnormal)
-          yield* Effect.tryPromise({
-            try: () => rm(directory, { recursive: true }),
-            catch: asError,
-          });
-        return;
+        if (!abnormal) await rm(directory, { recursive: true });
+        return { _tag: "Finished" };
       }
       if (!session.ctx.isIdle() && session.config.delivery === "interrupt") {
         // Native abort returns void. In particular Pi restores prior queues to
         // its composer; we neither await abort nor replace those native semantics.
         session.ctx.abort();
-        while (!session.ctx.isIdle()) yield* Effect.sleep(20);
+        while (!session.ctx.isIdle() && !signal.aborted) await idleTick(20, signal);
       }
-      if (!active()) return;
+      if (!active()) return { _tag: "Finished" };
       const message = formatFeedback(notes);
       if (session.ctx.isIdle()) bindings.sendUserMessage(message);
       else
@@ -617,18 +714,18 @@ export function createHost(bindings: HostBindings) {
         });
       // Native sendUserMessage returns void and hides asynchronous failures.
       // Retain recovery rather than treating call acceptance as a receipt.
-    });
-    operation.settled = Effect.runPromise(program, { signal: operation.cancel.signal })
-      .catch((error: unknown) => {
-        if (active())
-          session.ctx.ui.notify(
-            `Hunk review failed: ${asError(error).message}${operation.journal ? `\nRecovery: ${operation.journal}` : ""}`,
-            "error",
-          );
-      })
-      .finally(() => {
-        if (active()) listen(session);
-      });
+      return { _tag: "Finished" };
+    } catch (error) {
+      const failure = asError(error);
+      if (active())
+        session.ctx.ui.notify(
+          `Hunk review failed: ${failure.message}${recovery._tag === "Journaled" ? `\nRecovery: ${recovery.journal}` : ""}`,
+          "error",
+        );
+      return failure instanceof HunkTeardownError
+        ? { _tag: "TeardownFailed", error: failure }
+        : { _tag: "Finished" };
+    }
   }
 
   async function configure(args: string, ctx: HostContext): Promise<void> {
@@ -640,53 +737,61 @@ export function createHost(bindings: HostBindings) {
       ctx.ui.notify("Hunk configuration requires an interactive terminal.", "warning");
       return;
     }
-    if (state._tag !== "Listening" && state._tag !== "Inactive") {
+    if (state._tag !== "Listening" && state._tag !== "Armed" && state._tag !== "Inactive") {
       ctx.ui.notify("Finish the current Hunk operation before configuring it.", "warning");
       return;
     }
 
-    const previous = state._tag === "Listening" ? state.session : undefined;
-    if (state._tag === "Listening") state.unsubscribe();
-    const operation: Operation = { cancel: new AbortController(), settled: Promise.resolve() };
-    const configuring: State = { _tag: "Configuring", operation };
+    const restore: Restore =
+      state._tag === "Inactive" ? { _tag: "None" } : { _tag: "Listening", session: state.session };
+    if (state._tag !== "Inactive") state.unsubscribe();
+    const cancel = new AbortController();
+    const { promise: settled, resolve } = Promise.withResolvers<void>();
+    const configuring: State = { _tag: "Configuring", cancel, settled, restore };
     state = configuring;
-    const active = () => state === configuring && !operation.cancel.signal.aborted;
-    let saved: Config | undefined;
-
-    operation.settled = Effect.runPromise(editConfig(bindings.configPath, ctx.ui), {
-      signal: operation.cancel.signal,
-    })
-      .then((config) => {
-        if (!active() || !config) return;
-        saved = config;
+    const active = () => state === configuring && !cancel.signal.aborted;
+    const finish = (outcome: ConfigOutcome) => {
+      if (!active()) return;
+      if (outcome._tag === "Saved") {
         ctx.ui.notify(
           `Hunk configuration saved to ${bindings.configPath}. Changes are active.`,
           "info",
         );
-      })
-      .catch((error: unknown) => {
-        if (active())
-          ctx.ui.notify(`Hunk configuration failed: ${asError(error).message}`, "error");
-      })
-      .finally(() => {
         if (!active()) return;
-        if (saved) listen({ ctx, config: saved });
-        else if (previous) listen(previous);
-        else state = { _tag: "Inactive" };
-      });
-    await operation.settled;
+        listen({ ctx, config: outcome.config });
+        return;
+      }
+      if (outcome._tag === "Failed")
+        ctx.ui.notify(`Hunk configuration failed: ${outcome.error.message}`, "error");
+      if (!active()) return;
+      if (restore._tag === "Listening") listen(restore.session);
+      else state = { _tag: "Inactive" };
+    };
+    void editConfig(bindings.configPath, ctx.ui, cancel.signal)
+      .then(
+        (config): ConfigOutcome =>
+          config === undefined ? { _tag: "Discarded" } : { _tag: "Saved", config },
+        (error: unknown): ConfigOutcome => ({ _tag: "Failed", error: asError(error) }),
+      )
+      .then((outcome) => {
+        finish(outcome);
+        resolve();
+      })
+      // A host UI failure while restoring the keyboard must never leave `stop` waiting forever.
+      .catch(() => resolve());
+    await settled;
   }
 
   async function start(ctx: HostContext): Promise<void> {
-    const request = ++generation;
+    const mine: Request = { _tag: "Start" };
+    request = mine;
     await stopCurrent();
-    if (request !== generation || ctx.mode !== "tui") return;
-    const operation: Operation = { cancel: new AbortController(), settled: Promise.resolve() };
-    const loading: State = { _tag: "Loading", operation };
+    // A later start or stop supersedes this request while teardown is awaited.
+    if (request !== mine || ctx.mode !== "tui") return;
+    const { promise: settled, resolve } = Promise.withResolvers<void>();
+    const loading: State = { _tag: "Loading", settled };
     state = loading;
-    operation.settled = Effect.runPromise(loadConfig(bindings.configPath), {
-      signal: operation.cancel.signal,
-    })
+    void loadConfig(bindings.configPath)
       .then((config) => {
         if (state === loading) listen({ ctx, config });
       })
@@ -694,8 +799,12 @@ export function createHost(bindings: HostBindings) {
         if (state !== loading) return;
         state = { _tag: "Inactive" };
         ctx.ui.notify(`Hunk configuration failed: ${asError(error).message}`, "error");
-      });
-    await operation.settled;
+      })
+      .then(
+        () => resolve(),
+        () => resolve(),
+      );
+    await settled;
   }
 
   return {
@@ -709,7 +818,7 @@ export function createHost(bindings: HostBindings) {
       handler: configure,
     },
     stop: () => {
-      generation++;
+      request = { _tag: "Stop" };
       return stopCurrent();
     },
   };
