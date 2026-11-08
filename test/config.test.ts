@@ -2,7 +2,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { matchesKey, type KeyId } from "@earendil-works/pi-tui";
-import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vitest";
 import { loadConfig, parseConfig, saveConfig } from "../src/config.js";
 
@@ -42,13 +41,14 @@ describe("host-global configuration persistence", () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-hunk-config-test-"));
     const path = join(directory, "pi-hunk.json");
     try {
-      const saved = await Effect.runPromise(
-        saveConfig(path, { prefix: "ctrl+g", diff: "!", show: "H", delivery: "followUp" }),
-      );
-      await expect(
-        Effect.runPromise(saveConfig(path, { ...saved, diff: saved.show })),
-      ).rejects.toThrow(Error);
-      expect(await Effect.runPromise(loadConfig(path))).toEqual(saved);
+      const saved = await saveConfig(path, {
+        prefix: "ctrl+g",
+        diff: "!",
+        show: "H",
+        delivery: "followUp",
+      });
+      await expect(saveConfig(path, { ...saved, diff: saved.show })).rejects.toThrow(Error);
+      expect(await loadConfig(path)).toEqual(saved);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

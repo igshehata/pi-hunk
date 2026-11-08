@@ -6,15 +6,10 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const effectEntry = 'import * as Effect from "effect/Effect";\nconsole.log(Effect.succeed(1));\n';
 
-type Layout = "local" | "hoisted";
-
-async function createFixture(layout: Layout, piSource = effectEntry) {
-  const scratch = await mkdtemp(join(tmpdir(), "pi-hunk-build-test-"));
-  const packageRoot = layout === "local" ? scratch : join(scratch, "packages", "pi-hunk");
-  const dependencyRoot =
-    layout === "local" ? join(packageRoot, "node_modules") : join(scratch, "node_modules");
+async function createFixture(source: string) {
+  const packageRoot = await mkdtemp(join(tmpdir(), "pi-hunk-build-test-"));
+  const dependencyRoot = join(packageRoot, "node_modules");
   await Promise.all([
     mkdir(join(packageRoot, "scripts"), { recursive: true }),
     mkdir(join(packageRoot, "src"), { recursive: true }),
@@ -23,14 +18,12 @@ async function createFixture(layout: Layout, piSource = effectEntry) {
   await Promise.all([
     copyFile(join(repositoryRoot, "scripts/build.mjs"), join(packageRoot, "scripts/build.mjs")),
     ...["pi", "omp", "hunk"].map((entry) =>
-      writeFile(join(packageRoot, "src", `${entry}.ts`), piSource),
+      writeFile(join(packageRoot, "src", `${entry}.ts`), source),
     ),
-    ...["effect", "esbuild"].map((dependency) =>
-      symlink(
-        resolve(repositoryRoot, "node_modules", dependency),
-        join(dependencyRoot, dependency),
-        "dir",
-      ),
+    symlink(
+      resolve(repositoryRoot, "node_modules/esbuild"),
+      join(dependencyRoot, "esbuild"),
+      "dir",
     ),
     symlink(
       resolve(repositoryRoot, "node_modules/@esbuild"),
@@ -38,7 +31,7 @@ async function createFixture(layout: Layout, piSource = effectEntry) {
       "dir",
     ),
   ]);
-  return { scratch, packageRoot, dependencyRoot };
+  return { packageRoot, dependencyRoot };
 }
 
 function runBuild(packageRoot: string) {
@@ -54,29 +47,8 @@ function runBuild(packageRoot: string) {
 }
 
 describe("production build dependency policy", () => {
-  it("accepts Effect installed alongside the package", async () => {
-    const fixture = await createFixture("local");
-    try {
-      const result = runBuild(fixture.packageRoot);
-      expect(result.status).toBe(0);
-    } finally {
-      await rm(fixture.scratch, { recursive: true, force: true });
-    }
-  });
-
-  it("accepts Effect hoisted above a workspace package", async () => {
-    const fixture = await createFixture("hoisted");
-    try {
-      const result = runBuild(fixture.packageRoot);
-      expect(result.status).toBe(0);
-    } finally {
-      await rm(fixture.scratch, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a bundled runtime library other than Effect", async () => {
+  it("rejects a bundled runtime library", async () => {
     const fixture = await createFixture(
-      "local",
       'import { marker } from "other-runtime";\nconsole.log(marker);\n',
     );
     try {
@@ -92,10 +64,10 @@ describe("production build dependency policy", () => {
       const result = runBuild(fixture.packageRoot);
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(
-        "bundles a runtime library other than Effect: node_modules/other-runtime/index.js",
+        "bundles a runtime library: node_modules/other-runtime/index.js",
       );
     } finally {
-      await rm(fixture.scratch, { recursive: true, force: true });
+      await rm(fixture.packageRoot, { recursive: true, force: true });
     }
   });
 });

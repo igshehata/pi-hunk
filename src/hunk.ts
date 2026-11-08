@@ -1,11 +1,11 @@
 import { execFile, execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
-import * as Effect from "effect/Effect";
 import {
   matchesKeyChord,
   parseKeyChord,
   type ExtensionContext,
   type ExtensionKeyEvent,
+  type ExtensionReviewNote,
   type ExtensionReviewSnapshotNote,
   type HunkExtensionAPI,
 } from "hunkdiff/extension";
@@ -21,26 +21,116 @@ import {
 import { parseConfig } from "./config.js";
 import { excerptFor } from "./excerpt.js";
 
+/**
+ * View lifecycle of one review.
+ *
+ * `Reviewing` holds the mounted view. `Switching` means a reconciler is reloading Hunk; it is
+ * also the single-slot inbox for newer requests, so a newer request supersedes the in-flight
+ * reload instead of queueing behind it. `Switching` always belongs to a `Running` registration:
+ * one torn down mid-reload leaves the switch pending, and the registration that replaces it
+ * resumes the reconciler, confirming first whatever Hunk reports as mounted. `Failed` is
+ * terminal capture failure: the journal must not be submitted and no view may be requested
+ * anymore.
+ */
 type ReviewState =
   | { readonly _tag: "Reviewing"; readonly view: View }
-  | { readonly _tag: "Switching"; view: View; target: View; requested: View }
+  | {
+      readonly _tag: "Switching";
+      /** View Hunk has confirmed mounted; the previous review until a replacement mounts. */
+      readonly mounted: View;
+      /** View the in-flight reload was asked to load. */
+      readonly target: View;
+      /** Latest requested view; a newer request replaces it, nothing queues. */
+      readonly requested: View;
+    }
   | { readonly _tag: "Failed"; readonly message: string };
 
-type InstanceState = "Registered" | "Running" | "Stopped";
+/** A review state that can still capture notes and accept view requests. */
+type ActiveReviewState = Exclude<ReviewState, { readonly _tag: "Failed" }>;
+
+/** One view request either starts a reconciler, feeds the running one, or changes nothing. */
+type SwitchRequest =
+  | { readonly _tag: "Started"; readonly state: ReviewState }
+  | { readonly _tag: "Queued"; readonly state: ReviewState }
+  | { readonly _tag: "Ignored" };
+
+/**
+ * How a switch enters its reconciler. `Known` means the view the state records is the one Hunk
+ * shows; `Interrupted` means the reload a torn-down registration abandoned may have mounted a
+ * different view, so that record cannot be trusted until the reconciler reloads again.
+ */
+type SwitchEntry = { readonly _tag: "Known" } | { readonly _tag: "Interrupted" };
+
+/**
+ * Registration lifecycle of this extension instance inside Hunk's registry. Only a `Running`
+ * registration writes journal events, records notes, or switches views. `Stopped` is terminal:
+ * every handler this registration registered becomes a no-op and its in-flight CLI work is
+ * cancelled, so a registry replacement starts from a registration that cannot act again.
+ */
+type BridgeState =
+  | { readonly _tag: "Registered" }
+  | { readonly _tag: "Running" }
+  | { readonly _tag: "Stopped" };
+
+/**
+ * Navigation model of a review, fixed at launch. A history-selected (`log`) review is a dead
+ * end: Hunk opened the reviewer on a past range, so diff/show would misdescribe what is loaded,
+ * and the log key is the way back to the host. Diff and show reviews switch between both.
+ */
+type Navigation = { readonly _tag: "History" } | { readonly _tag: "SwitchableViews" };
+
+/** The Hunk session owned by this process; resolved once, then reused by every reload. */
+type SessionState = { readonly _tag: "Unknown" } | { readonly _tag: "Owned"; readonly id: string };
+
+/** One file of the mounted changeset: its exact patch, and its path in the reviewed revision. */
+interface ReviewedFile {
+  readonly patch: string;
+  readonly previousPath?: string;
+}
+
+/**
+ * Changeset lifecycle. Nothing can be captured before Hunk mounts one: a saved note needs the
+ * revision it was saved against and the patch its excerpt is cut from. One transition replaces
+ * the whole table, so a revision can never disagree with the files it describes.
+ */
+type ChangesetState =
+  | { readonly _tag: "Absent" }
+  | {
+      readonly _tag: "Present";
+      readonly revision: Revision;
+      readonly files: ReadonlyMap<string, ReviewedFile>;
+    };
+
+/** The evidence a note freezes at its first save; later edits replace the body only. */
+interface FrozenNote {
+  readonly view: View;
+  readonly revision: Revision;
+  readonly previousPath?: string;
+  readonly excerpt?: string;
+}
+
+/**
+ * Note lifecycle. Hunk reports a note's public path through note_created/note_edited before
+ * note_changed commits it, so a note is either `Located` (path known, not journaled yet) or
+ * `Saved` (journaled, its evidence frozen). A removal drops the record.
+ */
+type NoteState =
+  | { readonly _tag: "Located"; readonly fileId: string; readonly path: string }
+  | {
+      readonly _tag: "Saved";
+      /** Latest public path Hunk reported; a newer report wins over the journaled one. */
+      readonly fileId: string;
+      readonly path: string;
+      readonly frozen: FrozenNote;
+    };
 
 interface Review {
   readonly launch: ReviewLaunch;
   state: ReviewState;
-  sessionId?: string;
-  /** The revision of the currently loaded changeset; undefined until Hunk loads one. */
-  revision?: Revision;
-  /** Public saved-note lifecycle payloads supply paths before note_changed fires. */
-  readonly paths: Map<string, { readonly path: string; readonly fileId: string }>;
-  /** fileId → path in the loaded revision, for files Hunk reports as renamed. */
-  readonly renames: Map<string, string>;
-  /** fileId → that file's exact patch in the loaded revision. */
-  readonly patches: Map<string, string>;
-  readonly notes: Map<string, ReviewNote>;
+  session: SessionState;
+  changeset: ChangesetState;
+  /** noteId → capture record, so a location and its journal entry cannot diverge. */
+  readonly notes: Map<string, NoteState>;
 }
 
 // Hunk imports the same module when replacing its extension registry. Keep review
@@ -142,6 +232,122 @@ function resolveRevision(cwd: string, view: View, title: string): Revision {
   return { kind: "commit", commit, ...(parent === null ? {} : { parent }) };
 }
 
+// View lifecycle: every transition of `ReviewState` lives here, and no handler mutates it
+// field by field.
+
+/**
+ * Record one view request. A request while `Switching` only replaces the pending intent: the
+ * running reconciler reads it after the reload it is waiting on, so the latest request wins.
+ */
+function requestSwitch(state: ReviewState, target: View): SwitchRequest {
+  if (state._tag === "Failed") return { _tag: "Ignored" };
+  if (state._tag === "Switching") {
+    return { _tag: "Queued", state: { ...state, requested: target } };
+  }
+  if (state.view === target) return { _tag: "Ignored" };
+  return {
+    _tag: "Started",
+    state: { _tag: "Switching", mounted: state.view, target, requested: target },
+  };
+}
+
+/** Confirm the view Hunk mounted; outside a switch there is nothing in flight to confirm. */
+function confirmMount(state: ReviewState, view: View): ReviewState {
+  return state._tag === "Switching" ? { ...state, mounted: view } : state;
+}
+
+/**
+ * Record the view this reconciler is asking Hunk to load. `changeset_loaded` reads it while the
+ * reload is in flight, so it must name the reload that is actually running, not an earlier one.
+ */
+function beginReload(state: ReviewState, view: View): ReviewState {
+  return state._tag === "Switching" ? { ...state, target: view } : state;
+}
+
+/** A failed switch leaves the last mounted review authoritative. */
+function abandonSwitch(state: ReviewState): ReviewState {
+  return state._tag === "Switching" ? { _tag: "Reviewing", view: state.mounted } : state;
+}
+
+// Capture state: session resolution, changeset mounting, and note records.
+
+/** Parse `hunk session list --json` and return the one session this process owns. */
+function parseOwnSession(output: string): string {
+  const result: unknown = JSON.parse(output);
+  if (
+    !result ||
+    typeof result !== "object" ||
+    !("sessions" in result) ||
+    !Array.isArray(result.sessions)
+  ) {
+    throw new Error("Hunk session list returned an invalid response");
+  }
+  const own = result.sessions.filter(
+    (session: unknown): session is { pid: number; sessionId: string } =>
+      !!session &&
+      typeof session === "object" &&
+      "pid" in session &&
+      session.pid === process.pid &&
+      "sessionId" in session &&
+      typeof session.sessionId === "string" &&
+      session.sessionId.length > 0,
+  );
+  if (own.length !== 1)
+    throw new Error(
+      `Expected one Hunk session for owned process ${process.pid}, found ${own.length}`,
+    );
+  return own[0]!.sessionId;
+}
+
+/** Run one `hunk` CLI control command in the reviewed repository. */
+function control(review: Review, signal: AbortSignal, args: readonly string[]): Promise<string> {
+  const { promise, resolve, reject } = Promise.withResolvers<string>();
+  execFile(
+    "hunk",
+    args,
+    {
+      cwd: review.launch.cwd,
+      encoding: "utf8",
+      signal,
+      timeout: 15_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+    (error, stdout, stderr) => {
+      if (error) reject(new Error(stderr.trim() || error.message));
+      else resolve(stdout);
+    },
+  );
+  return promise;
+}
+
+/**
+ * Resolve the Hunk session this process owns. The session cannot change while the process
+ * lives, so a failed lookup leaves it unknown and the next switch retries it.
+ */
+async function ownedSession(review: Review, signal: AbortSignal): Promise<string> {
+  const state = review.session;
+  if (state._tag === "Owned") return state.id;
+  const id = parseOwnSession(await control(review, signal, ["session", "list", "--json"]));
+  review.session = { _tag: "Owned", id };
+  return id;
+}
+
+/** Record where Hunk says a note lives; a journaled note keeps its frozen evidence. */
+function locateNote(review: Review, note: ExtensionReviewNote): void {
+  const record = review.notes.get(note.id);
+  review.notes.set(
+    note.id,
+    record?._tag === "Saved"
+      ? { ...record, fileId: note.fileId, path: note.filePath }
+      : { _tag: "Located", fileId: note.fileId, path: note.filePath },
+  );
+}
+
+/**
+ * Terminal transition of the capture lifecycle: the first failure becomes the journal's
+ * `Failure` event, the one error notice the user sees, and exit code 74. A later failure keeps
+ * the first message, and every handler stops capturing once the review is `Failed`.
+ */
 function failCapture(review: Review, context: ExtensionContext, error: unknown): void {
   if (review.state._tag === "Failed") return;
   const message = `pi-hunk cannot capture review feedback: ${error instanceof Error ? error.message : String(error)}`;
@@ -158,132 +364,35 @@ function failCapture(review: Review, context: ExtensionContext, error: unknown):
   }
 }
 
-function control(review: Review, args: readonly string[]): Effect.Effect<string, Error> {
-  return Effect.tryPromise({
-    try: (signal) =>
-      new Promise<string>((resolve, reject) => {
-        execFile(
-          "hunk",
-          args,
-          {
-            cwd: review.launch.cwd,
-            encoding: "utf8",
-            signal,
-            timeout: 15_000,
-            maxBuffer: 4 * 1024 * 1024,
-          },
-          (error, stdout, stderr) => {
-            if (error) reject(new Error(stderr.trim() || error.message));
-            else resolve(stdout);
-          },
-        );
-      }),
-    catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-  });
-}
-
-function switchView(review: Review, target: View, context: ExtensionContext): void {
-  if (review.state._tag === "Failed") return;
-  if (review.state._tag === "Switching") {
-    // One latest intent, not a queue: replacing it also cancels an obsolete pending view.
-    review.state.requested = target;
-    return;
-  }
-  if (review.state.view === target) return;
-  const switching: ReviewState & { _tag: "Switching" } = {
-    _tag: "Switching",
-    view: review.state.view,
-    target,
-    requested: target,
-  };
-  review.state = switching;
-  Effect.runFork(
-    Effect.gen(function* () {
-      if (!review.sessionId) {
-        const output = yield* control(review, ["session", "list", "--json"]);
-        const id = yield* Effect.try(() => {
-          const result: unknown = JSON.parse(output);
-          if (
-            !result ||
-            typeof result !== "object" ||
-            !("sessions" in result) ||
-            !Array.isArray(result.sessions)
-          ) {
-            throw new Error("Hunk session list returned an invalid response");
-          }
-          const own = result.sessions.filter(
-            (session: unknown): session is { pid: number; sessionId: string } =>
-              !!session &&
-              typeof session === "object" &&
-              "pid" in session &&
-              session.pid === process.pid &&
-              "sessionId" in session &&
-              typeof session.sessionId === "string" &&
-              session.sessionId.length > 0,
-          );
-          if (own.length !== 1)
-            throw new Error(
-              `Expected one Hunk session for owned process ${process.pid}, found ${own.length}`,
-            );
-          return own[0]!.sessionId;
-        });
-        review.sessionId = id;
-      }
-      while (review.state === switching) {
-        if (switching.view === switching.requested) {
-          review.state = { _tag: "Reviewing", view: switching.view };
-          break;
-        }
-        switching.target = switching.requested;
-        yield* control(review, ["session", "reload", review.sessionId, "--", switching.target]);
-        switching.view = switching.target;
-      }
-    }).pipe(
-      Effect.catch((error) =>
-        Effect.sync(() => {
-          if (review.state === switching) {
-            // A mounted replacement confirms a successful reload even if its CLI
-            // response was lost. Otherwise the previous review remains authoritative.
-            review.state = { _tag: "Reviewing", view: switching.view };
-          }
-          context.notify(
-            `pi-hunk could not switch to ${switching.target}: ${String(error)}`,
-            "error",
-          );
-        }),
-      ),
-    ),
-  );
-}
-
-function saveMutation(review: Review, note: ExtensionReviewSnapshotNote): void {
-  if (review.state._tag === "Failed") return;
-  const existing = review.notes.get(note.id);
-  const target = review.paths.get(note.id);
-  const path = target?.path ?? existing?.path;
-  if (!path) throw new Error(`Hunk did not provide a public file path for saved note ${note.id}`);
+function saveMutation(
+  review: Review,
+  state: ActiveReviewState,
+  note: ExtensionReviewSnapshotNote,
+): void {
+  const record = review.notes.get(note.id);
+  if (!record) throw new Error(`Hunk did not provide a public file path for saved note ${note.id}`);
+  const changeset = review.changeset;
+  const file = changeset._tag === "Present" ? changeset.files.get(record.fileId) : undefined;
+  const frozen = record._tag === "Saved" ? record.frozen : undefined;
   // A comment keeps the revision it was first saved against, even after the review reloads.
-  const revision = existing?.revision ?? review.revision;
+  const revision =
+    frozen?.revision ?? (changeset._tag === "Present" ? changeset.revision : undefined);
   if (!revision) throw new Error(`Hunk loaded no reviewed revision before saved note ${note.id}`);
-  const previousPath =
-    existing?.previousPath ?? (target ? review.renames.get(target.fileId) : undefined);
+  const previousPath = frozen?.previousPath ?? file?.previousPath;
   // Like revisions, excerpts are fixed when a note is first saved: a later reload
   // must not rewrite the evidence for a comment that already exists.
   const excerpt =
-    existing?.excerpt ??
-    excerptFor(
-      (target ? review.patches.get(target.fileId) : undefined) ?? "",
-      note.anchor.oldRange,
-      note.anchor.newRange,
-    );
+    frozen?.excerpt ?? excerptFor(file?.patch ?? "", note.anchor.oldRange, note.anchor.newRange);
   const body =
     note.markup ?? (note.rationale ? `${note.summary}\n\n${note.rationale}` : note.summary);
+  // A switch keeps the last mounted view authoritative until the replacement mounts.
+  const view = frozen?.view ?? (state._tag === "Switching" ? state.mounted : state.view);
   const saved: ReviewNote = {
     id: note.id,
     ...(note.parentId === undefined ? {} : { parentId: note.parentId }),
-    view: existing?.view ?? review.state.view,
+    view,
     revision,
-    path,
+    path: record.path,
     ...(previousPath === undefined ? {} : { previousPath }),
     ...(note.anchor.oldRange === undefined ? {} : { oldRange: note.anchor.oldRange }),
     ...(note.anchor.newRange === undefined ? {} : { newRange: note.anchor.newRange }),
@@ -291,7 +400,82 @@ function saveMutation(review: Review, note: ExtensionReviewSnapshotNote): void {
     body,
   };
   append(review, { _tag: "Upsert", note: saved });
-  review.notes.set(note.id, saved);
+  review.notes.set(note.id, {
+    _tag: "Saved",
+    fileId: record.fileId,
+    path: record.path,
+    frozen: frozen ?? {
+      view,
+      revision,
+      ...(previousPath === undefined ? {} : { previousPath }),
+      ...(excerpt === undefined ? {} : { excerpt }),
+    },
+  });
+}
+
+/**
+ * One reconciler per switch; the `Switching` state is its lock, so at most one reload is in
+ * flight. Every iteration reads the freshest request, which is what lets a newer request
+ * supersede the reload it arrived during instead of waiting behind it.
+ *
+ * The registration's signal is the other half of that lock: once it is aborted, this
+ * registration is stopped, so the reconciler neither writes the review nor speaks for it. The
+ * pending switch stays `Switching` for the registration that replaces this one.
+ */
+async function runSwitch(
+  review: Review,
+  context: ExtensionContext,
+  signal: AbortSignal,
+  attempted: View,
+  entry: SwitchEntry,
+): Promise<void> {
+  try {
+    const session = await ownedSession(review, signal);
+    // A resumed switch reloads before it can finish: the abandoned reload may have mounted its
+    // target, so the recorded view is only trustworthy once this reconciler has reloaded.
+    let trustMounted = entry._tag === "Known";
+    while (!signal.aborted && review.state._tag === "Switching") {
+      const state = review.state;
+      if (trustMounted && state.mounted === state.requested) {
+        review.state = { _tag: "Reviewing", view: state.mounted };
+        return;
+      }
+      trustMounted = true;
+      attempted = state.requested;
+      review.state = beginReload(state, attempted);
+      await control(review, signal, ["session", "reload", session, "--", attempted]);
+      if (signal.aborted) return;
+      review.state = confirmMount(review.state, attempted);
+    }
+  } catch (error) {
+    // A stopped registration must not rewrite the review or report on it: the next
+    // registration resumes the pending switch and confirms what actually mounted.
+    if (signal.aborted) return;
+    // A mounted replacement confirms a successful reload even if its CLI response was lost.
+    // Otherwise the previous review remains authoritative.
+    review.state = abandonSwitch(review.state);
+    try {
+      context.notify(`pi-hunk could not switch to ${attempted}: ${String(error)}`, "error");
+    } catch {
+      // A dying Hunk UI must not turn a reported switch failure into an exit.
+    }
+  }
+}
+
+function switchView(
+  review: Review,
+  target: View,
+  context: ExtensionContext,
+  signal: AbortSignal,
+): void {
+  const request = requestSwitch(review.state, target);
+  if (request._tag === "Ignored") return;
+  review.state = request.state;
+  // The reconciler reports its own failure through the review's notice; this callback must
+  // return to Hunk immediately.
+  if (request._tag === "Started") {
+    void runSwitch(review, context, signal, target, { _tag: "Known" });
+  }
 }
 
 export default function hunkBridge(hunk: HunkExtensionAPI): void {
@@ -320,23 +504,30 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     ownedReview = {
       launch,
       state: { _tag: "Reviewing", view: launch.view },
-      paths: new Map(),
-      renames: new Map(),
-      patches: new Map(),
+      session: { _tag: "Unknown" },
+      changeset: { _tag: "Absent" },
       notes: new Map(),
     };
   } else if (ownedReview.launch.journal !== launch.journal) {
     throw new Error("A Hunk process cannot own two pi-hunk review journals");
   }
   const review = ownedReview;
-  let instance: InstanceState = "Registered";
+  const navigation: Navigation =
+    launch.view === "log" ? { _tag: "History" } : { _tag: "SwitchableViews" };
+  let bridge: BridgeState = { _tag: "Registered" };
+  // This registration's act gate: shutdown aborts it, and every awaited step that belongs to
+  // the registration (session lookup, reload CLI, reconciler) observes it before acting.
+  const cancel = new AbortController();
   const prefix = compileHunkKey(launch.config.prefix);
   const diff = compileHunkKey(launch.config.diff);
   const show = compileHunkKey(launch.config.show);
   const log = compileHunkKey(launch.config.log);
 
   hunk.on("startup", (_event, context) => {
-    instance = "Running";
+    // Stopped is terminal: Hunk registers a replacement by importing the module again, so this
+    // registration never revives and none of its handlers may act.
+    if (bridge._tag === "Stopped") return;
+    bridge = { _tag: "Running" };
     try {
       if (review.state._tag === "Failed") {
         context.notify(review.state.message, "error");
@@ -346,40 +537,52 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     } catch (error) {
       failCapture(review, context, error);
     }
+    // A switch left pending by the registration this one replaced gets its reconciler back, and
+    // must reload before it can finish: the abandoned reload may have mounted its own target.
+    const state = review.state;
+    if (state._tag === "Switching") {
+      void runSwitch(review, context, cancel.signal, state.requested, { _tag: "Interrupted" });
+    }
   });
 
   hunk.on("changeset_loaded", ({ changeset }) => {
-    if (instance !== "Running" || review.state._tag === "Failed") return;
-    const view = review.state._tag === "Switching" ? review.state.target : review.state.view;
-    if (review.state._tag === "Switching") review.state.view = view;
-    review.renames.clear();
-    review.patches.clear();
-    for (const file of changeset.files) {
-      if (file.previousPath !== undefined) review.renames.set(file.id, file.previousPath);
-      review.patches.set(file.id, file.patch);
-    }
-    review.revision = resolveRevision(review.launch.cwd, view, changeset.title);
+    if (bridge._tag !== "Running") return;
+    const state = review.state;
+    if (state._tag === "Failed") return;
+    // The view Hunk just mounted: a reload in flight is mounting its target, otherwise the
+    // review is showing the stable view the last switch settled on.
+    const view = state._tag === "Switching" ? state.target : state.view;
+    review.state = confirmMount(state, view);
+    review.changeset = {
+      _tag: "Present",
+      revision: resolveRevision(review.launch.cwd, view, changeset.title),
+      files: new Map(
+        changeset.files.map((file): [string, ReviewedFile] => [
+          file.id,
+          {
+            patch: file.patch,
+            ...(file.previousPath === undefined ? {} : { previousPath: file.previousPath }),
+          },
+        ]),
+      ),
+    };
   });
 
   hunk.on("note_created", ({ note }) => {
-    if (instance === "Running" && !note.draft) {
-      review.paths.set(note.id, { path: note.filePath, fileId: note.fileId });
-    }
+    if (bridge._tag === "Running" && !note.draft) locateNote(review, note);
   });
   hunk.on("note_edited", ({ note }) => {
-    if (instance === "Running" && !note.draft) {
-      review.paths.set(note.id, { path: note.filePath, fileId: note.fileId });
-    }
+    if (bridge._tag === "Running" && !note.draft) locateNote(review, note);
   });
   hunk.on("note_changed", ({ kind, note }, context) => {
-    if (instance !== "Running" || review.state._tag === "Failed" || note.source !== "user") return;
+    const state = review.state;
+    if (bridge._tag !== "Running" || state._tag === "Failed" || note.source !== "user") return;
     try {
       if (kind === "removed") {
         append(review, { _tag: "Remove", id: note.id });
         review.notes.delete(note.id);
-        review.paths.delete(note.id);
       } else {
-        saveMutation(review, note);
+        saveMutation(review, state, note);
       }
     } catch (error) {
       failCapture(review, context, error);
@@ -390,12 +593,15 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     id: "prefix",
     title: "pi-hunk view",
     onKey(key, context) {
+      // A stopped registration no longer owns this mode: Hunk has torn it down, so it neither
+      // acts nor reports.
+      if (bridge._tag === "Stopped") return "pass";
       // Exit before passing unknown input through to native Hunk commands.
       // Escape is owned and canceled by Hunk before this callback runs.
       context.keyboardModes.exitMode();
-      if (launch.view === "log") {
+      if (navigation._tag === "History") {
         if (log.matches(key)) {
-          if (instance === "Running" && review.state._tag !== "Failed") {
+          if (bridge._tag === "Running" && review.state._tag !== "Failed") {
             context.commands.execute("hunk.app.quit");
           }
           return "handled";
@@ -411,14 +617,14 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
       }
       const target = diff.matches(key) ? "diff" : show.matches(key) ? "show" : undefined;
       if (!target) return "pass";
-      if (instance === "Running") switchView(review, target, context);
+      if (bridge._tag === "Running") switchView(review, target, context, cancel.signal);
       return "handled";
     },
   });
   hunk.registerCommand(
     { id: "prefix", title: "Choose pi-hunk view", key: prefix.bindings },
     (context) => {
-      if (instance !== "Running" || review.state._tag === "Failed") return;
+      if (bridge._tag !== "Running" || review.state._tag === "Failed") return;
       context.keyboardModes.enterMode("prefix");
     },
   );
@@ -426,6 +632,13 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   hunk.on("shutdown", () => {
     // Registry replacement is not review completion. No export, journal reset,
     // submission, or wait for the reload CLI under Hunk's 250ms deadline.
-    instance = "Stopped";
+    if (bridge._tag === "Stopped") return;
+    bridge = { _tag: "Stopped" };
+    // Teardown is terminal for this registration: its handlers are no-ops from here on, and
+    // aborting the signal stops the reconciler at its next step and kills its reload CLI. The
+    // review is left exactly as it is — a pending `Switching` is neither flattened to the view
+    // it came from nor reported as mounted, because only the replacing registration, reading
+    // the changeset Hunk reloads for it, can tell what actually mounted.
+    cancel.abort();
   });
 }

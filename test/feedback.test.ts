@@ -1,7 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vitest";
 import type { ReviewEvent, ReviewNote } from "../src/contract.js";
 import { readFeedback } from "../src/feedback.js";
@@ -19,7 +18,7 @@ async function collect(events: readonly ReviewEvent[], tail = ""): Promise<reado
   try {
     const path = join(directory, "notes.jsonl");
     await writeFile(path, `${events.map((event) => JSON.stringify(event)).join("\n")}\n${tail}`);
-    return await Effect.runPromise(readFeedback(path));
+    return await readFeedback(path);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
