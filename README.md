@@ -115,7 +115,9 @@ their new side is the working tree. Show and history comments record the reviewe
 parent, or the selected range, so old/new line ranges are read against those versions rather than
 today’s files, even if the code or file was later removed or renamed. Renames also record the file’s
 previous path. When Hunk’s revision cannot be verified with Git, the comment records Hunk’s own text
-as unresolved instead of guessing.
+as unresolved instead of guessing. Git verification runs in the background, so opening or switching
+a review renders immediately; a comment saved before that lookup finishes still records the revision
+on screen at that moment, never the previous one.
 
 The handoff is readable on its own. Comments are grouped by the exact revision they refer to, each
 shows its file, old and new lines, and the reviewed diff lines around the comment, and replies
