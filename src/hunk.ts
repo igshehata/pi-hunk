@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import * as Effect from "effect/Effect";
 import {
@@ -15,6 +15,7 @@ import {
   type ReviewEvent,
   type ReviewLaunch,
   type ReviewNote,
+  type Revision,
   type View,
 } from "./contract.js";
 import { parseConfig } from "./config.js";
@@ -30,9 +31,12 @@ interface Review {
   readonly launch: ReviewLaunch;
   state: ReviewState;
   sessionId?: string;
-  source?: ReviewNote["source"];
+  /** The revision of the currently loaded changeset; undefined until Hunk loads one. */
+  revision?: Revision;
   /** Public saved-note lifecycle payloads supply paths before note_changed fires. */
-  readonly paths: Map<string, string>;
+  readonly paths: Map<string, { readonly path: string; readonly fileId: string }>;
+  /** fileId → path in the loaded revision, for files Hunk reports as renamed. */
+  readonly renames: Map<string, string>;
   readonly notes: Map<string, ReviewNote>;
 }
 
@@ -63,6 +67,76 @@ function compileHunkKey(chord: string) {
 
 function append(review: Review, event: ReviewEvent): void {
   appendFileSync(review.launch.journal, `${JSON.stringify(event)}\n`, { encoding: "utf8" });
+}
+
+/** Full object ids: 40 hex for SHA-1 repositories, 64 for SHA-256 ones. */
+const GIT_OBJECT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+/** Run one git query in the reviewed repository; null when git cannot answer it. */
+function gitQuery(cwd: string, args: readonly string[]): string | null {
+  try {
+    const output = execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      timeout: 2_000,
+      maxBuffer: 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return output.length > 0 ? output : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve one revision to a full commit SHA, or null when git cannot name a commit. */
+function resolveCommit(cwd: string, revision: string): string | null {
+  const commit = gitQuery(cwd, ["rev-parse", "--verify", "--quiet", `${revision}^{commit}`]);
+  return commit !== null && GIT_OBJECT_ID.test(commit) ? commit : null;
+}
+
+/** True when `revision` names the empty tree, the base Hunk reports for a root commit. */
+function resolvesToEmptyTree(cwd: string, revision: string): boolean {
+  const empty = gitQuery(cwd, ["hash-object", "-t", "tree", "/dev/null"]);
+  if (empty === null) return false;
+  const lower = revision.toLowerCase();
+  if (lower === empty) return true;
+  // Hunk abbreviates history ids, and the empty tree is usually absent from the object
+  // database, so git cannot expand that abbreviation; match it by prefix instead.
+  if (lower.length >= 4 && /^[0-9a-f]+$/.test(lower) && empty.startsWith(lower)) return true;
+  return gitQuery(cwd, ["rev-parse", "--verify", "--quiet", `${revision}^{tree}`]) === empty;
+}
+
+/**
+ * Recover the reviewed revision from the display title Hunk reports with a changeset.
+ *
+ * The extension API exposes no structured revision on `changeset_loaded`, so the title
+ * is parsed and every id it names is verified with git in the reviewed repository.
+ * Hunk 0.24.1 emits `"<repo> show <ref>"` (the show view's `HEAD`, or a history
+ * selection of a single root commit) and `"<repo> <from>..<to>"` (a history range,
+ * where `from` is the empty tree when the selection reaches the root commit). Anything
+ * that does not resolve is recorded verbatim as `unresolved`; a SHA is never guessed.
+ */
+function resolveRevision(cwd: string, view: View, title: string): Revision {
+  if (view === "diff") return { kind: "working-tree" };
+  const unresolved: Revision = { kind: "unresolved", description: title };
+  const tokens = title.trim().split(/\s+/);
+  const target = tokens[tokens.length - 1];
+  if (!target) return unresolved;
+  const separator = target.indexOf("..");
+  if (separator >= 0) {
+    const to = resolveCommit(cwd, target.slice(separator + 2));
+    if (to === null) return unresolved;
+    const fromToken = target.slice(0, separator);
+    if (fromToken.length === 0) return { kind: "range", to };
+    const from = resolveCommit(cwd, fromToken);
+    if (from !== null) return { kind: "range", from, to };
+    return resolvesToEmptyTree(cwd, fromToken) ? { kind: "range", to } : unresolved;
+  }
+  if (tokens[tokens.length - 2] !== "show") return unresolved;
+  const commit = resolveCommit(cwd, target);
+  if (commit === null) return unresolved;
+  const parent = resolveCommit(cwd, `${commit}^1`);
+  return { kind: "commit", commit, ...(parent === null ? {} : { parent }) };
 }
 
 function failCapture(review: Review, context: ExtensionContext, error: unknown): void {
@@ -182,16 +256,23 @@ function switchView(review: Review, target: View, context: ExtensionContext): vo
 function saveMutation(review: Review, note: ExtensionReviewSnapshotNote): void {
   if (review.state._tag === "Failed") return;
   const existing = review.notes.get(note.id);
-  const path = review.paths.get(note.id) ?? existing?.path;
+  const target = review.paths.get(note.id);
+  const path = target?.path ?? existing?.path;
   if (!path) throw new Error(`Hunk did not provide a public file path for saved note ${note.id}`);
+  // A comment keeps the revision it was first saved against, even after the review reloads.
+  const revision = existing?.revision ?? review.revision;
+  if (!revision) throw new Error(`Hunk loaded no reviewed revision before saved note ${note.id}`);
+  const previousPath =
+    existing?.previousPath ?? (target ? review.renames.get(target.fileId) : undefined);
   const body =
     note.markup ?? (note.rationale ? `${note.summary}\n\n${note.rationale}` : note.summary);
   const saved: ReviewNote = {
     id: note.id,
     ...(note.parentId === undefined ? {} : { parentId: note.parentId }),
     view: existing?.view ?? review.state.view,
+    revision,
     path,
-    ...((existing?.source ?? review.source) ? { source: existing?.source ?? review.source } : {}),
+    ...(previousPath === undefined ? {} : { previousPath }),
     ...(note.anchor.oldRange === undefined ? {} : { oldRange: note.anchor.oldRange }),
     ...(note.anchor.newRange === undefined ? {} : { newRange: note.anchor.newRange }),
     body,
@@ -227,6 +308,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
       launch,
       state: { _tag: "Reviewing", view: launch.view },
       paths: new Map(),
+      renames: new Map(),
       notes: new Map(),
     };
   } else if (ownedReview.launch.journal !== launch.journal) {
@@ -253,19 +335,25 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   });
 
   hunk.on("changeset_loaded", ({ changeset }) => {
-    if (instance === "Running" && launch.view === "log") {
-      review.source = { title: changeset.title, label: changeset.sourceLabel };
+    if (instance !== "Running" || review.state._tag === "Failed") return;
+    const view = review.state._tag === "Switching" ? review.state.target : review.state.view;
+    if (review.state._tag === "Switching") review.state.view = view;
+    review.renames.clear();
+    for (const file of changeset.files) {
+      if (file.previousPath !== undefined) review.renames.set(file.id, file.previousPath);
     }
-    if (instance === "Running" && review.state._tag === "Switching") {
-      review.state.view = review.state.target;
-    }
+    review.revision = resolveRevision(review.launch.cwd, view, changeset.title);
   });
 
   hunk.on("note_created", ({ note }) => {
-    if (instance === "Running" && !note.draft) review.paths.set(note.id, note.filePath);
+    if (instance === "Running" && !note.draft) {
+      review.paths.set(note.id, { path: note.filePath, fileId: note.fileId });
+    }
   });
   hunk.on("note_edited", ({ note }) => {
-    if (instance === "Running" && !note.draft) review.paths.set(note.id, note.filePath);
+    if (instance === "Running" && !note.draft) {
+      review.paths.set(note.id, { path: note.filePath, fileId: note.fileId });
+    }
   });
   hunk.on("note_changed", ({ kind, note }, context) => {
     if (instance !== "Running" || review.state._tag === "Failed" || note.source !== "user") return;

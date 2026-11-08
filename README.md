@@ -78,11 +78,11 @@ remount this extension; use a full restart.
 
 Press the prefix, release it, then press the view key:
 
-| Keys                                                  | Opens                             |
-| ----------------------------------------------------- | --------------------------------- |
-| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>h</kbd> | Working-tree changes: `hunk diff` |
-| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>s</kbd> | Latest commit: `hunk show`        |
-| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>l</kbd> | Native history: `hunk log`        |
+| Keys                                                  | Opens                              |
+| ----------------------------------------------------- | ---------------------------------- |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>h</kbd> | Index vs working tree: `hunk diff` |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>s</kbd> | Latest commit: `hunk show`         |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>l</kbd> | Native history: `hunk log`         |
 
 1. **Open a view** from your agent’s terminal.
 2. **Review and save comments** using Hunk’s normal controls.
@@ -102,10 +102,14 @@ Launch `hunk log` with the log chord **from the agent’s terminal**. History ke
 controls: select commits or a range, then press <kbd>Enter</kbd> to review them. On the selected
 review’s main screen, the log chord acts like native <kbd>q</kbd>: it returns to the retained
 history screen without closing Hunk or handing off comments. Quit history to submit the saved
-comments from all selections together. History comments include Hunk’s original changeset title and
-source label, alongside their file and line context. For Git history, the recorded range identifies
-the reviewed versions even if the code or file was later removed. The agent is instructed to inspect
-that historical diff: old/new line ranges belong to its before/after versions, not today's files.
+comments from all selections together. Every saved comment records the exact revision its line
+numbers refer to, as full commit SHAs; a comment keeps that revision if it is edited later. Diff
+comments record the index and the working tree—their old side is the index (staged content) and
+their new side is the working tree. Show and history comments record the reviewed commit and its
+parent, or the selected range, so old/new line ranges are read against those versions rather than
+today’s files, even if the code or file was later removed or renamed. Renames also record the file’s
+previous path. When Hunk’s revision cannot be verified with Git, the comment records Hunk’s own text
+as unresolved instead of guessing.
 
 The prefix is not active on the history screen. Diff/show switching is intentionally unavailable
 inside history-selected reviews; those chords show a notice and leave the selection unchanged. The

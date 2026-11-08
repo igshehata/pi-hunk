@@ -55,5 +55,5 @@ export function readFeedback(journal: string): Effect.Effect<readonly ReviewNote
 }
 
 export function formatFeedback(notes: readonly ReviewNote[]): string {
-  return `Hunk review comments:\n\n${JSON.stringify(notes, null, 2)}\n\nAddress every comment. Use its view, original source context when present, file path, and line ranges to locate the reviewed code. For log comments in a Git repository, inspect the recorded range with Git: oldRange and newRange refer to its before and after versions, not today's files. Check whether the concern still applies before changing current code.`;
+  return `Hunk review comments:\n\n${JSON.stringify(notes, null, 2)}\n\nAddress every comment. Its revision says exactly which code version its line ranges refer to. working-tree: oldRange is the index (staged content) and newRange is the working tree. commit: oldRange is the parent (none for a root commit) and newRange is the commit; commit and parent are full SHAs. range: oldRange is from (the empty tree when absent) and newRange is to; from and to are full SHAs. unresolved: Hunk's revision could not be verified, and description is Hunk's exact text. Those versions are not today's files: inspect them with Git before changing current code. Check whether the concern still applies before changing current code.`;
 }

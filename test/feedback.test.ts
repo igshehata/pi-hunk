@@ -9,6 +9,7 @@ import { readFeedback } from "../src/feedback.js";
 const original: ReviewNote = {
   id: "first",
   view: "diff",
+  revision: { kind: "working-tree" },
   path: "working.ts",
   body: "Original comment",
 };
@@ -31,7 +32,13 @@ describe("saved review feedback", () => {
       { _tag: "Upsert", note: original },
       {
         _tag: "Upsert",
-        note: { id: "removed", view: "show", path: "committed.ts", body: "Remove me" },
+        note: {
+          id: "removed",
+          view: "show",
+          revision: { kind: "commit", commit: "a".repeat(40) },
+          path: "committed.ts",
+          body: "Remove me",
+        },
       },
       { _tag: "Upsert", note: { ...original, body: "Edited comment" } },
       { _tag: "Ready" },
