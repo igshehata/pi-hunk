@@ -131,6 +131,10 @@ from the agent.
 reply whose comment was deleted is marked as such, and closing an empty review sends no message.
 Each new review starts fresh.
 
+Starting a new session while a review is open waits for Hunk to close, then sets up the new session.
+If pi-hunk cannot verify that Hunk’s process tree has exited, it reports that cleanup failure and
+still sets up the new session; close any leftover `hunk` process yourself.
+
 ## Configure
 
 No configuration is required. Run **`/hunk config`** in Pi or OMP to open the host’s native
