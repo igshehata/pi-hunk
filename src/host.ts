@@ -1,7 +1,8 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { writeSync } from "node:fs";
+import { access, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { editConfig, type ConfigUI } from "./config-ui.js";
@@ -146,6 +147,57 @@ class HunkTeardownError extends Error {
 
 const HUNK_INSTALL =
   "Install Hunk 0.22.0 or newer from https://hunk.dev; pi-hunk does not install or upgrade Hunk.";
+
+/** Journals a `stop()` took over, each named once by the first hook that has the terminal back. */
+const abandoned = new Set<string>();
+let abandonedHook = false;
+
+/**
+ * Writes the recovery notices to stderr, the one channel that survives the host TUI: a `ui.notify`
+ * raised after the TUI is gone can never render. `stop()` can end a review while the TUI is gone
+ * (Pi: the notice waits for the `exit` handler, once the terminal is restored) or still closing
+ * (OMP: the host reports after its shutdown handler resolves). Whichever runs first drains the set.
+ */
+function flushAbandoned(): void {
+  if (abandoned.size === 0) return;
+  const notices = [...abandoned].map(
+    (path) => `pi-hunk: the Hunk review ended without handoff; your comments are saved at ${path}`,
+  );
+  abandoned.clear();
+  try {
+    writeSync(2, `\n${notices.join("\n")}\n`);
+  } catch {
+    // A terminal that is already gone loses the notice; the journals themselves stay on disk.
+  }
+}
+
+/** Remembers an abandoned journal until a hook with a restored terminal can name it. */
+function announce(journal: string): void {
+  abandoned.add(journal);
+  if (abandonedHook) return;
+  abandonedHook = true;
+  process.on("exit", flushAbandoned);
+}
+
+/**
+ * Ends a review `stop()` took over. The child is already closed, so its journal is final: one that
+ * captured comments (or failed partway) is kept and named, because it is the only copy of them. One
+ * that captured nothing is discarded exactly as an empty review is on a normal close.
+ */
+async function abandonReview(recovery: Recovery): Promise<void> {
+  if (recovery._tag !== "Journaled") return;
+  const { journal } = recovery;
+  const notes = await readFeedback(journal).catch(() => undefined);
+  const captured =
+    notes === undefined
+      ? await stat(journal).then(
+          (info) => info.size > 0,
+          () => false,
+        )
+      : notes.length > 0;
+  if (captured) announce(journal);
+  else await rm(dirname(journal), { recursive: true }).catch(() => {});
+}
 
 /**
  * Waits `ms`, returning as soon as `signal` aborts. Callers re-check `signal.aborted`; an abort is
@@ -781,7 +833,11 @@ export function createHost(bindings: HostBindings) {
           // A dying host UI must not turn a reported teardown warning into an exit.
         }
       }
-      if (outcome._tag === "Cancelled") return { _tag: "Finished" };
+      if (outcome._tag === "Cancelled") {
+        // `stop()` ended the review; nothing was handed off, so the journal is the only copy.
+        await abandonReview(recovery);
+        return { _tag: "Finished" };
+      }
       if (outcome._tag === "Failed") throw outcome.error;
       const childExit = outcome.exit;
       if (childExit._tag === "SpawnError") throw childExit.error;
@@ -796,7 +852,10 @@ export function createHost(bindings: HostBindings) {
           "warning",
         );
       const notes = await readFeedback(journal, signal);
-      if (!active()) return { _tag: "Finished" };
+      if (!active()) {
+        await abandonReview(recovery);
+        return { _tag: "Finished" };
+      }
       if (notes.length === 0) {
         if (!abnormal) await rm(directory, { recursive: true });
         return { _tag: "Finished" };
@@ -807,7 +866,10 @@ export function createHost(bindings: HostBindings) {
         session.ctx.abort();
         while (!session.ctx.isIdle() && !signal.aborted) await idleTick(20, signal);
       }
-      if (!active()) return { _tag: "Finished" };
+      if (!active()) {
+        await abandonReview(recovery);
+        return { _tag: "Finished" };
+      }
       const message = formatFeedback(notes);
       if (session.ctx.isIdle()) bindings.sendUserMessage(message);
       else
@@ -819,7 +881,8 @@ export function createHost(bindings: HostBindings) {
       return { _tag: "Finished" };
     } catch (error) {
       const failure = asError(error);
-      if (active())
+      if (!active()) await abandonReview(recovery);
+      else
         session.ctx.ui.notify(
           `Hunk review failed: ${failure.message}${recovery._tag === "Journaled" ? `\nRecovery: ${recovery.journal}` : ""}`,
           "error",
@@ -930,5 +993,7 @@ export function createHost(bindings: HostBindings) {
       request = { _tag: "Stop" };
       return stopCurrent();
     },
+    /** OMP restores the terminal after its shutdown handler, so it reports once `stop` settles. */
+    announceAbandoned: flushAbandoned,
   };
 }
