@@ -33,13 +33,13 @@
     "access": "public"
   },
   "scripts": {
-    "audit": "npm audit --audit-level=high",
+    "audit": "bun audit --audit-level=high",
     "build": "node scripts/build.mjs",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm ls --depth=0 && npm test && npm run build && npm run verify:package",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun install --frozen-lockfile --dry-run --no-progress && bun run test && bun run build && bun run verify:package",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
-    "prepare": "npm run build",
+    "prepare": "bun run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
@@ -86,7 +86,7 @@
   "engines": {
     "node": ">=22.19.0"
   },
-  "packageManager": "npm@11.17.0",
+  "packageManager": "bun@1.4.4",
   "omp": {
     "extensions": [
       "./dist/omp.js"

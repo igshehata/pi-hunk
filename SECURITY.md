@@ -26,13 +26,14 @@ disclosure before publishing details.
 
 ## Dependency intake
 
-Repository npm installs enforce a seven-day minimum release age through `.npmrc`. New dependency
-versions therefore become eligible only after they have been public for seven days; `npm ci` remains
-reproducible from the reviewed lockfile. Maintainers can run `npm run audit` when reviewing
-dependency security without blocking unrelated CI changes.
+Repository installs run through Bun and enforce a seven-day minimum release age through
+`bunfig.toml`. New dependency versions therefore become eligible only after they have been public
+for seven days; `bun install --frozen-lockfile` remains reproducible from the reviewed lockfile.
+Maintainers can run `bun run audit` when reviewing dependency security without blocking unrelated CI
+changes.
 
 For an urgent security fix that is newer than the waiting period, a maintainer may explicitly run
-`npm install --min-release-age=0 <package>@<version>`, review the package and lockfile changes, and
+`bun add --minimum-release-age=0 <package>@<version>`, review the package and lockfile changes, and
 record why the exception was necessary in the pull request. The release-age policy must not be
 removed globally to land one emergency update.
 
