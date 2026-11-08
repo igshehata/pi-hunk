@@ -19,6 +19,7 @@ import {
   type View,
 } from "./contract.js";
 import { parseConfig } from "./config.js";
+import { excerptFor } from "./excerpt.js";
 
 type ReviewState =
   | { readonly _tag: "Reviewing"; readonly view: View }
@@ -37,6 +38,8 @@ interface Review {
   readonly paths: Map<string, { readonly path: string; readonly fileId: string }>;
   /** fileId → path in the loaded revision, for files Hunk reports as renamed. */
   readonly renames: Map<string, string>;
+  /** fileId → that file's exact patch in the loaded revision. */
+  readonly patches: Map<string, string>;
   readonly notes: Map<string, ReviewNote>;
 }
 
@@ -264,6 +267,15 @@ function saveMutation(review: Review, note: ExtensionReviewSnapshotNote): void {
   if (!revision) throw new Error(`Hunk loaded no reviewed revision before saved note ${note.id}`);
   const previousPath =
     existing?.previousPath ?? (target ? review.renames.get(target.fileId) : undefined);
+  // Like revisions, excerpts are fixed when a note is first saved: a later reload
+  // must not rewrite the evidence for a comment that already exists.
+  const excerpt =
+    existing?.excerpt ??
+    excerptFor(
+      (target ? review.patches.get(target.fileId) : undefined) ?? "",
+      note.anchor.oldRange,
+      note.anchor.newRange,
+    );
   const body =
     note.markup ?? (note.rationale ? `${note.summary}\n\n${note.rationale}` : note.summary);
   const saved: ReviewNote = {
@@ -275,6 +287,7 @@ function saveMutation(review: Review, note: ExtensionReviewSnapshotNote): void {
     ...(previousPath === undefined ? {} : { previousPath }),
     ...(note.anchor.oldRange === undefined ? {} : { oldRange: note.anchor.oldRange }),
     ...(note.anchor.newRange === undefined ? {} : { newRange: note.anchor.newRange }),
+    ...(excerpt === undefined ? {} : { excerpt }),
     body,
   };
   append(review, { _tag: "Upsert", note: saved });
@@ -309,6 +322,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
       state: { _tag: "Reviewing", view: launch.view },
       paths: new Map(),
       renames: new Map(),
+      patches: new Map(),
       notes: new Map(),
     };
   } else if (ownedReview.launch.journal !== launch.journal) {
@@ -339,8 +353,10 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     const view = review.state._tag === "Switching" ? review.state.target : review.state.view;
     if (review.state._tag === "Switching") review.state.view = view;
     review.renames.clear();
+    review.patches.clear();
     for (const file of changeset.files) {
       if (file.previousPath !== undefined) review.renames.set(file.id, file.previousPath);
+      review.patches.set(file.id, file.patch);
     }
     review.revision = resolveRevision(review.launch.cwd, view, changeset.title);
   });
