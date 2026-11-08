@@ -167,6 +167,13 @@ Every field is optional; omitted fields keep the defaults above. For example, `"
 must differ, and `escape` is reserved for canceling the prefix. Invalid configuration is reported,
 not silently repaired.
 
+A field this build does not know — for example one a newer release added, before you rolled back —
+is reported by name and ignored, and every setting it does understand still applies. Save rewrites
+the file with the known settings only. A file that cannot be parsed, or whose known field has an
+invalid value, keeps Hunk switched off and names the file, the error, and the next step in the
+startup notice. `/hunk config` still opens in that state: it starts from the defaults and says so,
+**Save** replaces the broken file with a valid one, and **Cancel** leaves it exactly as it was.
+
 If an existing configuration uses `l` for diff or show, set `log` to a different key when upgrading;
 the new default log trigger must not collide with either existing trigger.
 

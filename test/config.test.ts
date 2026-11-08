@@ -1,9 +1,9 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { matchesKey, type KeyId } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
-import { loadConfig, parseConfig, saveConfig } from "../src/config.js";
+import { DEFAULT_CONFIG, loadConfig, parseConfig, saveConfig } from "../src/config.js";
 
 describe("shared shortcut configuration", () => {
   it("rejects literal and modified symbols Pi cannot bind", () => {
@@ -28,7 +28,7 @@ describe("shared shortcut configuration", () => {
   });
 
   it("preserves literal symbols and uppercase trigger semantics", () => {
-    const config = parseConfig({ prefix: "ctrl+g", diff: "!", show: "H" });
+    const { config } = parseConfig({ prefix: "ctrl+g", diff: "!", show: "H" });
     expect(matchesKey("\u0007", config.prefix as KeyId)).toBe(true);
     expect(matchesKey("!", config.diff as KeyId)).toBe(true);
     expect(matchesKey("H", config.show as KeyId)).toBe(true);
@@ -48,7 +48,28 @@ describe("host-global configuration persistence", () => {
         delivery: "followUp",
       });
       await expect(saveConfig(path, { ...saved, diff: saved.show })).rejects.toThrow(Error);
-      expect(await loadConfig(path)).toEqual(saved);
+      expect(await loadConfig(path)).toEqual({ _tag: "Loaded", config: saved, ignored: [] });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  // Guards the bug where one field a newer build wrote disabled every known setting and made
+  // `/hunk config` fail on the same file, leaving hand-editing as the only recovery.
+  it("applies known settings beside an unknown field and reports the field", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-hunk-config-test-"));
+    const path = join(directory, "pi-hunk.json");
+    try {
+      await writeFile(
+        path,
+        `${JSON.stringify({ diff: "d", delivery: "followUp", theme: "dark" })}\n`,
+      );
+      const loaded = await loadConfig(path);
+      expect(loaded).toEqual({
+        _tag: "Loaded",
+        config: { ...DEFAULT_CONFIG, diff: "d", delivery: "followUp" },
+        ignored: ["theme"],
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

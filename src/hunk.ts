@@ -494,11 +494,12 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   ) {
     throw new Error("Invalid pi-hunk review launch");
   }
+  const { config } = parseConfig(parsed.config);
   const launch: ReviewLaunch = {
     journal: parsed.journal,
     cwd: parsed.cwd,
     view: parsed.view,
-    config: parseConfig(parsed.config),
+    config,
   };
   if (!ownedReview) {
     ownedReview = {
