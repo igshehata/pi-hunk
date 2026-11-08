@@ -187,14 +187,14 @@ function announce(journal: string): void {
 async function abandonReview(recovery: Recovery): Promise<void> {
   if (recovery._tag !== "Journaled") return;
   const { journal } = recovery;
-  const notes = await readFeedback(journal).catch(() => undefined);
+  const read = await readFeedback(journal).catch(() => undefined);
   const captured =
-    notes === undefined
+    read === undefined
       ? await stat(journal).then(
           (info) => info.size > 0,
           () => false,
         )
-      : notes.length > 0;
+      : read.notes.length > 0 || read.uncommitted !== undefined;
   if (captured) announce(journal);
   else await rm(dirname(journal), { recursive: true }).catch(() => {});
 }
@@ -851,13 +851,24 @@ export function createHost(bindings: HostBindings) {
           `Hunk exited ${childExit.signal ?? `with code ${childExit.code}`}; saved comments will still be handed off. Recovery: ${journal}`,
           "warning",
         );
-      const notes = await readFeedback(journal, signal);
+      const read = await readFeedback(journal, signal);
       if (!active()) {
         await abandonReview(recovery);
         return { _tag: "Finished" };
       }
+      const { notes, uncommitted } = read;
+      // An interrupted append costs only that record; say which one and what still survived.
+      if (uncommitted !== undefined)
+        session.ctx.ui.notify(
+          `Hunk journal ${journal} ends with an unfinished record (line ${uncommitted.line}), which was not replayed. ${
+            notes.length === 0
+              ? "No comment was captured; the journal is kept for recovery."
+              : `${notes.length} saved comment(s) were handed off; the newest saved change may be missing.`
+          }`,
+          "warning",
+        );
       if (notes.length === 0) {
-        if (!abnormal) await rm(directory, { recursive: true });
+        if (!abnormal && uncommitted === undefined) await rm(directory, { recursive: true });
         return { _tag: "Finished" };
       }
       if (!session.ctx.isIdle() && session.config.delivery === "interrupt") {

@@ -97,7 +97,7 @@ describe("review launch config boundary", () => {
         },
         context,
       );
-      const notes = await readFeedback(journal);
+      const { notes } = await readFeedback(journal);
       expect(notes).toEqual([
         {
           id: "note-1",

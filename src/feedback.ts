@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { open } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import type { ReviewEvent, ReviewNote, Revision } from "./contract.js";
 
@@ -39,24 +40,89 @@ function recordedNotes(state: JournalState): readonly ReviewNote[] {
   return [...state.notes.values()];
 }
 
-export async function readFeedback(
-  journal: string,
-  signal?: AbortSignal,
-): Promise<readonly ReviewNote[]> {
+/** A record whose append never finished: a kill or full disk, not repository garbage. */
+export interface UncommittedRecord {
+  /** 1-based line number in the journal. */
+  readonly line: number;
+  /** The partial text that could not be replayed. */
+  readonly text: string;
+}
+
+/** The committed notes plus, at most, the one record an interrupted append left behind. */
+export interface FeedbackRead {
+  readonly notes: readonly ReviewNote[];
+  readonly uncommitted?: UncommittedRecord;
+}
+
+/**
+ * Readline hands back a final line whether or not it was terminated, and only the file itself
+ * knows which: an unterminated last line is an append that never completed and was never a
+ * record the bridge committed to.
+ */
+async function endsWithNewline(journal: string): Promise<boolean> {
+  const handle = await open(journal, "r");
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) return true;
+    const last = Buffer.alloc(1);
+    const { bytesRead } = await handle.read(last, 0, 1, size - 1);
+    return bytesRead === 0 || last[0] === 0x0a;
+  } finally {
+    await handle.close();
+  }
+}
+
+function journalFailure(journal: string, error: unknown): Error {
+  return new Error(
+    `Cannot collect review feedback from ${journal}: ${error instanceof Error ? error.message : String(error)}`,
+  );
+}
+
+export async function readFeedback(journal: string, signal?: AbortSignal): Promise<FeedbackRead> {
+  // Settled before the stream exists: a readline interface created ahead of an await can miss the
+  // end of a short journal, and every answer below depends on whether the file ended with a newline.
+  let terminated: boolean;
+  try {
+    terminated = await endsWithNewline(journal);
+  } catch (error) {
+    throw journalFailure(journal, error);
+  }
   const stream = createReadStream(journal, { encoding: "utf8", signal });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   try {
     let state: JournalState = { _tag: "AwaitingBridge" };
-    for await (const line of lines) {
-      if (line.length === 0) continue;
-      const event = JSON.parse(line) as ReviewEvent;
-      state = replay(state, event);
+    let uncommitted: UncommittedRecord | undefined;
+    // One record is held back so the last line of the file is known to be the last line.
+    let held: { readonly line: number; readonly text: string } | undefined;
+    let position = 0;
+    const commit = (entry: { readonly line: number; readonly text: string }): void => {
+      if (entry.text.length === 0) return;
+      state = replay(state, JSON.parse(entry.text) as ReviewEvent);
+    };
+    for await (const text of lines) {
+      position += 1;
+      if (held !== undefined) commit(held);
+      held = { line: position, text };
     }
-    return recordedNotes(state);
+    if (held !== undefined && held.text.length > 0) {
+      if (terminated) commit(held);
+      else {
+        // Only an unparsable final record is tolerated. A parseable one still replays, so a
+        // journaled Failure keeps rejecting the review, and mid-file garbage keeps failing.
+        let event: ReviewEvent | undefined;
+        try {
+          event = JSON.parse(held.text) as ReviewEvent;
+        } catch {
+          event = undefined;
+        }
+        if (event === undefined) uncommitted = { line: held.line, text: held.text };
+        else state = replay(state, event);
+      }
+    }
+    const notes = recordedNotes(state);
+    return uncommitted === undefined ? { notes } : { notes, uncommitted };
   } catch (error) {
-    throw new Error(
-      `Cannot collect review feedback from ${journal}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    throw journalFailure(journal, error);
   } finally {
     lines.close();
     stream.destroy();
