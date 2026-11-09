@@ -707,10 +707,11 @@ async function runChild(
   }
   // A crash or kill skips Hunk's own restore: give the screen back before restarting the host.
   if (endedWithoutRestore(outcome)) undoHunkTerminal();
-  // A review the host's own shutdown cancelled leaves the terminal to the host, which restores
-  // it right after this settles. Starting the TUI here would make it query the terminal while
-  // that restore is already in flight: the reply arrives once the shell owns the tty again and
-  // the line discipline echoes it. Every other ending (a close, a session switch) restarts it.
+  // A review cancelled because the host process is quitting leaves the terminal to the host, which
+  // restores it right after this settles. Starting the TUI here would make it query the terminal
+  // while that restore is already in flight: the reply arrives once the shell owns the tty again
+  // and the line discipline echoes it. Every other ending (a close, a session replacement)
+  // restarts it, because the host keeps running and needs its UI back.
   if (!hostClosing()) {
     tui.start();
     tui.requestRender(true);
@@ -747,9 +748,9 @@ export function createHost(bindings: HostBindings) {
   /** Journal of the review that is open right now; only an interrupted review falls back to it. */
   let pendingJournal: string | undefined;
   /**
-   * True between the host's `stop()` and a later `start()`: the host is leaving and restores the
-   * terminal itself, so a review cancelled now must not start the host TUI again. `start()` clears
-   * it, because a host that keeps running after a `stop()` (a session replacement) owns a live TUI.
+   * True once the host process is quitting (its quit shutdown, or SIGINT during a review): the host
+   * restores the terminal itself, so a review cancelled now must not start the host TUI again. A
+   * session replacement is not quitting: the process keeps its live TUI. `start()` clears it.
    */
   let hostClosing = false;
 
@@ -822,6 +823,8 @@ export function createHost(bindings: HostBindings) {
         return;
       }
       ending = true;
+      // The signal is re-raised once the review is closed, so this process is leaving.
+      hostClosing = true;
       void Promise.race([stopCurrent().catch(() => undefined), delay(INTERRUPT_GRACE_MS)]).then(
         release,
       );
@@ -1142,9 +1145,10 @@ export function createHost(bindings: HostBindings) {
           : null,
       handler: configure,
     },
-    stop: () => {
+    /** `quitting`: the process is exiting, not replacing its session. */
+    stop: (quitting: boolean) => {
       request = { _tag: "Stop" };
-      hostClosing = true;
+      hostClosing = quitting;
       return stopCurrent();
     },
     /** OMP restores the terminal after its shutdown handler, so it reports once `stop` settles. */
