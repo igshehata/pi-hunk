@@ -392,23 +392,32 @@ function locateNote(review: Review, note: ExtensionReviewNote): void {
 
 /**
  * Terminal transition of the capture lifecycle: the first failure becomes the journal's
- * `Failure` event, the one error notice the user sees, and exit code 74. A later failure keeps
- * the first message, and every handler stops capturing once the review is `Failed`.
+ * `Failure` event and the one error notice the user sees. A later failure keeps the first
+ * message, and every handler stops capturing once the review is `Failed`.
+ *
+ * Hunk stays open: the failure is already recorded, so the host refuses to submit the journal
+ * when Hunk closes, and exiting here would drop the review (drafts included) mid-render and
+ * leave the terminal in Hunk's alternate screen. Only a journal that cannot record the failure
+ * itself leaves through exit code 74, because a partial journal would otherwise look
+ * submittable.
  */
 function failCapture(review: Review, context: ExtensionContext, error: unknown): void {
   if (review.state._tag === "Failed") return;
   const message = `pi-hunk cannot capture review feedback: ${error instanceof Error ? error.message : String(error)}`;
   review.state = { _tag: "Failed", message };
+  let recorded = false;
   try {
     append(review, { _tag: "Failure", message });
-  } finally {
-    try {
-      context.notify(message, "error");
-    } finally {
-      // Even a full/unwritable disk must not turn a partial journal into a submission.
-      process.exit(CAPTURE_FAILURE_EXIT_CODE);
-    }
+    recorded = true;
+  } catch {
+    // The journal cannot name the cause, so the host could still read it as a complete review.
   }
+  try {
+    context.notify(message, "error");
+  } catch {
+    // A dying Hunk UI must not turn a reported capture failure into an exit of its own.
+  }
+  if (!recorded) process.exit(CAPTURE_FAILURE_EXIT_CODE);
 }
 
 async function saveMutation(
