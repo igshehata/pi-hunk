@@ -202,6 +202,12 @@ that happens. An interrupt (<kbd>Ctrl</kbd> + <kbd>C</kbd>) counts as a stop: pi
 prints the journal path, and the host exits the way it would without the review. Journals contain
 comment text and file paths; treat them as local review data.
 
+A journal is appended one record at a time, so a kill or a full disk can leave the last record
+half-written. That unfinished final record is reported by journal path and line number and skipped;
+every comment saved before it is still handed off. A corrupt record that did reach disk completely,
+or a capture failure the bridge recorded, still rejects the whole review rather than handing off a
+partial one.
+
 ## Development
 
 After changing runtime source, run `bun run build` and restart your host. To run formatting, lint,
