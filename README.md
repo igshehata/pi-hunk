@@ -186,6 +186,10 @@ still requires a full host restart—OMP’s `/reload` is not enough. If your OS
 When the agent is already idle, all three modes send feedback as a new user message and start a
 turn.
 
+An interrupt waits up to 30 seconds for the aborted turn to become idle. If the turn does not stop
+in time, the feedback is queued as a follow-up and the journal path is reported, so the comments are
+never dropped and the review keys come back.
+
 ### Recovering feedback
 
 Nonempty reviews retain a local temporary journal, including after handoff: calling the host’s send

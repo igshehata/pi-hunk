@@ -148,6 +148,9 @@ class HunkTeardownError extends Error {
 const HUNK_INSTALL =
   "Install Hunk 0.22.0 or newer from https://hunk.dev; pi-hunk does not install or upgrade Hunk.";
 
+/** How long `interrupt` delivery waits for the aborted turn to become idle before queueing. */
+const INTERRUPT_IDLE_TIMEOUT_MS = 30_000;
+
 /** Journals a `stop()` took over, each named once by the first hook that has the terminal back. */
 const abandoned = new Set<string>();
 let abandonedHook = false;
@@ -913,7 +916,25 @@ export function createHost(bindings: HostBindings) {
         // Native abort returns void. In particular Pi restores prior queues to
         // its composer; we neither await abort nor replace those native semantics.
         session.ctx.abort();
-        while (!session.ctx.isIdle() && !signal.aborted) await idleTick(20, signal);
+        // An abort that never makes the session idle must not leave the review silent and the
+        // keyboard unowned: the wait is bounded and says what it is waiting for.
+        const deadline = Date.now() + INTERRUPT_IDLE_TIMEOUT_MS;
+        let announced = false;
+        while (!session.ctx.isIdle() && !signal.aborted && Date.now() < deadline) {
+          if (!announced) {
+            announced = true;
+            session.ctx.ui.notify(
+              "Hunk review: interrupting the current turn; waiting for the agent to become idle.",
+              "info",
+            );
+          }
+          await idleTick(20, signal);
+        }
+        if (!session.ctx.isIdle() && !signal.aborted)
+          session.ctx.ui.notify(
+            `Hunk review: the agent is still busy after interrupting; the comments were queued as a follow-up. Recovery: ${journal}`,
+            "warning",
+          );
       }
       if (!active()) {
         await abandonReview(recovery);
@@ -923,7 +944,9 @@ export function createHost(bindings: HostBindings) {
       if (session.ctx.isIdle()) bindings.sendUserMessage(message);
       else
         bindings.sendUserMessage(message, {
-          deliverAs: session.config.delivery === "followUp" ? "followUp" : "steer",
+          // An interrupt that timed out falls back to the follow-up queue; comments are never
+          // dropped because the turn did not stop.
+          deliverAs: session.config.delivery === "steer" ? "steer" : "followUp",
         });
       // Native sendUserMessage returns void and hides asynchronous failures.
       // Retain recovery rather than treating call acceptance as a receipt.
