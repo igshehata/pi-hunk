@@ -668,16 +668,24 @@ async function runChild(
   bridge: string,
   signal: AbortSignal,
   warn: (message: string) => void,
+  hostClosing: () => boolean,
 ): Promise<ReviewOutcome> {
+  let outcome: ReviewOutcome;
   try {
     tui.stop();
-    return await ownChild(launch, bridge, signal, warn);
+    outcome = await ownChild(launch, bridge, signal, warn);
   } catch (error) {
-    return { _tag: "Failed", error: asError(error) };
-  } finally {
+    outcome = { _tag: "Failed", error: asError(error) };
+  }
+  // A review the host's own shutdown cancelled leaves the terminal to the host, which restores
+  // it right after this settles. Starting the TUI here would make it query the terminal while
+  // that restore is already in flight: the reply arrives once the shell owns the tty again and
+  // the line discipline echoes it. Every other ending (a close, a session switch) restarts it.
+  if (!hostClosing()) {
     tui.start();
     tui.requestRender(true);
   }
+  return outcome;
 }
 
 /** The child is closed before this settles, including on cancellation and on errors. */
@@ -708,6 +716,12 @@ export function createHost(bindings: HostBindings) {
   let request: Request = { _tag: "Stop" };
   /** Journal of the review that is open right now; only an interrupted review falls back to it. */
   let pendingJournal: string | undefined;
+  /**
+   * True between the host's `stop()` and a later `start()`: the host is leaving and restores the
+   * terminal itself, so a review cancelled now must not start the host TUI again. `start()` clears
+   * it, because a host that keeps running after a `stop()` (a session replacement) owns a live TUI.
+   */
+  let hostClosing = false;
 
   function stopCurrent(): Promise<void> {
     switch (state._tag) {
@@ -868,9 +882,16 @@ export function createHost(bindings: HostBindings) {
       const outcome = await session.ctx.ui.custom<ReviewOutcome>(
         async (tui, _theme, _keys, done) => {
           done(
-            await runChild(tui, launchData, bindings.bridge, signal, (message) => {
-              teardownWarning ??= message;
-            }),
+            await runChild(
+              tui,
+              launchData,
+              bindings.bridge,
+              signal,
+              (message) => {
+                teardownWarning ??= message;
+              },
+              () => hostClosing,
+            ),
           );
           return emptyComponent;
         },
@@ -1036,6 +1057,8 @@ export function createHost(bindings: HostBindings) {
   async function start(ctx: HostContext): Promise<void> {
     const mine: Request = { _tag: "Start" };
     request = mine;
+    // This host is alive: a review cancelled here must restore its TUI like any other close.
+    hostClosing = false;
     // A previous teardown can fail on unverifiable process cleanup. That error belongs to
     // `stop()`; the replacement session still needs its keyboard, so report it and load.
     const teardown = await stopCurrent().then(
@@ -1091,6 +1114,7 @@ export function createHost(bindings: HostBindings) {
     },
     stop: () => {
       request = { _tag: "Stop" };
+      hostClosing = true;
       return stopCurrent();
     },
     /** OMP restores the terminal after its shutdown handler, so it reports once `stop` settles. */
