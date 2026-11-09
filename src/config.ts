@@ -40,15 +40,21 @@ function key(value: unknown, field: string): string {
   return [...modifiers.filter((modifier) => selected.has(modifier)), base].join("+");
 }
 
-export function parseConfig(value: unknown): Config {
+/** A parsed file: the settings this build understands, plus the ones it had to skip. */
+export interface ParsedConfig {
+  readonly config: Config;
+  /** Fields a newer build wrote. They are ignored, named, and dropped by the next Save. */
+  readonly ignored: readonly string[];
+}
+
+export function parseConfig(value: unknown): ParsedConfig {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Configuration must be a JSON object");
   }
-  for (const field of Object.keys(value)) {
-    if (!Object.hasOwn(DEFAULT_CONFIG, field))
-      throw new Error(`Unknown configuration field: ${field}`);
-  }
   const supplied = value as Record<string, unknown>;
+  // A rolled-back build must keep working with a file a newer one wrote, so an unknown field is
+  // reported to the user and ignored instead of disabling every known setting.
+  const ignored = Object.keys(supplied).filter((field) => !Object.hasOwn(DEFAULT_CONFIG, field));
   const prefix = key(
     supplied.prefix === undefined ? DEFAULT_CONFIG.prefix : supplied.prefix,
     "prefix",
@@ -65,27 +71,38 @@ export function parseConfig(value: unknown): Config {
   if (delivery !== "steer" && delivery !== "followUp" && delivery !== "interrupt") {
     throw new Error("delivery must be steer, followUp, or interrupt");
   }
-  return { prefix, diff, show, log, delivery };
+  return { config: { prefix, diff, show, log, delivery }, ignored };
 }
 
-export async function loadConfig(path: string): Promise<Config> {
+/**
+ * A file the extension can work with, or one it cannot: a broken file is reported, never replaced,
+ * so `/hunk config` can open on defaults and leave the write to an explicit Save.
+ */
+export type ConfigLoad =
+  | { readonly _tag: "Loaded"; readonly config: Config; readonly ignored: readonly string[] }
+  | { readonly _tag: "Broken"; readonly message: string };
+
+export async function loadConfig(path: string): Promise<ConfigLoad> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return DEFAULT_CONFIG;
+      return { _tag: "Loaded", config: DEFAULT_CONFIG, ignored: [] };
     }
+    // An unreadable file is not a malformed one: a Save over it could destroy valid settings.
     throw new Error(
       `Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   try {
-    return parseConfig(JSON.parse(text));
+    const { config, ignored } = parseConfig(JSON.parse(text));
+    return { _tag: "Loaded", config, ignored };
   } catch (error) {
-    throw new Error(
-      `Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    return {
+      _tag: "Broken",
+      message: `Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 }
 
@@ -93,7 +110,7 @@ export async function saveConfig(path: string, value: unknown): Promise<Config> 
   // An accepted save must settle before an interrupted session can reload this path, so there is no
   // cancellation signal to observe: once this promise starts writing, it runs to completion.
   try {
-    const config = parseConfig(value);
+    const { config } = parseConfig(value);
     const text = `${JSON.stringify(config, null, 2)}\n`;
     const directory = dirname(path);
     await mkdir(directory, { recursive: true, mode: 0o700 });

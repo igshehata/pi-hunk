@@ -1,4 +1,4 @@
-import { loadConfig, saveConfig } from "./config.js";
+import { DEFAULT_CONFIG, loadConfig, saveConfig } from "./config.js";
 import type { Config, Delivery } from "./contract.js";
 
 export interface ConfigUI {
@@ -58,7 +58,25 @@ export async function editConfig(
   signal: AbortSignal,
 ): Promise<Config | undefined> {
   const loaded = await loadConfig(path);
-  let state: EditorState = { _tag: "Menu", draft: loaded };
+  const broken = loaded._tag === "Broken";
+  // A broken file is never rewritten until Save: the menu starts from defaults and says so.
+  if (loaded._tag === "Broken")
+    ui.notify(
+      `${loaded.message}\nHunk shortcuts are off until this is fixed. This menu starts from defaults; Save replaces the file, Cancel leaves it untouched.`,
+      "warning",
+    );
+  else if (loaded.ignored.length > 0)
+    ui.notify(
+      `Hunk configuration at ${path} sets unknown field(s) ${loaded.ignored.join(", ")}. They are ignored, and Save writes the known settings only.`,
+      "warning",
+    );
+  const title = broken
+    ? `Hunk configuration — ${path} is unreadable; Save replaces it`
+    : `Hunk configuration — ${path}`;
+  let state: EditorState = {
+    _tag: "Menu",
+    draft: loaded._tag === "Loaded" ? loaded.config : DEFAULT_CONFIG,
+  };
   while (true) {
     // Covers the save, the one await that has no follow-up check: an abort during it must not reopen
     // a menu the caller has already cancelled.
@@ -80,7 +98,7 @@ export async function editConfig(
           signal,
           (): Promise<string | undefined> =>
             ui.select(
-              `Hunk configuration — ${path}`,
+              title,
               menu.map(({ label }) => label),
               { signal },
             ),

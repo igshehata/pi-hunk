@@ -1050,8 +1050,22 @@ export function createHost(bindings: HostBindings) {
     const loading: State = { _tag: "Loading", settled };
     state = loading;
     void loadConfig(bindings.configPath)
-      .then((config) => {
-        if (state === loading) listen({ ctx, config });
+      .then((loaded) => {
+        if (state !== loading) return;
+        if (loaded._tag === "Broken") {
+          state = { _tag: "Inactive" };
+          ctx.ui.notify(
+            `${loaded.message}\nHunk shortcuts are off until this file is fixed. Run /hunk config to review it and replace it on Save, or repair the file directly.`,
+            "error",
+          );
+          return;
+        }
+        if (loaded.ignored.length > 0)
+          ctx.ui.notify(
+            `Hunk configuration at ${bindings.configPath} sets unknown field(s) ${loaded.ignored.join(", ")}; they are ignored and the known settings apply.`,
+            "warning",
+          );
+        listen({ ctx, config: loaded.config });
       })
       .catch((error: unknown) => {
         if (state !== loading) return;
