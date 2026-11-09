@@ -695,11 +695,16 @@ async function ownChild(
   }
 }
 
+/** How long an interrupt waits for the review teardown before reporting and re-raising anyway. */
+const INTERRUPT_GRACE_MS = 5_000;
+
 /** One lifecycle shared by the native Pi and OMP entrypoints. */
 export function createHost(bindings: HostBindings) {
   let state: State = { _tag: "Inactive" };
   /** The newest start or stop request; identity decides which one may still take over. */
   let request: Request = { _tag: "Stop" };
+  /** Journal of the review that is open right now; only an interrupted review falls back to it. */
+  let pendingJournal: string | undefined;
 
   function stopCurrent(): Promise<void> {
     switch (state._tag) {
@@ -736,6 +741,46 @@ export function createHost(bindings: HostBindings) {
         return stopping.settled;
       }
     }
+  }
+
+  /**
+   * SIGINT while Hunk owns the terminal. Neither host's own signal path can close the review:
+   * Pi re-raises through `signal-exit`, which only re-raises while no foreign listener holds the
+   * signal, and an OMP shutdown is already racing the child. So the listener closes the review
+   * itself, names the journal, and re-raises the signal with itself removed, which restores the
+   * host's own termination path (Pi: re-raise; OMP: its idempotent shutdown handler). It exists
+   * only while a review is open, because it disables the default termination both hosts rely on
+   * outside one.
+   */
+  function watchInterrupt(): () => void {
+    let ending = false;
+    const release = (): void => {
+      process.removeListener("SIGINT", handler);
+      // A teardown that never settled leaves the review's journal unnamed; it is the only copy.
+      if (pendingJournal !== undefined && abandoned.size === 0) announce(pendingJournal);
+      // The host repaints its own screen while the review closes; a notice written there is
+      // discarded with the alternate screen when the signal is re-raised. Leave it first.
+      try {
+        writeSync(2, "\x1b[?1049l");
+      } catch {
+        // A terminal that is already gone keeps the journal on disk; nothing to name it to.
+      }
+      flushAbandoned();
+      process.kill(process.pid, "SIGINT");
+    };
+    const handler = (): void => {
+      // A second interrupt is the user refusing to wait for a teardown that may be hung.
+      if (ending) {
+        release();
+        return;
+      }
+      ending = true;
+      void Promise.race([stopCurrent().catch(() => undefined), delay(INTERRUPT_GRACE_MS)]).then(
+        release,
+      );
+    };
+    process.on("SIGINT", handler);
+    return () => process.removeListener("SIGINT", handler);
   }
 
   function listen(session: Session): void {
@@ -775,8 +820,11 @@ export function createHost(bindings: HostBindings) {
     const { promise: settled, resolve } = Promise.withResolvers<LaunchResult>();
     const reviewing: State = { _tag: "Reviewing", session, cancel, settled };
     state = reviewing;
+    const detach = watchInterrupt();
     const active = () => state === reviewing && !cancel.signal.aborted;
     const finish = (result: LaunchResult) => {
+      // The interrupt guard belongs to this review only; outside one it disables default death.
+      detach();
       // Ownership comes back before `settled` resolves, as the old finalizer order required.
       if (active()) listen(session);
       resolve(result);
@@ -802,6 +850,7 @@ export function createHost(bindings: HostBindings) {
       const journal = join(directory, "notes.jsonl");
       // From here a failure still names the journal, so saved comments stay recoverable.
       recovery = { _tag: "Journaled", journal };
+      pendingJournal = journal;
       await writeFile(journal, "", { mode: 0o600, flag: "wx" });
       signal.throwIfAborted();
       const launchData: ReviewLaunch = {
@@ -890,6 +939,9 @@ export function createHost(bindings: HostBindings) {
       return failure instanceof HunkTeardownError
         ? { _tag: "TeardownFailed", error: failure }
         : { _tag: "Finished" };
+    } finally {
+      // Only an open review can be interrupted into an unnamed journal; reviews are serialized.
+      pendingJournal = undefined;
     }
   }
 
