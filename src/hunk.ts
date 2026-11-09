@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import {
   matchesKeyChord,
@@ -92,12 +92,25 @@ interface ReviewedFile {
  * Changeset lifecycle. Nothing can be captured before Hunk mounts one: a saved note needs the
  * revision it was saved against and the patch its excerpt is cut from. One transition replaces
  * the whole table, so a revision can never disagree with the files it describes.
+ *
+ * `Reading` is the mounted changeset whose revision git is still resolving. Hunk mounts and
+ * paints it immediately, so a note can be saved before the revision lands; such a save waits for
+ * this exact resolution rather than reading a revision this changeset does not have. `key`
+ * identifies what the revision was derived from (the view and Hunk's title), so remounting the
+ * same changeset reuses its revision instead of querying git again.
  */
 type ChangesetState =
   | { readonly _tag: "Absent" }
   | {
       readonly _tag: "Present";
+      readonly key: string;
       readonly revision: Revision;
+      readonly files: ReadonlyMap<string, ReviewedFile>;
+    }
+  | {
+      readonly _tag: "Reading";
+      readonly key: string;
+      readonly revision: Promise<Revision>;
       readonly files: ReadonlyMap<string, ReviewedFile>;
     };
 
@@ -165,38 +178,61 @@ function append(review: Review, event: ReviewEvent): void {
 /** Full object ids: 40 hex for SHA-1 repositories, 64 for SHA-256 ones. */
 const GIT_OBJECT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 
-/** Run one git query in the reviewed repository; null when git cannot answer it. */
-function gitQuery(cwd: string, args: readonly string[]): string | null {
-  try {
-    const output = execFileSync("git", args, {
-      cwd,
-      encoding: "utf8",
-      timeout: 2_000,
-      maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return output.length > 0 ? output : null;
-  } catch {
-    return null;
-  }
+/**
+ * Run one git query in the reviewed repository; null when git cannot answer it.
+ *
+ * Asynchronous on purpose: `changeset_loaded` is emitted while Hunk is mounting the review, so a
+ * synchronous query would freeze the render for every spawn. Nothing here rejects; a revision
+ * that git cannot answer is recorded as `unresolved` instead.
+ */
+function gitQuery(cwd: string, args: readonly string[]): Promise<string | null> {
+  const { promise, resolve } = Promise.withResolvers<string | null>();
+  execFile(
+    "git",
+    args,
+    { cwd, encoding: "utf8", timeout: 2_000, maxBuffer: 1024 * 1024 },
+    (error, stdout) => {
+      if (error) return resolve(null);
+      const output = stdout.trim();
+      resolve(output.length > 0 ? output : null);
+    },
+  );
+  return promise;
 }
 
 /** Resolve one revision to a full commit SHA, or null when git cannot name a commit. */
-function resolveCommit(cwd: string, revision: string): string | null {
-  const commit = gitQuery(cwd, ["rev-parse", "--verify", "--quiet", `${revision}^{commit}`]);
+async function resolveCommit(cwd: string, revision: string): Promise<string | null> {
+  const commit = await gitQuery(cwd, ["rev-parse", "--verify", "--quiet", `${revision}^{commit}`]);
   return commit !== null && GIT_OBJECT_ID.test(commit) ? commit : null;
 }
 
+/**
+ * The empty tree id of each reviewed repository. It is a constant of the object format, so one
+ * query per repository answers every root-commit range; Hunk's abbreviated ids are matched
+ * against it by prefix instead of asking git to expand an object it does not have.
+ */
+const emptyTreeIds = new Map<string, Promise<string | null>>();
+
+function emptyTreeId(cwd: string): Promise<string | null> {
+  const cached = emptyTreeIds.get(cwd);
+  if (cached !== undefined) return cached;
+  const query = gitQuery(cwd, ["hash-object", "-t", "tree", "/dev/null"]);
+  emptyTreeIds.set(cwd, query);
+  return query;
+}
+
 /** True when `revision` names the empty tree, the base Hunk reports for a root commit. */
-function resolvesToEmptyTree(cwd: string, revision: string): boolean {
-  const empty = gitQuery(cwd, ["hash-object", "-t", "tree", "/dev/null"]);
+async function resolvesToEmptyTree(cwd: string, revision: string): Promise<boolean> {
+  const empty = await emptyTreeId(cwd);
   if (empty === null) return false;
   const lower = revision.toLowerCase();
   if (lower === empty) return true;
   // Hunk abbreviates history ids, and the empty tree is usually absent from the object
   // database, so git cannot expand that abbreviation; match it by prefix instead.
   if (lower.length >= 4 && /^[0-9a-f]+$/.test(lower) && empty.startsWith(lower)) return true;
-  return gitQuery(cwd, ["rev-parse", "--verify", "--quiet", `${revision}^{tree}`]) === empty;
+  return (
+    (await gitQuery(cwd, ["rev-parse", "--verify", "--quiet", `${revision}^{tree}`])) === empty
+  );
 }
 
 /**
@@ -209,7 +245,7 @@ function resolvesToEmptyTree(cwd: string, revision: string): boolean {
  * where `from` is the empty tree when the selection reaches the root commit). Anything
  * that does not resolve is recorded verbatim as `unresolved`; a SHA is never guessed.
  */
-function resolveRevision(cwd: string, view: View, title: string): Revision {
+async function resolveRevision(cwd: string, view: View, title: string): Promise<Revision> {
   if (view === "diff") return { kind: "working-tree" };
   const unresolved: Revision = { kind: "unresolved", description: title };
   const tokens = title.trim().split(/\s+/);
@@ -217,19 +253,30 @@ function resolveRevision(cwd: string, view: View, title: string): Revision {
   if (!target) return unresolved;
   const separator = target.indexOf("..");
   if (separator >= 0) {
-    const to = resolveCommit(cwd, target.slice(separator + 2));
+    const to = await resolveCommit(cwd, target.slice(separator + 2));
     if (to === null) return unresolved;
     const fromToken = target.slice(0, separator);
     if (fromToken.length === 0) return { kind: "range", to };
-    const from = resolveCommit(cwd, fromToken);
+    const from = await resolveCommit(cwd, fromToken);
     if (from !== null) return { kind: "range", from, to };
-    return resolvesToEmptyTree(cwd, fromToken) ? { kind: "range", to } : unresolved;
+    return (await resolvesToEmptyTree(cwd, fromToken)) ? { kind: "range", to } : unresolved;
   }
   if (tokens[tokens.length - 2] !== "show") return unresolved;
-  const commit = resolveCommit(cwd, target);
+  const commit = await resolveCommit(cwd, target);
   if (commit === null) return unresolved;
-  const parent = resolveCommit(cwd, `${commit}^1`);
+  const parent = await resolveCommit(cwd, `${commit}^1`);
   return { kind: "commit", commit, ...(parent === null ? {} : { parent }) };
+}
+
+/**
+ * True when every id the title names is a commit id, so the same title provably names the same
+ * revision. A symbolic target (`HEAD`, a branch) does not: the commit it points at can move
+ * between two mounts of the same title, so such a changeset is always re-resolved.
+ */
+function titleNamesCommits(title: string): boolean {
+  const target = title.trim().split(/\s+/).pop();
+  if (!target) return false;
+  return target.split("..").every((token) => token === "" || /^[0-9a-f]{4,64}$/i.test(token));
 }
 
 // View lifecycle: every transition of `ReviewState` lives here, and no handler mutates it
@@ -364,20 +411,24 @@ function failCapture(review: Review, context: ExtensionContext, error: unknown):
   }
 }
 
-function saveMutation(
+async function saveMutation(
   review: Review,
   state: ActiveReviewState,
+  changeset: ChangesetState,
   note: ExtensionReviewSnapshotNote,
-): void {
+): Promise<void> {
   const record = review.notes.get(note.id);
   if (!record) throw new Error(`Hunk did not provide a public file path for saved note ${note.id}`);
-  const changeset = review.changeset;
-  const file = changeset._tag === "Present" ? changeset.files.get(record.fileId) : undefined;
+  const file = changeset._tag === "Absent" ? undefined : changeset.files.get(record.fileId);
   const frozen = record._tag === "Saved" ? record.frozen : undefined;
   // A comment keeps the revision it was first saved against, even after the review reloads.
-  const revision =
-    frozen?.revision ?? (changeset._tag === "Present" ? changeset.revision : undefined);
-  if (!revision) throw new Error(`Hunk loaded no reviewed revision before saved note ${note.id}`);
+  // A changeset whose revision is still resolving is awaited: the note was saved while Hunk
+  // showed that changeset, so it neither borrows the previous revision nor guesses one.
+  let revision = frozen?.revision;
+  if (revision === undefined && changeset._tag === "Present") revision = changeset.revision;
+  if (revision === undefined && changeset._tag === "Reading") revision = await changeset.revision;
+  if (revision === undefined)
+    throw new Error(`Hunk loaded no reviewed revision before saved note ${note.id}`);
   const previousPath = frozen?.previousPath ?? file?.previousPath;
   // Like revisions, excerpts are fixed when a note is first saved: a later reload
   // must not rewrite the evidence for a comment that already exists.
@@ -515,6 +566,9 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const navigation: Navigation =
     launch.view === "log" ? { _tag: "History" } : { _tag: "SwitchableViews" };
   let bridge: BridgeState = { _tag: "Registered" };
+  // Journal writes run one at a time: a save waiting for its revision must not let a later note
+  // event overtake it, and the journal keeps the order the user worked in.
+  let capture: Promise<void> = Promise.resolve();
   // This registration's act gate: shutdown aborts it, and every awaited step that belongs to
   // the registration (session lookup, reload CLI, reconciler) observes it before acting.
   const cancel = new AbortController();
@@ -553,19 +607,42 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     // review is showing the stable view the last switch settled on.
     const view = state._tag === "Switching" ? state.target : state.view;
     review.state = confirmMount(state, view);
-    review.changeset = {
-      _tag: "Present",
+    const files = new Map(
+      changeset.files.map((file): [string, ReviewedFile] => [
+        file.id,
+        {
+          patch: file.patch,
+          ...(file.previousPath === undefined ? {} : { previousPath: file.previousPath }),
+        },
+      ]),
+    );
+    const key = `${view}\u0000${changeset.title}`;
+    const mounted = review.changeset;
+    // Remounting the changeset whose revision is already known only moves the files: the key is
+    // what the revision was derived from, so asking git again would repeat the same question.
+    // `diff` is always the working tree, and a title that names commit ids cannot go stale.
+    const reusable = view === "diff" || titleNamesCommits(changeset.title);
+    if (reusable && mounted._tag !== "Absent" && mounted.key === key) {
+      review.changeset =
+        mounted._tag === "Present"
+          ? { _tag: "Present", key, revision: mounted.revision, files }
+          : { _tag: "Reading", key, revision: mounted.revision, files };
+      return;
+    }
+    // Resolution is asynchronous: Hunk mounts and paints this changeset now, and a note saved
+    // before the revision lands waits for it instead of blocking the render here.
+    const reading: ChangesetState = {
+      _tag: "Reading",
+      key,
       revision: resolveRevision(review.launch.cwd, view, changeset.title),
-      files: new Map(
-        changeset.files.map((file): [string, ReviewedFile] => [
-          file.id,
-          {
-            patch: file.patch,
-            ...(file.previousPath === undefined ? {} : { previousPath: file.previousPath }),
-          },
-        ]),
-      ),
+      files,
     };
+    review.changeset = reading;
+    void reading.revision.then((revision) => {
+      // A newer mount owns the table by now, so this answer must not replace its entry.
+      if (review.changeset !== reading) return;
+      review.changeset = { _tag: "Present", key, revision, files };
+    });
   });
 
   hunk.on("note_created", ({ note }) => {
@@ -575,18 +652,27 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     if (bridge._tag === "Running" && !note.draft) locateNote(review, note);
   });
   hunk.on("note_changed", ({ kind, note }, context) => {
+    // The evidence is frozen at the event, like the save it belongs to: the changeset and view
+    // Hunk showed when the note was committed, not whatever mounted while a save was queued.
     const state = review.state;
+    const changeset = review.changeset;
     if (bridge._tag !== "Running" || state._tag === "Failed" || note.source !== "user") return;
-    try {
-      if (kind === "removed") {
-        append(review, { _tag: "Remove", id: note.id });
-        review.notes.delete(note.id);
-      } else {
-        saveMutation(review, state, note);
+    // A save can wait for a pending revision, so journal writes are serialized: an edit must
+    // never overtake the save it edits, and the journal stays in the order the user worked.
+    capture = capture.then(async () => {
+      // A stopped registration or an earlier failure owns the review by the time this runs.
+      if (bridge._tag !== "Running" || review.state._tag === "Failed") return;
+      try {
+        if (kind === "removed") {
+          append(review, { _tag: "Remove", id: note.id });
+          review.notes.delete(note.id);
+        } else {
+          await saveMutation(review, state, changeset, note);
+        }
+      } catch (error) {
+        failCapture(review, context, error);
       }
-    } catch (error) {
-      failCapture(review, context, error);
-    }
+    });
   });
 
   hunk.registerKeyboardMode({
