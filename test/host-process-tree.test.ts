@@ -269,7 +269,9 @@ describe("native Hunk process ownership", () => {
           expect(isAlive(launcherPid)).toBe(false);
           expect(isAlive(latePid)).toBe(false);
           expect(isAlive(sibling.pid!)).toBe(true);
-          expect(events).toEqual(["terminal-stop", "terminal-start"]);
+          // stop() is the host leaving: it restores the terminal itself, so the review's TUI is
+          // deliberately left stopped (no restart that could query a restored tty).
+          expect(events).toEqual(["terminal-stop"]);
         });
       } finally {
         sibling.kill("SIGKILL");
@@ -293,7 +295,8 @@ describe("native Hunk process ownership", () => {
         await expect(host.stop()).rejects.toThrow(
           /Owned Hunk processes did not exit|Hunk process teardown/,
         );
-        expect(events).toEqual(["terminal-stop", "terminal-start"]);
+        // A teardown failure during stop() still leaves the restart to the host, not to us.
+        expect(events).toEqual(["terminal-stop"]);
       });
     },
     15_000,
