@@ -234,7 +234,7 @@ describe("changeset revision resolution", () => {
       );
       await vi.waitFor(
         async () => {
-          const notes = await readFeedback(journal);
+          const { notes } = await readFeedback(journal);
           expect(notes).toHaveLength(1);
           expect(notes[0]!.revision).toEqual({
             kind: "unresolved",
