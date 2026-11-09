@@ -70,8 +70,10 @@ export async function editConfig(
       `Hunk configuration at ${path} sets unknown field(s) ${loaded.ignored.join(", ")}. They are ignored, and Save writes the known settings only.`,
       "warning",
     );
+  // The host draws a select title on one row and truncates it, so the state that the user must act
+  // on comes before the path: a long path must never hide "unreadable; Save replaces it".
   const title = broken
-    ? `Hunk configuration — ${path} is unreadable; Save replaces it`
+    ? `Hunk configuration (unreadable; Save replaces it) — ${path}`
     : `Hunk configuration — ${path}`;
   let state: EditorState = {
     _tag: "Menu",

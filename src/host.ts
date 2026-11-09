@@ -661,6 +661,34 @@ async function closeChild(child: OwnedChild, warn: (message: string) => void): P
   }
 }
 
+/**
+ * What a Hunk process that had no chance to restore the terminal leaves behind: the alternate
+ * screen, its mouse/paste/keyboard modes, and a hidden cursor. Both hosts repaint from their own
+ * last frame, so rows outside the host's viewport (OMP's provider renderer paints a diff, not the
+ * whole grid) would otherwise keep Hunk's last frame. Undoing Hunk's setup returns the screen the
+ * review started from, and the host's forced repaint then lands on a clean buffer.
+ */
+const HUNK_TERMINAL_SETUP_UNDO =
+  "\x1b[?2026l\x1b[>4;0m\x1b[?2027l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l";
+
+/** Reverses what Hunk's own shutdown would have reversed. A terminal that is gone keeps nothing. */
+function undoHunkTerminal(): void {
+  try {
+    writeSync(1, HUNK_TERMINAL_SETUP_UNDO);
+  } catch {
+    // The screen is already lost with the terminal; the journal on disk is unaffected.
+  }
+}
+
+/** True when the child ended in a way that skipped its own terminal restore. */
+function endedWithoutRestore(outcome: ReviewOutcome): boolean {
+  return (
+    outcome._tag === "Exited" &&
+    outcome.exit._tag === "Closed" &&
+    (outcome.exit.code !== 0 || outcome.exit.signal !== null)
+  );
+}
+
 /** The child is closed first, then the terminal comes back, on every exit path. */
 async function runChild(
   tui: Terminal,
@@ -668,16 +696,27 @@ async function runChild(
   bridge: string,
   signal: AbortSignal,
   warn: (message: string) => void,
+  hostClosing: () => boolean,
 ): Promise<ReviewOutcome> {
+  let outcome: ReviewOutcome;
   try {
     tui.stop();
-    return await ownChild(launch, bridge, signal, warn);
+    outcome = await ownChild(launch, bridge, signal, warn);
   } catch (error) {
-    return { _tag: "Failed", error: asError(error) };
-  } finally {
+    outcome = { _tag: "Failed", error: asError(error) };
+  }
+  // A crash or kill skips Hunk's own restore: give the screen back before restarting the host.
+  if (endedWithoutRestore(outcome)) undoHunkTerminal();
+  // A review cancelled because the host process is quitting leaves the terminal to the host, which
+  // restores it right after this settles. Starting the TUI here would make it query the terminal
+  // while that restore is already in flight: the reply arrives once the shell owns the tty again
+  // and the line discipline echoes it. Every other ending (a close, a session replacement)
+  // restarts it, because the host keeps running and needs its UI back.
+  if (!hostClosing()) {
     tui.start();
     tui.requestRender(true);
   }
+  return outcome;
 }
 
 /** The child is closed before this settles, including on cancellation and on errors. */
@@ -708,6 +747,12 @@ export function createHost(bindings: HostBindings) {
   let request: Request = { _tag: "Stop" };
   /** Journal of the review that is open right now; only an interrupted review falls back to it. */
   let pendingJournal: string | undefined;
+  /**
+   * True once the host process is quitting (its quit shutdown, or SIGINT during a review): the host
+   * restores the terminal itself, so a review cancelled now must not start the host TUI again. A
+   * session replacement is not quitting: the process keeps its live TUI. `start()` clears it.
+   */
+  let hostClosing = false;
 
   function stopCurrent(): Promise<void> {
     switch (state._tag) {
@@ -778,6 +823,8 @@ export function createHost(bindings: HostBindings) {
         return;
       }
       ending = true;
+      // The signal is re-raised once the review is closed, so this process is leaving.
+      hostClosing = true;
       void Promise.race([stopCurrent().catch(() => undefined), delay(INTERRUPT_GRACE_MS)]).then(
         release,
       );
@@ -868,9 +915,16 @@ export function createHost(bindings: HostBindings) {
       const outcome = await session.ctx.ui.custom<ReviewOutcome>(
         async (tui, _theme, _keys, done) => {
           done(
-            await runChild(tui, launchData, bindings.bridge, signal, (message) => {
-              teardownWarning ??= message;
-            }),
+            await runChild(
+              tui,
+              launchData,
+              bindings.bridge,
+              signal,
+              (message) => {
+                teardownWarning ??= message;
+              },
+              () => hostClosing,
+            ),
           );
           return emptyComponent;
         },
@@ -1036,6 +1090,8 @@ export function createHost(bindings: HostBindings) {
   async function start(ctx: HostContext): Promise<void> {
     const mine: Request = { _tag: "Start" };
     request = mine;
+    // This host is alive: a review cancelled here must restore its TUI like any other close.
+    hostClosing = false;
     // A previous teardown can fail on unverifiable process cleanup. That error belongs to
     // `stop()`; the replacement session still needs its keyboard, so report it and load.
     const teardown = await stopCurrent().then(
@@ -1089,8 +1145,10 @@ export function createHost(bindings: HostBindings) {
           : null,
       handler: configure,
     },
-    stop: () => {
+    /** `quitting`: the process is exiting, not replacing its session. */
+    stop: (quitting: boolean) => {
       request = { _tag: "Stop" };
+      hostClosing = quitting;
       return stopCurrent();
     },
     /** OMP restores the terminal after its shutdown handler, so it reports once `stop` settles. */

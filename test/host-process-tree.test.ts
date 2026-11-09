@@ -193,7 +193,7 @@ async function withHost(
       // Restore termination before stopping, including assertion failures in the EPERM test.
       vi.restoreAllMocks();
       try {
-        await host.stop();
+        await host.stop(true);
       } finally {
         // A deliberately failed teardown may have left the fixture's recorded children alive.
         const native = await readNative(paths.nativePid);
@@ -263,13 +263,15 @@ describe("native Hunk process ownership", () => {
           expect(nativeRecord.ppid).toBe(launcherPid);
           expect(isAlive(nativeRecord.pid)).toBe(true);
           expect(isAlive(sibling.pid!)).toBe(true);
-          await host.stop();
+          await host.stop(true);
           const latePid = Number(await readFile(paths.latePid, "utf8"));
           expect(isAlive(nativeRecord.pid)).toBe(false);
           expect(isAlive(launcherPid)).toBe(false);
           expect(isAlive(latePid)).toBe(false);
           expect(isAlive(sibling.pid!)).toBe(true);
-          expect(events).toEqual(["terminal-stop", "terminal-start"]);
+          // stop() is the host leaving: it restores the terminal itself, so the review's TUI is
+          // deliberately left stopped (no restart that could query a restored tty).
+          expect(events).toEqual(["terminal-stop"]);
         });
       } finally {
         sibling.kill("SIGKILL");
@@ -290,10 +292,11 @@ describe("native Hunk process ownership", () => {
             throw Object.assign(new Error("permission denied"), { code: "EPERM" });
           return originalKill(pid, signal);
         });
-        await expect(host.stop()).rejects.toThrow(
+        await expect(host.stop(true)).rejects.toThrow(
           /Owned Hunk processes did not exit|Hunk process teardown/,
         );
-        expect(events).toEqual(["terminal-stop", "terminal-start"]);
+        // A teardown failure during stop() still leaves the restart to the host, not to us.
+        expect(events).toEqual(["terminal-stop"]);
       });
     },
     15_000,

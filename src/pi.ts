@@ -15,5 +15,6 @@ export default function piHunk(pi: ExtensionAPI): void {
   pi.registerCommand("hunk", host.command);
   pi.on("session_start", (_event, ctx) => host.start(ctx));
   pi.on("session_tree", (_event, ctx) => host.start(ctx));
-  pi.on("session_shutdown", () => host.stop());
+  // Pi also shuts the extension down to reload or replace the session; only "quit" ends the process.
+  pi.on("session_shutdown", (event) => host.stop(event.reason === "quit"));
 }

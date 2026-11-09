@@ -114,7 +114,7 @@ async function runChord(hunkSource: string | undefined): Promise<{
     await wait;
     return { notices, events };
   } finally {
-    await host.stop().catch(() => {});
+    await host.stop(true).catch(() => {});
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
     await rm(directory, { recursive: true, force: true });
