@@ -15,7 +15,7 @@ function createHunk() {
   const handlers = new Map<string, Array<(payload: unknown, context: ExtensionContext) => void>>();
   return {
     hunk: {
-      apiVersion: 25,
+      apiVersion: 33,
       on(event: string, handler: (payload: unknown, context: ExtensionContext) => void) {
         const list = handlers.get(event) ?? [];
         list.push(handler);

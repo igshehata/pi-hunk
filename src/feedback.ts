@@ -29,6 +29,9 @@ function replay(state: JournalState, event: ReviewEvent): JournalState {
       return state;
     case "Failure":
       throw new Error(event.message);
+    case "Exited":
+      // Written by the multiplexer launcher after Hunk exits; it records no comment.
+      return state;
     default:
       throw new Error("Unrecognized review journal entry");
   }
@@ -138,6 +141,10 @@ function revisionKey(revision: Revision): string {
       return `commit:${revision.commit}:${revision.parent ?? ""}`;
     case "range":
       return `range:${revision.from ?? ""}:${revision.to}`;
+    case "branch":
+      return `branch:${revision.base}`;
+    case "codebase":
+      return "codebase";
     case "unresolved":
       return `unresolved:${revision.description}`;
   }
@@ -161,6 +168,12 @@ function revisionHeading(revision: Revision): string {
       const from = revision.from.slice(0, revision.abbrev);
       return `## Range ${from}..${to} (old: ${from}, new: ${to})`;
     }
+    case "branch": {
+      const base = revision.base.slice(0, revision.abbrev);
+      return `## Branch (old: merge-base ${base}, new: working tree)`;
+    }
+    case "codebase":
+      return "## Whole codebase (new: working tree)";
     case "unresolved":
       return `## Unverified revision: Hunk reported "${revision.description}"`;
   }
@@ -182,23 +195,27 @@ function locationOf(note: ReviewNote): string {
   return sides.length === 0 ? "whole file" : sides.join(" → ");
 }
 
+/** The location heading, with the one qualifier its caller adds. */
+function locationLine(note: ReviewNote, suffix = ""): string {
+  const renamed = note.previousPath === undefined ? "" : ` (renamed from ${note.previousPath})`;
+  return `### ${note.path}${renamed} · ${locationOf(note)}${suffix}`;
+}
+
+/** The reviewed diff lines, fenced past the longest backtick run so the diff cannot end it. */
+function excerptBlock(excerpt: string): string {
+  const longest = Math.max(0, ...Array.from(excerpt.matchAll(/`+/g), (match) => match[0].length));
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}diff\n${excerpt}\n${fence}`;
+}
+
 /** One top-level comment with its excerpt, body, and threaded replies. */
 function commentBlocks(
   note: ReviewNote,
   replies: ReadonlyMap<string, ReviewNote[]>,
   orphan: boolean,
 ): string[] {
-  const renamed = note.previousPath === undefined ? "" : ` (renamed from ${note.previousPath})`;
-  const suffix = orphan ? " (reply to a deleted comment)" : "";
-  const blocks = [`### ${note.path}${renamed} · ${locationOf(note)}${suffix}`];
-  if (note.excerpt !== undefined) {
-    const longest = Math.max(
-      0,
-      ...Array.from(note.excerpt.matchAll(/`+/g), (match) => match[0].length),
-    );
-    const fence = "`".repeat(Math.max(3, longest + 1));
-    blocks.push(`${fence}diff\n${note.excerpt}\n${fence}`);
-  }
+  const blocks = [locationLine(note, orphan ? " (reply to a deleted comment)" : "")];
+  if (note.excerpt !== undefined) blocks.push(excerptBlock(note.excerpt));
   if (note.body.length > 0) blocks.push(note.body);
   blocks.push(...replyBlocks(note, replies));
   return blocks;
@@ -256,4 +273,62 @@ export function formatFeedback(notes: readonly ReviewNote[]): string {
     );
   }
   return sections.join("\n\n");
+}
+
+/**
+ * One change the live review (multiplexer mode) sends as it happens. The number is the review's
+ * own `#n`, assigned when the change was first seen, so an edit or a delete can name what the
+ * agent already read.
+ */
+export type LiveChange =
+  | {
+      readonly kind: "added";
+      readonly number: number;
+      readonly note: ReviewNote;
+      /** The parent thread, when the agent has already been told about it. */
+      readonly parent?: { readonly number: number; readonly note: ReviewNote };
+    }
+  | { readonly kind: "edited"; readonly number: number; readonly note: ReviewNote }
+  | { readonly kind: "deleted"; readonly number: number };
+
+/** What a comment saved against older disk content still refers to. */
+const STALE_NOTE =
+  "The file changed after this review loaded; line numbers refer to the reviewed version.";
+
+/**
+ * One comment saved, edited, or deleted, as the agent reads it live. Same facts as a review
+ * handoff, one change at a time, and again no instructions: how to act on a review belongs to the
+ * user's own agent configuration.
+ */
+export function formatLiveChange(change: LiveChange): string {
+  switch (change.kind) {
+    case "deleted":
+      return `Hunk comment #${change.number} deleted.`;
+    case "edited": {
+      const { note } = change;
+      const blocks = [`Hunk comment #${change.number} edited`, locationLine(note)];
+      if (note.stale === true) blocks.push(STALE_NOTE);
+      if (note.body.length > 0) blocks.push(note.body);
+      return blocks.join("\n\n");
+    }
+    case "added": {
+      const { note, parent } = change;
+      const title =
+        parent === undefined
+          ? `Hunk comment #${change.number}`
+          : `Hunk comment #${change.number} (reply to #${parent.number})`;
+      // Only a new top-level comment needs its revision: a reply sits in the thread it answers,
+      // and an edit is about a comment the agent already located.
+      const blocks = [title];
+      if (parent === undefined) blocks.push(revisionHeading(note.revision));
+      blocks.push(locationLine(note));
+      if (note.stale === true) blocks.push(STALE_NOTE);
+      if (parent === undefined && note.excerpt !== undefined)
+        blocks.push(excerptBlock(note.excerpt));
+      if (parent !== undefined && parent.note.body.length > 0)
+        blocks.push(`> ${parent.note.body.split("\n").join("\n> ")}`);
+      if (note.body.length > 0) blocks.push(note.body);
+      return blocks.join("\n\n");
+    }
+  }
 }

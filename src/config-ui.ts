@@ -1,5 +1,5 @@
 import { DEFAULT_CONFIG, loadConfig, saveConfig } from "./config.js";
-import type { Config, Delivery } from "./contract.js";
+import type { Config, Delivery, Mode } from "./contract.js";
 
 export interface ConfigUI {
   select(
@@ -15,29 +15,42 @@ export interface ConfigUI {
   notify(message: string, type?: "info" | "warning" | "error"): void;
 }
 
-type KeyField = "prefix" | "diff" | "show" | "log";
+type KeyField = "prefix" | "diff" | "show" | "log" | "branch" | "codebase";
 
 // The unsaved draft travels inside the state: no second mutable "current config" lives beside it.
 type EditorState =
   | { readonly _tag: "Menu"; readonly draft: Config }
   | { readonly _tag: "Key"; readonly draft: Config; readonly field: KeyField }
   | { readonly _tag: "Delivery"; readonly draft: Config }
+  | { readonly _tag: "Mode"; readonly draft: Config }
   | { readonly _tag: "Save"; readonly draft: Config };
 
 // Each menu row carries the transition it selects, so no index arithmetic or label matching decides it.
 type MenuChoice =
   | { readonly _tag: "Key"; readonly field: KeyField; readonly label: string }
   | { readonly _tag: "Delivery"; readonly label: string }
+  | { readonly _tag: "Mode"; readonly label: string }
   | { readonly _tag: "Save"; readonly label: string }
   | { readonly _tag: "Cancel"; readonly label: string };
 
 type Answer<T> = { readonly _tag: "Answer"; readonly value: T } | { readonly _tag: "Aborted" };
 
-const keyFields: readonly KeyField[] = ["prefix", "diff", "show", "log"];
+const keyFields: readonly KeyField[] = ["prefix", "diff", "show", "log", "branch", "codebase"];
 const deliveryChoices: readonly { value: Delivery; label: string }[] = [
   { value: "steer", label: "steer — deliver during the current response" },
   { value: "followUp", label: "followUp — wait until the current response finishes" },
   { value: "interrupt", label: "interrupt — stop the current response and deliver" },
+];
+const modeChoices: readonly { value: Mode; label: string }[] = [
+  {
+    value: "static",
+    label: "static — full-screen Hunk; comments are sent when you close it",
+  },
+  {
+    value: "multiplexer",
+    label:
+      "multiplexer — Hunk opens beside the agent in Tern, Rex, or Herdr; each comment is sent as you save it",
+  },
 ];
 
 // A dialog that settles because the caller cancelled is cancellation, not an answer, and the
@@ -93,6 +106,7 @@ export async function editConfig(
             label: `${field}: ${draft[field]}`,
           })),
           { _tag: "Delivery", label: `delivery: ${draft.delivery}` },
+          { _tag: "Mode", label: `mode: ${draft.mode}` },
           { _tag: "Save", label: "Save" },
           { _tag: "Cancel", label: "Cancel" },
         ];
@@ -117,6 +131,9 @@ export async function editConfig(
             break;
           case "Delivery":
             state = { _tag: "Delivery", draft };
+            break;
+          case "Mode":
+            state = { _tag: "Mode", draft };
             break;
           case "Save":
             state = { _tag: "Save", draft };
@@ -163,6 +180,27 @@ export async function editConfig(
         state = {
           _tag: "Menu",
           draft: selected ? { ...current, delivery: selected.value } : current,
+        };
+        break;
+      }
+      case "Mode": {
+        const current: Config = state.draft;
+        const answered: Answer<string | undefined> = await answer(
+          signal,
+          (): Promise<string | undefined> =>
+            ui.select(
+              `Hunk mode (current: ${current.mode})`,
+              modeChoices.map(({ label }) => label),
+              { signal },
+            ),
+        );
+        if (answered._tag === "Aborted") return undefined;
+        const selected: { value: Mode; label: string } | undefined = modeChoices.find(
+          ({ label }) => label === answered.value,
+        );
+        state = {
+          _tag: "Menu",
+          draft: selected ? { ...current, mode: selected.value } : current,
         };
         break;
       }

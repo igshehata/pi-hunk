@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, watch, type FSWatcher } from "node:fs";
+import { join } from "node:path";
 import {
   matchesKeyChord,
   parseKeyChord,
@@ -7,6 +8,8 @@ import {
   type ExtensionKeyEvent,
   type ExtensionReviewNote,
   type ExtensionReviewSnapshotNote,
+  type ExtensionStatusLineControls,
+  type ExtensionStatusSpan,
   type HunkExtensionAPI,
 } from "hunkdiff/extension";
 import {
@@ -19,7 +22,8 @@ import {
   type View,
 } from "./contract.js";
 import { parseConfig } from "./config.js";
-import { excerptFor } from "./excerpt.js";
+import { excerptFor, newSideLines } from "./excerpt.js";
+import { hunkArgs } from "./views.js";
 
 /**
  * View lifecycle of one review.
@@ -146,10 +150,143 @@ interface Review {
   readonly notes: Map<string, NoteState>;
 }
 
+/** The one control multiplexer mode paints from; a context without it is skipped silently. */
+interface StatusLineHost {
+  readonly statusLine?: ExtensionStatusLineControls;
+}
+
+/**
+ * Multiplexer-mode status: the one item reporting what the agent has received, plus whether the
+ * working tree moved since Hunk mounted its changeset. Static mode never fills it.
+ */
+interface LiveStatus {
+  /** Last context that can paint the status row; the watcher callback receives no context. */
+  host?: StatusLineHost;
+  /** True while the working tree changed after the mounted changeset was read. */
+  filesChanged: boolean;
+  /** True once this registration decided about the watcher, so a second startup adds no other. */
+  watching: boolean;
+  watcher?: FSWatcher;
+  /** Pending watcher debounce; cleared on shutdown. */
+  timer?: NodeJS.Timeout;
+}
+
 // Hunk imports the same module when replacing its extension registry. Keep review
 // ownership here, not in a factory instance that shutdown/startup will replace.
 // One Hunk child owns exactly one host-created journal; nothing survives its exit.
 let ownedReview: Review | undefined;
+
+/** Status item id multiplexer mode keeps for the whole session; Hunk scopes it per extension. */
+const LIVE_STATUS_ID = "live";
+
+/** One write burst is one change: editors emit several events for one save. */
+const WORKING_TREE_DEBOUNCE_MS = 300;
+
+/** Saved comments the journal holds right now: one Upsert per note, minus its Remove. */
+function sentCount(review: Review): number {
+  let sent = 0;
+  for (const state of review.notes.values()) if (state._tag === "Saved") sent += 1;
+  return sent;
+}
+
+/**
+ * Paint the permanent status item. Multiplexer mode only: the row must never appear and vanish
+ * mid-review, so it is set once at startup and updated from then on, never cleared.
+ *
+ * The context a watcher callback repaints from is the last one an event handed us. A registration
+ * Hunk has replaced can no longer paint, and not every context carries a status line, so a
+ * context that cannot paint here is skipped: the next event repaints from its own.
+ */
+function paintLiveStatus(review: Review, live: LiveStatus, context?: StatusLineHost): void {
+  const host = context ?? live.host;
+  if (host === undefined) return;
+  live.host = host;
+  const controls = host.statusLine;
+  if (controls === undefined) return;
+  const spans: ExtensionStatusSpan[] = [
+    { text: `pi-hunk live · ${sentCount(review)} sent`, tone: "muted" },
+  ];
+  if (live.filesChanged) spans.push({ text: " · files changed, r to refresh", tone: "accent" });
+  try {
+    controls.set({ id: LIVE_STATUS_ID, spans });
+  } catch {
+    // A context from a replaced registration cannot paint; the next event repaints its own.
+  }
+}
+
+/**
+ * Follow the working tree so the status item can report that the files moved. Hunk shows nothing
+ * until the user presses `r`, so this only reports: no reload, no notice, no navigation. A
+ * platform that cannot watch recursively, or a failing watch, leaves the rest of the review as
+ * it is.
+ */
+function watchWorkingTree(review: Review, live: LiveStatus): void {
+  live.watching = true;
+  try {
+    const watcher = watch(review.launch.cwd, { recursive: true }, (_event, filename) => {
+      // Hunk keeps its own git state in `.git`; the reviewed files are everything else.
+      const name = filename?.replace(/\\/g, "/");
+      if (name === ".git" || name?.startsWith(".git/")) return;
+      clearTimeout(live.timer);
+      const timer = setTimeout(() => {
+        live.timer = undefined;
+        live.filesChanged = true;
+        paintLiveStatus(review, live);
+      }, WORKING_TREE_DEBOUNCE_MS);
+      // The indicator must not keep Hunk's process alive once the review is over.
+      timer.unref();
+      live.timer = timer;
+    });
+    watcher.on("error", () => {
+      // An unwatchable tree is not a review failure: drop the indicator, keep the review.
+      live.watcher = undefined;
+      try {
+        watcher.close();
+      } catch {
+        // Already closed.
+      }
+    });
+    live.watcher = watcher;
+  } catch {
+    live.watcher = undefined;
+  }
+}
+
+/**
+ * True when the revision's new side is the working tree, so the file on disk can have moved since
+ * Hunk read it. `diff`, `branch`, and `codebase` all show the working tree as their new side.
+ */
+function newSideIsWorkingTree(revision: Revision): boolean {
+  return (
+    revision.kind === "working-tree" || revision.kind === "branch" || revision.kind === "codebase"
+  );
+}
+
+/**
+ * True when the working-tree file no longer carries the reviewed NEW-side lines of `range`.
+ *
+ * Multiplexer mode only, where the agent keeps writing while the reviewer reads: the patch Hunk
+ * mounted is what the comment's line numbers name, so it is what the file is compared against.
+ * One file read is cheap enough for the save path; an unreadable or missing file is exactly the
+ * case this flag exists for.
+ */
+function workingTreeMoved(
+  cwd: string,
+  path: string,
+  file: ReviewedFile,
+  range: readonly [number, number],
+): boolean {
+  const reviewed = newSideLines(file.patch, range);
+  if (reviewed === undefined) return false;
+  let current: readonly string[];
+  try {
+    current = readFileSync(join(cwd, path), "utf8").split("\n");
+  } catch {
+    return true;
+  }
+  for (const [line, text] of reviewed) if (current[line - 1] !== text) return true;
+  return false;
+}
 
 /** Compile physical Alt spellings emitted by Hunk's public Kitty and legacy events. */
 function compileHunkKey(chord: string) {
@@ -259,9 +396,20 @@ async function resolvesToEmptyTree(cwd: string, revision: string): Promise<boole
  * selection of a single root commit) and `"<repo> <from>..<to>"` (a history range,
  * where `from` is the empty tree when the selection reaches the root commit). Anything
  * that does not resolve is recorded verbatim as `unresolved`; a SHA is never guessed.
+ *
+ * The views that compare the working tree to one known commit name their revision by
+ * themselves: their title is `<repo> <sha>`, which says nothing the view has not already decided,
+ * so they are answered before the title is read.
  */
-async function resolveRevision(cwd: string, view: View, title: string): Promise<Revision> {
+async function resolveRevision(launch: ReviewLaunch, view: View, title: string): Promise<Revision> {
+  const { cwd } = launch;
   if (view === "diff") return { kind: "working-tree" };
+  if (view === "codebase") return { kind: "codebase" };
+  if (view === "branch") {
+    const base = launch.base;
+    if (base === undefined) return { kind: "unresolved", description: title };
+    return { kind: "branch", base, abbrev: await abbreviation(cwd, [base]) };
+  }
   const unresolved: Revision = { kind: "unresolved", description: title };
   const tokens = title.trim().split(/\s+/);
   const target = tokens[tokens.length - 1];
@@ -466,6 +614,15 @@ async function saveMutation(
     note.markup ?? (note.rationale ? `${note.summary}\n\n${note.rationale}` : note.summary);
   // A switch keeps the last mounted view authoritative until the replacement mounts.
   const view = frozen?.view ?? (state._tag === "Switching" ? state.mounted : state.view);
+  // Multiplexer mode only: the agent writes while the reviewer reads, so say whether the file
+  // still carries the lines these line numbers name. A note pinned to the old side, or to a
+  // revision that is not the working tree, has nothing on disk to compare.
+  const stale =
+    review.launch.config.mode === "multiplexer" &&
+    newSideIsWorkingTree(revision) &&
+    note.anchor.newRange !== undefined &&
+    file !== undefined &&
+    workingTreeMoved(review.launch.cwd, record.path, file, note.anchor.newRange);
   const saved: ReviewNote = {
     id: note.id,
     ...(note.parentId === undefined ? {} : { parentId: note.parentId }),
@@ -476,6 +633,7 @@ async function saveMutation(
     ...(note.anchor.oldRange === undefined ? {} : { oldRange: note.anchor.oldRange }),
     ...(note.anchor.newRange === undefined ? {} : { newRange: note.anchor.newRange }),
     ...(excerpt === undefined ? {} : { excerpt }),
+    ...(stale ? { stale: true as const } : {}),
     body,
   };
   append(review, { _tag: "Upsert", note: saved });
@@ -522,7 +680,13 @@ async function runSwitch(
       trustMounted = true;
       attempted = state.requested;
       review.state = beginReload(state, attempted);
-      await control(review, signal, ["session", "reload", session, "--", attempted]);
+      await control(review, signal, [
+        "session",
+        "reload",
+        session,
+        "--",
+        ...hunkArgs(attempted, review.launch.base),
+      ]);
       if (signal.aborted) return;
       review.state = confirmMount(review.state, attempted);
     }
@@ -558,18 +722,20 @@ function switchView(
 }
 
 export default function hunkBridge(hunk: HunkExtensionAPI): void {
-  if (hunk.apiVersion < 25) {
+  if (hunk.apiVersion < 33) {
     throw new Error(
-      `pi-hunk requires Hunk 0.22.0 (extension API 25) or newer; this Hunk reports API ${hunk.apiVersion}`,
+      `pi-hunk requires Hunk 0.25.0 (extension API 33) or newer; this Hunk reports API ${hunk.apiVersion}`,
     );
   }
   const raw = process.env[REVIEW_ENV];
   if (!raw) throw new Error("pi-hunk's review extension must be launched by its host integration");
   const parsed = JSON.parse(raw) as ReviewLaunch;
+  const views: readonly View[] = ["diff", "show", "log", "branch", "codebase"];
   if (
     !parsed.journal ||
     !parsed.cwd ||
-    (parsed.view !== "diff" && parsed.view !== "show" && parsed.view !== "log")
+    !views.includes(parsed.view) ||
+    (parsed.base !== undefined && (typeof parsed.base !== "string" || parsed.base.length === 0))
   ) {
     throw new Error("Invalid pi-hunk review launch");
   }
@@ -579,6 +745,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     cwd: parsed.cwd,
     view: parsed.view,
     config,
+    ...(parsed.base === undefined ? {} : { base: parsed.base }),
   };
   if (!ownedReview) {
     ownedReview = {
@@ -595,6 +762,8 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const navigation: Navigation =
     launch.view === "log" ? { _tag: "History" } : { _tag: "SwitchableViews" };
   let bridge: BridgeState = { _tag: "Registered" };
+  // Multiplexer mode's one status item and its working-tree watcher; unused in static mode.
+  const live: LiveStatus = { filesChanged: false, watching: false };
   // Journal writes run one at a time: a save waiting for its revision must not let a later note
   // event overtake it, and the journal keeps the order the user worked in.
   let capture: Promise<void> = Promise.resolve();
@@ -605,6 +774,8 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const diff = compileHunkKey(launch.config.diff);
   const show = compileHunkKey(launch.config.show);
   const log = compileHunkKey(launch.config.log);
+  const branch = compileHunkKey(launch.config.branch);
+  const codebase = compileHunkKey(launch.config.codebase);
 
   hunk.on("startup", (_event, context) => {
     // Stopped is terminal: Hunk registers a replacement by importing the module again, so this
@@ -620,6 +791,12 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     } catch (error) {
       failCapture(review, context, error);
     }
+    // Multiplexer mode owns one status item for the whole session: setting it here keeps the row
+    // from appearing and disappearing later, and the watcher only ever changes its text.
+    if (launch.config.mode === "multiplexer" && review.state._tag !== "Failed") {
+      paintLiveStatus(review, live, context);
+      if (!live.watching) watchWorkingTree(review, live);
+    }
     // A switch left pending by the registration this one replaced gets its reconciler back, and
     // must reload before it can finish: the abandoned reload may have mounted its own target.
     const state = review.state;
@@ -628,7 +805,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     }
   });
 
-  hunk.on("changeset_loaded", ({ changeset }) => {
+  hunk.on("changeset_loaded", ({ changeset }, context) => {
     if (bridge._tag !== "Running") return;
     const state = review.state;
     if (state._tag === "Failed") return;
@@ -636,6 +813,12 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     // review is showing the stable view the last switch settled on.
     const view = state._tag === "Switching" ? state.target : state.view;
     review.state = confirmMount(state, view);
+    // A changeset reached here because the user reloaded (`r`) or switched views, so the files
+    // on disk are the ones this review now carries and nothing is behind anymore.
+    if (launch.config.mode === "multiplexer") {
+      live.filesChanged = false;
+      paintLiveStatus(review, live, context);
+    }
     const files = new Map(
       changeset.files.map((file): [string, ReviewedFile] => [
         file.id,
@@ -649,8 +832,10 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     const mounted = review.changeset;
     // Remounting the changeset whose revision is already known only moves the files: the key is
     // what the revision was derived from, so asking git again would repeat the same question.
-    // `diff` is always the working tree, and a title that names commit ids cannot go stale.
-    const reusable = view === "diff" || titleNamesCommits(changeset.title);
+    // `diff` is always the working tree, `branch` the base resolved at launch, `codebase` the
+    // empty tree, and a title that names commit ids cannot go stale.
+    const viewNamesRevision = view === "diff" || view === "branch" || view === "codebase";
+    const reusable = viewNamesRevision || titleNamesCommits(changeset.title);
     if (reusable && mounted._tag !== "Absent" && mounted.key === key) {
       review.changeset =
         mounted._tag === "Present"
@@ -663,7 +848,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     const reading: ChangesetState = {
       _tag: "Reading",
       key,
-      revision: resolveRevision(review.launch.cwd, view, changeset.title),
+      revision: resolveRevision(review.launch, view, changeset.title),
       files,
     };
     review.changeset = reading;
@@ -698,6 +883,8 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
         } else {
           await saveMutation(review, state, changeset, note);
         }
+        // The item counts what the journal holds, so it is repainted after the write, not before.
+        if (launch.config.mode === "multiplexer") paintLiveStatus(review, live, context);
       } catch (error) {
         failCapture(review, context, error);
       }
@@ -721,17 +908,39 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
           }
           return "handled";
         }
-        if (diff.matches(key) || show.matches(key)) {
+        if (
+          diff.matches(key) ||
+          show.matches(key) ||
+          branch.matches(key) ||
+          codebase.matches(key)
+        ) {
           context.notify(
-            "Diff/show switching is unavailable in history-selected reviews. Use the log key to return to history.",
+            "Switching views is unavailable in history-selected reviews. Use the log key to return to history.",
             "info",
           );
           return "handled";
         }
         return "pass";
       }
-      const target = diff.matches(key) ? "diff" : show.matches(key) ? "show" : undefined;
+      const target = diff.matches(key)
+        ? "diff"
+        : show.matches(key)
+          ? "show"
+          : branch.matches(key)
+            ? "branch"
+            : codebase.matches(key)
+              ? "codebase"
+              : undefined;
       if (!target) return "pass";
+      // The branch view compares a commit that only the host can find: without a base resolved at
+      // launch there is no diff to load, so the review stays where it is.
+      if (target === "branch" && launch.base === undefined) {
+        context.notify(
+          `pi-hunk could not find the branch's base commit at launch. Set "base" in the /hunk config file and reopen the review.`,
+          "error",
+        );
+        return "handled";
+      }
       if (bridge._tag === "Running") switchView(review, target, context, cancel.signal);
       return "handled";
     },
@@ -755,5 +964,15 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     // it came from nor reported as mounted, because only the replacing registration, reading
     // the changeset Hunk reloads for it, can tell what actually mounted.
     cancel.abort();
+    // The watcher belongs to this registration: a replacement starts its own, and a closed tree
+    // must not leave a timer painting into a review this registration no longer owns.
+    clearTimeout(live.timer);
+    live.timer = undefined;
+    try {
+      live.watcher?.close();
+    } catch {
+      // Already closed.
+    }
+    live.watcher = undefined;
   });
 }

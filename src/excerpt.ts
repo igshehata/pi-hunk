@@ -95,6 +95,26 @@ function parseHunks(patch: string): Hunk[] {
 }
 
 /**
+ * The reviewed NEW-side text of `newRange`, keyed by new-side line number: the patch's context
+ * and added lines without their diff marker. Undefined when the patch covers none of the range,
+ * so a caller cannot read "nothing to compare" as "unchanged".
+ */
+export function newSideLines(
+  patch: string,
+  newRange: readonly [number, number],
+): Map<number, string> | undefined {
+  const lines = new Map<number, string>();
+  for (const hunk of parseHunks(patch)) {
+    for (const line of hunk.lines) {
+      const number = line.newNumber;
+      if (number === undefined || number < newRange[0] || number > newRange[1]) continue;
+      lines.set(number, line.text.slice(1));
+    }
+  }
+  return lines.size === 0 ? undefined : lines;
+}
+
+/**
  * Unified-diff lines around a comment's old/new ranges: each affected hunk's
  * header plus the selected lines and up to three context lines on each side.
  * Returns undefined when the patch carries nothing to show.
