@@ -16,8 +16,9 @@ file, old and new lines, and the reviewed diff lines. No copy/paste.
 ## Why pi-hunk?
 
 - **Real Hunk.** The full-screen native TUI, not a webview or another diff renderer.
-- **Changes, commits, and history.** Switch between working-tree changes and the latest commit, or
-  browse native `hunk log` and open selected commits for review.
+- **Changes, commits, branches, and history.** Switch between working-tree changes, the latest
+  commit, everything on your branch, or the whole codebase, or browse native `hunk log` and open
+  selected commits for review.
 - **Comments that stay together.** Saved notes survive view switches and returning to history; edits
   replace old text, and deleted notes stay deleted.
 - **Your agent’s workflow.** Steer an active turn, queue a follow-up, or interrupt it. The same
