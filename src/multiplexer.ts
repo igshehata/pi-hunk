@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { REVIEW_ENV, type ReviewLaunch } from "./contract.js";
+import { hunkArgs } from "./views.js";
 
 export type MultiplexerKind = "herdr" | "rex" | "tern";
 
@@ -343,7 +344,7 @@ export async function writeLauncher(
     ...forwarded,
     // Hunk reviews the directory it starts in. Not every terminal honors its `--cwd` for the
     // pane's shell, so the script moves there itself; a failed `cd` still reaches the record below.
-    `cd ${q(options.launch.cwd)} && ${q(options.hunk)} ${options.launch.view} --extension ${q(options.bridge)}`,
+    `cd ${q(options.launch.cwd)} && ${q(options.hunk)} ${hunkArgs(options.launch.view, options.launch.base).map(q).join(" ")} --extension ${q(options.bridge)}`,
     "status=$?",
     // The bridge cannot report its own exit, so this record is how the host learns the review is
     // over (the pane closes itself on exit 0 in all three terminals).

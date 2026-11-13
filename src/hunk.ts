@@ -23,6 +23,7 @@ import {
 } from "./contract.js";
 import { parseConfig } from "./config.js";
 import { excerptFor, newSideLines } from "./excerpt.js";
+import { hunkArgs } from "./views.js";
 
 /**
  * View lifecycle of one review.
@@ -252,6 +253,16 @@ function watchWorkingTree(review: Review, live: LiveStatus): void {
 }
 
 /**
+ * True when the revision's new side is the working tree, so the file on disk can have moved since
+ * Hunk read it. `diff`, `branch`, and `codebase` all show the working tree as their new side.
+ */
+function newSideIsWorkingTree(revision: Revision): boolean {
+  return (
+    revision.kind === "working-tree" || revision.kind === "branch" || revision.kind === "codebase"
+  );
+}
+
+/**
  * True when the working-tree file no longer carries the reviewed NEW-side lines of `range`.
  *
  * Multiplexer mode only, where the agent keeps writing while the reviewer reads: the patch Hunk
@@ -385,9 +396,20 @@ async function resolvesToEmptyTree(cwd: string, revision: string): Promise<boole
  * selection of a single root commit) and `"<repo> <from>..<to>"` (a history range,
  * where `from` is the empty tree when the selection reaches the root commit). Anything
  * that does not resolve is recorded verbatim as `unresolved`; a SHA is never guessed.
+ *
+ * The views that compare the working tree to one known commit name their revision by
+ * themselves: their title is `<repo> <sha>`, which says nothing the view has not already decided,
+ * so they are answered before the title is read.
  */
-async function resolveRevision(cwd: string, view: View, title: string): Promise<Revision> {
+async function resolveRevision(launch: ReviewLaunch, view: View, title: string): Promise<Revision> {
+  const { cwd } = launch;
   if (view === "diff") return { kind: "working-tree" };
+  if (view === "codebase") return { kind: "codebase" };
+  if (view === "branch") {
+    const base = launch.base;
+    if (base === undefined) return { kind: "unresolved", description: title };
+    return { kind: "branch", base, abbrev: await abbreviation(cwd, [base]) };
+  }
   const unresolved: Revision = { kind: "unresolved", description: title };
   const tokens = title.trim().split(/\s+/);
   const target = tokens[tokens.length - 1];
@@ -597,7 +619,7 @@ async function saveMutation(
   // revision that is not the working tree, has nothing on disk to compare.
   const stale =
     review.launch.config.mode === "multiplexer" &&
-    revision.kind === "working-tree" &&
+    newSideIsWorkingTree(revision) &&
     note.anchor.newRange !== undefined &&
     file !== undefined &&
     workingTreeMoved(review.launch.cwd, record.path, file, note.anchor.newRange);
@@ -658,7 +680,13 @@ async function runSwitch(
       trustMounted = true;
       attempted = state.requested;
       review.state = beginReload(state, attempted);
-      await control(review, signal, ["session", "reload", session, "--", attempted]);
+      await control(review, signal, [
+        "session",
+        "reload",
+        session,
+        "--",
+        ...hunkArgs(attempted, review.launch.base),
+      ]);
       if (signal.aborted) return;
       review.state = confirmMount(review.state, attempted);
     }
@@ -702,10 +730,12 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const raw = process.env[REVIEW_ENV];
   if (!raw) throw new Error("pi-hunk's review extension must be launched by its host integration");
   const parsed = JSON.parse(raw) as ReviewLaunch;
+  const views: readonly View[] = ["diff", "show", "log", "branch", "codebase"];
   if (
     !parsed.journal ||
     !parsed.cwd ||
-    (parsed.view !== "diff" && parsed.view !== "show" && parsed.view !== "log")
+    !views.includes(parsed.view) ||
+    (parsed.base !== undefined && (typeof parsed.base !== "string" || parsed.base.length === 0))
   ) {
     throw new Error("Invalid pi-hunk review launch");
   }
@@ -715,6 +745,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     cwd: parsed.cwd,
     view: parsed.view,
     config,
+    ...(parsed.base === undefined ? {} : { base: parsed.base }),
   };
   if (!ownedReview) {
     ownedReview = {
@@ -743,6 +774,8 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const diff = compileHunkKey(launch.config.diff);
   const show = compileHunkKey(launch.config.show);
   const log = compileHunkKey(launch.config.log);
+  const branch = compileHunkKey(launch.config.branch);
+  const codebase = compileHunkKey(launch.config.codebase);
 
   hunk.on("startup", (_event, context) => {
     // Stopped is terminal: Hunk registers a replacement by importing the module again, so this
@@ -799,8 +832,10 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     const mounted = review.changeset;
     // Remounting the changeset whose revision is already known only moves the files: the key is
     // what the revision was derived from, so asking git again would repeat the same question.
-    // `diff` is always the working tree, and a title that names commit ids cannot go stale.
-    const reusable = view === "diff" || titleNamesCommits(changeset.title);
+    // `diff` is always the working tree, `branch` the base resolved at launch, `codebase` the
+    // empty tree, and a title that names commit ids cannot go stale.
+    const viewNamesRevision = view === "diff" || view === "branch" || view === "codebase";
+    const reusable = viewNamesRevision || titleNamesCommits(changeset.title);
     if (reusable && mounted._tag !== "Absent" && mounted.key === key) {
       review.changeset =
         mounted._tag === "Present"
@@ -813,7 +848,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     const reading: ChangesetState = {
       _tag: "Reading",
       key,
-      revision: resolveRevision(review.launch.cwd, view, changeset.title),
+      revision: resolveRevision(review.launch, view, changeset.title),
       files,
     };
     review.changeset = reading;
@@ -873,17 +908,39 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
           }
           return "handled";
         }
-        if (diff.matches(key) || show.matches(key)) {
+        if (
+          diff.matches(key) ||
+          show.matches(key) ||
+          branch.matches(key) ||
+          codebase.matches(key)
+        ) {
           context.notify(
-            "Diff/show switching is unavailable in history-selected reviews. Use the log key to return to history.",
+            "Switching views is unavailable in history-selected reviews. Use the log key to return to history.",
             "info",
           );
           return "handled";
         }
         return "pass";
       }
-      const target = diff.matches(key) ? "diff" : show.matches(key) ? "show" : undefined;
+      const target = diff.matches(key)
+        ? "diff"
+        : show.matches(key)
+          ? "show"
+          : branch.matches(key)
+            ? "branch"
+            : codebase.matches(key)
+              ? "codebase"
+              : undefined;
       if (!target) return "pass";
+      // The branch view compares a commit that only the host can find: without a base resolved at
+      // launch there is no diff to load, so the review stays where it is.
+      if (target === "branch" && launch.base === undefined) {
+        context.notify(
+          `pi-hunk could not find the branch's base commit at launch. Set "base" in the /hunk config file and reopen the review.`,
+          "error",
+        );
+        return "handled";
+      }
       if (bridge._tag === "Running") switchView(review, target, context, cancel.signal);
       return "handled";
     },

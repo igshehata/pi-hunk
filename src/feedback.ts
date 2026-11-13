@@ -141,6 +141,10 @@ function revisionKey(revision: Revision): string {
       return `commit:${revision.commit}:${revision.parent ?? ""}`;
     case "range":
       return `range:${revision.from ?? ""}:${revision.to}`;
+    case "branch":
+      return `branch:${revision.base}`;
+    case "codebase":
+      return "codebase";
     case "unresolved":
       return `unresolved:${revision.description}`;
   }
@@ -164,6 +168,12 @@ function revisionHeading(revision: Revision): string {
       const from = revision.from.slice(0, revision.abbrev);
       return `## Range ${from}..${to} (old: ${from}, new: ${to})`;
     }
+    case "branch": {
+      const base = revision.base.slice(0, revision.abbrev);
+      return `## Branch (old: merge-base ${base}, new: working tree)`;
+    }
+    case "codebase":
+      return "## Whole codebase (new: working tree)";
     case "unresolved":
       return `## Unverified revision: Hunk reported "${revision.description}"`;
   }

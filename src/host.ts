@@ -16,6 +16,7 @@ import {
 import { deliver, idleTick } from "./deliver.js";
 import { formatFeedback, readFeedback } from "./feedback.js";
 import { createLiveReview } from "./live.js";
+import { hunkArgs, launchBase } from "./views.js";
 
 interface Terminal {
   stop(): void;
@@ -397,7 +398,7 @@ async function waitForProcesses(
 }
 
 function startChild(launch: ReviewLaunch, bridge: string): OwnedChild {
-  const child = spawn("hunk", [launch.view, "--extension", bridge], {
+  const child = spawn("hunk", [...hunkArgs(launch.view, launch.base), "--extension", bridge], {
     cwd: launch.cwd,
     env: { ...process.env, [REVIEW_ENV]: JSON.stringify(launch) },
     stdio: "inherit",
@@ -852,7 +853,11 @@ export function createHost(bindings: HostBindings) {
             ? "show"
             : bindings.matchesKey(data, session.config.log)
               ? "log"
-              : undefined;
+              : bindings.matchesKey(data, session.config.branch)
+                ? "branch"
+                : bindings.matchesKey(data, session.config.codebase)
+                  ? "codebase"
+                  : undefined;
         if (!view) return;
         if (session.config.mode === "multiplexer") {
           // The handler stays installed: a host without Tern, Rex or Herdr falls back to the
@@ -933,6 +938,14 @@ export function createHost(bindings: HostBindings) {
       await access(bindings.bridge);
       signal.throwIfAborted();
       await requireHunk(signal);
+      // Every launch carries the base when one exists: the bridge needs it to switch to the
+      // branch view inside Hunk. Only that view refuses to open without one.
+      const resolvedBase = await launchBase(session.ctx.cwd, session.config, view);
+      signal.throwIfAborted();
+      if (resolvedBase._tag === "Refused") {
+        session.ctx.ui.notify(resolvedBase.message, "error");
+        return { _tag: "Finished" };
+      }
       const directory = await mkdtemp(join(tmpdir(), "pi-hunk-"));
       const journal = join(directory, "notes.jsonl");
       // From here a failure still names the journal, so saved comments stay recoverable.
@@ -945,6 +958,7 @@ export function createHost(bindings: HostBindings) {
         view,
         config: session.config,
         journal,
+        ...(resolvedBase.base === undefined ? {} : { base: resolvedBase.base }),
       };
       // The async factory does not mount a replacement editor. `done` closes it
       // after the child and terminal have both finished restoring.

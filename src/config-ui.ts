@@ -15,7 +15,7 @@ export interface ConfigUI {
   notify(message: string, type?: "info" | "warning" | "error"): void;
 }
 
-type KeyField = "prefix" | "diff" | "show" | "log";
+type KeyField = "prefix" | "diff" | "show" | "log" | "branch" | "codebase";
 
 // The unsaved draft travels inside the state: no second mutable "current config" lives beside it.
 type EditorState =
@@ -35,7 +35,7 @@ type MenuChoice =
 
 type Answer<T> = { readonly _tag: "Answer"; readonly value: T } | { readonly _tag: "Aborted" };
 
-const keyFields: readonly KeyField[] = ["prefix", "diff", "show", "log"];
+const keyFields: readonly KeyField[] = ["prefix", "diff", "show", "log", "branch", "codebase"];
 const deliveryChoices: readonly { value: Delivery; label: string }[] = [
   { value: "steer", label: "steer — deliver during the current response" },
   { value: "followUp", label: "followUp — wait until the current response finishes" },

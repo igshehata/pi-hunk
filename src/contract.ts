@@ -1,4 +1,4 @@
-export type View = "diff" | "show" | "log";
+export type View = "diff" | "show" | "log" | "branch" | "codebase";
 
 export type Delivery = "steer" | "followUp" | "interrupt";
 
@@ -14,8 +14,12 @@ export interface Config {
   readonly diff: string;
   readonly show: string;
   readonly log: string;
+  readonly branch: string;
+  readonly codebase: string;
   readonly delivery: Delivery;
   readonly mode: Mode;
+  /** Base branch the `branch` view compares against; absent means detect it at launch. */
+  readonly base?: string;
 }
 
 /** Private launch data passed only to the Hunk process owned by this extension. */
@@ -24,6 +28,8 @@ export interface ReviewLaunch {
   readonly view: View;
   readonly config: Config;
   readonly journal: string;
+  /** The merge-base SHA resolved at launch; absent when no base branch could be found. */
+  readonly base?: string;
 }
 
 export const REVIEW_ENV = "PI_HUNK_REVIEW";
@@ -50,6 +56,19 @@ export type Revision =
       /** Git's unique abbreviation length for these SHAs; the handoff shows them this short. */
       readonly abbrev: number;
     }
+  /**
+   * `hunk diff <merge-base>`: old side is the commit where the branch left its base, new side is
+   * the working tree.
+   */
+  | {
+      readonly kind: "branch";
+      /** Full merge-base SHA of the branch and its base branch. */
+      readonly base: string;
+      /** Git's unique abbreviation length for `base`; the handoff shows it this short. */
+      readonly abbrev: number;
+    }
+  /** `hunk diff <empty tree>`: old side is empty, new side is the working tree. */
+  | { readonly kind: "codebase" }
   /** Hunk's own description, verbatim, when the revision could not be verified. */
   | { readonly kind: "unresolved"; readonly description: string };
 

@@ -84,25 +84,47 @@ remount this extension; use a full restart.
 
 Press the prefix, release it, then press the view key:
 
-| Keys                                                  | Opens                              |
-| ----------------------------------------------------- | ---------------------------------- |
-| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>h</kbd> | Index vs working tree: `hunk diff` |
-| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>s</kbd> | Latest commit: `hunk show`         |
-| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>l</kbd> | Native history: `hunk log`         |
+| Keys                                                  | Opens                                          |
+| ----------------------------------------------------- | ---------------------------------------------- |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>h</kbd> | Index vs working tree: `hunk diff`             |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>s</kbd> | Latest commit: `hunk show`                     |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>l</kbd> | Native history: `hunk log`                     |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>b</kbd> | Your branch since it left its base: merge-base |
+| <kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>c</kbd> | The whole codebase as added files: empty tree  |
 
 1. **Open a view** from your agent’s terminal.
 2. **Review and save comments** using Hunk’s normal controls.
-3. **Switch diff/show views with the same keys** while on Hunk’s main review screen. Your saved
-   comments stay together.
+3. **Switch between diff/show/branch/codebase views with the same keys** while on Hunk’s main review
+   screen. Your saved comments stay together.
 4. **Close Hunk** to return to the agent and hand off your feedback. In a standalone review, this is
    normally <kbd>q</kbd>; in a log review, return to history first, then quit history. In
    [multiplexer mode](#beside-the-agent-multiplexer-mode) each comment is already sent, so closing
    Hunk hands off nothing.
 
 The prefix has no timeout. <kbd>Escape</kbd> cancels it; an unrelated next key passes through
-normally. Selecting the current diff/show view does nothing. Hunk controls native input routing:
-note-editor text is not interpreted as a view chord. Help and open menus do not necessarily disable
-view shortcuts.
+normally. Selecting the current view does nothing. Hunk controls native input routing: note-editor
+text is not interpreted as a view chord. Help and open menus do not necessarily disable view
+shortcuts.
+
+### Branch and whole-codebase reviews
+
+Two views review more than the working tree:
+
+**Branch** opens `hunk diff <merge-base>`. Its old side is the commit where your branch left its
+base branch; its new side is the working tree. One review therefore carries the branch’s commits,
+staged and unstaged changes, and untracked files. The base is detected at launch: the remote’s
+default branch (`origin/HEAD`), then `main`, then `master`. To name it yourself, set `"base"` in the
+configuration file. Being on the base branch is not an error—the view then shows the uncommitted
+work alone. When no base branch can be resolved, the branch view says what it tried and does not
+open; every other view still does.
+
+**Whole codebase** opens `hunk diff <empty tree>`. Its old side is empty, so every tracked and
+untracked, non-ignored file arrives as added lines. It loads every file: on a large repository it
+can take a few seconds to appear.
+
+Comments saved in either view record their revision like the others, so the handoff says whether a
+comment refers to the merge-base or to the whole codebase, and those line numbers are read against
+the working tree they were written from.
 
 ### Beside the agent (multiplexer mode)
 
@@ -142,13 +164,15 @@ history screen without closing Hunk or handing off comments. Quit history to sub
 comments from all selections together. Every saved comment records the exact revision its line
 numbers refer to, as full commit SHAs; a comment keeps that revision if it is edited later. Diff
 comments record the index and the working tree—their old side is the index (staged content) and
-their new side is the working tree. Show and history comments record the reviewed commit and its
-parent, or the selected range, so old/new line ranges are read against those versions rather than
-today’s files, even if the code or file was later removed or renamed. Renames also record the file’s
-previous path. When Hunk’s revision cannot be verified with Git, the comment records Hunk’s own text
-as unresolved instead of guessing. Git verification runs in the background, so opening or switching
-a review renders immediately; a comment saved before that lookup finishes still records the revision
-on screen at that moment, never the previous one.
+their new side is the working tree. Branch comments record the merge-base commit as their old side
+and the working tree as their new one; whole-codebase comments record the working tree as their only
+side. Show and history comments record the reviewed commit and its parent, or the selected range, so
+old/new line ranges are read against those versions rather than today’s files, even if the code or
+file was later removed or renamed. Renames also record the file’s previous path. When Hunk’s
+revision cannot be verified with Git, the comment records Hunk’s own text as unresolved instead of
+guessing. Git verification runs in the background, so opening or switching a review renders
+immediately; a comment saved before that lookup finishes still records the revision on screen at
+that moment, never the previous one.
 
 The handoff is readable on its own. Comments are grouped by the exact revision they refer to, named
 by short SHA as `git log --oneline` would. Each shows its file, old and new lines, and the reviewed
@@ -156,10 +180,10 @@ diff lines around the comment, and replies appear directly under the comment the
 adds no instructions of its own: how a review should be handled is your choice, so put that guidance
 in `AGENTS.md` or a skill.
 
-The prefix is not active on the history screen. Diff/show switching is intentionally unavailable
-inside history-selected reviews; those chords show a notice and leave the selection unchanged. The
-log chord does not switch a standalone diff/show review to history—close that review and launch log
-from the agent.
+The prefix is not active on the history screen. View switching is intentionally unavailable inside
+history-selected reviews; those chords show a notice and leave the selection unchanged. The log
+chord does not switch a standalone review to history—close that review and launch log from the
+agent.
 
 **Only saved comments are sent.** Unsaved drafts are not submitted, deleted notes are omitted, a
 reply whose comment was deleted is marked as such, and closing an empty review sends no message.
@@ -172,10 +196,11 @@ still sets up the new session; close any leftover `hunk` process yourself.
 ## Configure
 
 No configuration is required. Run **`/hunk config`** in Pi or OMP to open the host’s native
-interactive menu for the prefix, diff key, show key, log key, feedback delivery, and mode. **Save**
-persists your changes and applies them immediately—no restart needed. **Cancel** or
-<kbd>Escape</kbd> from the main menu discards the draft; <kbd>Escape</kbd> from a field returns to
-the menu without changing that field. Finish any active review before opening the menu.
+interactive menu for the prefix, diff key, show key, log key, branch key, codebase key, feedback
+delivery, and mode. **Save** persists your changes and applies them immediately—no restart needed.
+**Cancel** or <kbd>Escape</kbd> from the main menu discards the draft; <kbd>Escape</kbd> from a
+field returns to the menu without changing that field. Finish any active review before opening the
+menu.
 
 Settings are global to your active host/profile and independent between Pi and OMP. The default
 files are:
@@ -192,15 +217,23 @@ host’s `config.yml` or `settings.json` is left untouched. You can also edit th
   "diff": "h",
   "show": "s",
   "log": "l",
+  "branch": "b",
+  "codebase": "c",
   "delivery": "steer",
-  "mode": "static"
+  "mode": "static",
+  "base": "origin/main"
 }
 ```
 
 Every field is optional; omitted fields keep the defaults above. For example, `"prefix": "alt+z"`,
-`"diff": "d"`, `"show": "v"`, and `"log": "g"` give you another set of bindings. All three view keys
-must differ, and `escape` is reserved for canceling the prefix. Invalid configuration is reported,
-not silently repaired.
+`"diff": "d"`, `"show": "v"`, `"log": "g"`, `"branch": "w"`, and `"codebase": "a"` give you another
+set of bindings. All five view keys must differ, and `escape` is reserved for canceling the prefix.
+Invalid configuration is reported, not silently repaired.
+
+`base` names the branch the branch view compares against, as any ref Git accepts in the repository
+(`origin/main`, `develop`, a full ref name). It is not in the interactive menu: the menu never
+changes it, and **Save** writes it back exactly as you set it. Leave it out and pi-hunk detects the
+base itself.
 
 A field this build does not know — for example one a newer release added, before you rolled back —
 is reported by name and ignored, and every setting it does understand still applies. Save rewrites

@@ -8,9 +8,18 @@ export const DEFAULT_CONFIG: Config = Object.freeze({
   diff: "h",
   show: "s",
   log: "l",
+  branch: "b",
+  codebase: "c",
   delivery: "steer",
   mode: "static",
 });
+
+/**
+ * Every field this build understands. `base` has no default to fall back on, so it is kept
+ * beside `DEFAULT_CONFIG` rather than in it: an unknown-field check that read the defaults alone
+ * would report a `base` the user set as a field from a newer build and drop it on Save.
+ */
+const knownFields: ReadonlySet<string> = new Set([...Object.keys(DEFAULT_CONFIG), "base"]);
 
 const modifiers = ["ctrl", "alt", "shift"] as const;
 const keyPattern =
@@ -41,6 +50,13 @@ function key(value: unknown, field: string): string {
   return [...modifiers.filter((modifier) => selected.has(modifier)), base].join("+");
 }
 
+/** A base branch is named, not composed: one git ref, no whitespace and nothing to split. */
+function branchName(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "" || /\s/.test(value))
+    throw new Error("base must be a branch name");
+  return value;
+}
+
 /** A parsed file: the settings this build understands, plus the ones it had to skip. */
 export interface ParsedConfig {
   readonly config: Config;
@@ -55,7 +71,7 @@ export function parseConfig(value: unknown): ParsedConfig {
   const supplied = value as Record<string, unknown>;
   // A rolled-back build must keep working with a file a newer one wrote, so an unknown field is
   // reported to the user and ignored instead of disabling every known setting.
-  const ignored = Object.keys(supplied).filter((field) => !Object.hasOwn(DEFAULT_CONFIG, field));
+  const ignored = Object.keys(supplied).filter((field) => !knownFields.has(field));
   const prefix = key(
     supplied.prefix === undefined ? DEFAULT_CONFIG.prefix : supplied.prefix,
     "prefix",
@@ -63,10 +79,19 @@ export function parseConfig(value: unknown): ParsedConfig {
   const diff = key(supplied.diff === undefined ? DEFAULT_CONFIG.diff : supplied.diff, "diff");
   const show = key(supplied.show === undefined ? DEFAULT_CONFIG.show : supplied.show, "show");
   const log = key(supplied.log === undefined ? DEFAULT_CONFIG.log : supplied.log, "log");
+  const branch = key(
+    supplied.branch === undefined ? DEFAULT_CONFIG.branch : supplied.branch,
+    "branch",
+  );
+  const codebase = key(
+    supplied.codebase === undefined ? DEFAULT_CONFIG.codebase : supplied.codebase,
+    "codebase",
+  );
   const delivery = supplied.delivery === undefined ? DEFAULT_CONFIG.delivery : supplied.delivery;
-  if (diff === show || diff === log || show === log)
-    throw new Error("diff, show, and log must use different trigger keys");
-  if (diff === "escape" || show === "escape" || log === "escape") {
+  const views = [diff, show, log, branch, codebase];
+  if (new Set(views).size !== views.length)
+    throw new Error("diff, show, log, branch, and codebase must use different trigger keys");
+  if (views.includes("escape")) {
     throw new Error("Escape is reserved for canceling the prefix");
   }
   if (delivery !== "steer" && delivery !== "followUp" && delivery !== "interrupt") {
@@ -76,7 +101,21 @@ export function parseConfig(value: unknown): ParsedConfig {
   if (mode !== "static" && mode !== "multiplexer") {
     throw new Error("mode must be static or multiplexer");
   }
-  return { config: { prefix, diff, show, log, delivery, mode }, ignored };
+  const base = supplied.base === undefined ? undefined : branchName(supplied.base);
+  return {
+    config: {
+      prefix,
+      diff,
+      show,
+      log,
+      branch,
+      codebase,
+      delivery,
+      mode,
+      ...(base === undefined ? {} : { base }),
+    },
+    ignored,
+  };
 }
 
 /**

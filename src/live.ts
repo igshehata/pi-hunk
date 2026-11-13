@@ -13,6 +13,7 @@ import {
   type Multiplexer,
   type Pane,
 } from "./multiplexer.js";
+import { launchBase } from "./views.js";
 
 /** What a live review needs from a session; `HostContext` satisfies it. */
 type LiveContext = DeliveryTarget & { readonly cwd: string };
@@ -353,6 +354,10 @@ export function createLiveReview(bindings: {
     let pane: Pane | undefined;
     try {
       const hunk = await resolveHunk(process.env);
+      // Every launch carries the base when one exists: the bridge needs it to switch to the
+      // branch view inside Hunk. Only that view refuses to open without one.
+      const resolvedBase = await launchBase(session.ctx.cwd, session.config, view);
+      if (resolvedBase._tag === "Refused") throw new Error(resolvedBase.message);
       directory = await mkdtemp(join(tmpdir(), "pi-hunk-"));
       const journal = join(directory, "notes.jsonl");
       // Created here, empty: the launcher only ever appends, and the reader starts at byte 0.
@@ -363,6 +368,7 @@ export function createLiveReview(bindings: {
         view,
         config: session.config,
         journal,
+        ...(resolvedBase.base === undefined ? {} : { base: resolvedBase.base }),
       };
       await writeLauncher(launcher, {
         hunk,
