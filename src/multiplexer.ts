@@ -88,8 +88,12 @@ function parseJson(binary: string, stdout: string): unknown {
   }
 }
 
-/** Reads a non-empty string at `path`, so a changed CLI shape fails loudly instead of silently. */
-function readString(value: unknown, path: readonly string[], binary: string): string {
+/**
+ * Reads a pane id at `path`, so a changed CLI shape fails loudly instead of silently. Tern prints
+ * its ids as JSON numbers while Herdr and Rex print strings; every id is passed back on a command
+ * line, so it is kept as text.
+ */
+function readId(value: unknown, path: readonly string[], binary: string): string {
   let current: unknown = value;
   for (const key of path) {
     if (typeof current !== "object" || current === null) {
@@ -98,6 +102,7 @@ function readString(value: unknown, path: readonly string[], binary: string): st
     // Checked as an object above; the keys come from `path` because the shape is the CLI's.
     current = (current as Record<string, unknown>)[key];
   }
+  if (typeof current === "number" && Number.isSafeInteger(current)) return String(current);
   if (typeof current !== "string" || current === "") {
     throw new Error(`${basename(binary)} returned no ${path.join(".")}`);
   }
@@ -145,7 +150,7 @@ function createHerdr(hostPane: string, binary: string, env: NodeJS.ProcessEnv): 
         cwd,
         "--focus",
       ]);
-      const id = readString(parseJson(binary, stdout), ["result", "pane", "pane_id"], binary);
+      const id = readId(parseJson(binary, stdout), ["result", "pane", "pane_id"], binary);
       // Only an `exec`ed process makes Herdr close the pane when it exits; a plain `run` would
       // leave the shell prompt behind after `q`.
       await run(["pane", "run", id, `exec /bin/sh '${launcher}'`]);
@@ -238,7 +243,7 @@ function createTern(hostPane: string, binary: string, env: NodeJS.ProcessEnv): M
         "/bin/sh",
         launcher,
       ]);
-      const id = readString(parseJson(binary, stdout), ["block"], binary);
+      const id = readId(parseJson(binary, stdout), ["block"], binary);
       // A split never moves focus, so an unfocused pane would leave the user typing into the agent.
       await run(["focus", id, "--json"]);
       return { kind: "tern", id };
