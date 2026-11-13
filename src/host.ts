@@ -13,7 +13,9 @@ import {
   type ReviewLaunch,
   type View,
 } from "./contract.js";
+import { deliver, idleTick } from "./deliver.js";
 import { formatFeedback, readFeedback } from "./feedback.js";
+import { createLiveReview } from "./live.js";
 
 interface Terminal {
   stop(): void;
@@ -146,10 +148,7 @@ class HunkTeardownError extends Error {
 }
 
 const HUNK_INSTALL =
-  "Install Hunk 0.22.0 or newer from https://hunk.dev; pi-hunk does not install or upgrade Hunk.";
-
-/** How long `interrupt` delivery waits for the aborted turn to become idle before queueing. */
-const INTERRUPT_IDLE_TIMEOUT_MS = 30_000;
+  "Install Hunk 0.25.0 or newer from https://hunk.dev; pi-hunk does not install or upgrade Hunk.";
 
 /** Journals a `stop()` took over, each named once by the first hook that has the terminal back. */
 const abandoned = new Set<string>();
@@ -202,18 +201,6 @@ async function abandonReview(recovery: Recovery): Promise<void> {
   else await rm(dirname(journal), { recursive: true }).catch(() => {});
 }
 
-/**
- * Waits `ms`, returning as soon as `signal` aborts. Callers re-check `signal.aborted`; an abort is
- * never an error, because a cancelled operation sends nothing.
- */
-async function idleTick(ms: number, signal: AbortSignal): Promise<void> {
-  try {
-    await delay(ms, undefined, { signal });
-  } catch (error) {
-    if (!signal.aborted) throw error;
-  }
-}
-
 /** Resolves when `signal` aborts; never settles while the operation runs, and never rejects. */
 function untilAborted(signal: AbortSignal): Promise<undefined> {
   const { promise, resolve } = Promise.withResolvers<undefined>();
@@ -236,22 +223,22 @@ async function requireHunk(signal: AbortSignal): Promise<void> {
         }
         reject(
           new Error(
-            `Cannot run hunk: ${(stderr && stderr.trim()) || error.message}. pi-hunk requires Hunk 0.22.0 or newer. ${HUNK_INSTALL}`,
+            `Cannot run hunk: ${(stderr && stderr.trim()) || error.message}. pi-hunk requires Hunk 0.25.0 or newer. ${HUNK_INSTALL}`,
           ),
         );
         return;
       }
       const match = /(\d+)\.(\d+)\.(\d+)/.exec(stdout);
-      if (match && Number(match[1]) === 0 && Number(match[2]) < 22) {
+      if (match && Number(match[1]) === 0 && Number(match[2]) < 25) {
         reject(
           new Error(
-            `pi-hunk requires Hunk 0.22.0 or newer; PATH hunk reports ${match[0]}. ${HUNK_INSTALL}`,
+            `pi-hunk requires Hunk 0.25.0 or newer; PATH hunk reports ${match[0]}. ${HUNK_INSTALL}`,
           ),
         );
         return;
       }
       // Successful --version without x.y.z is not treated as outdated.
-      // Launch continues; the bridge still throws if apiVersion < 25.
+      // Launch continues; the bridge still throws if apiVersion < 33.
       resolve();
     },
   );
@@ -753,6 +740,16 @@ export function createHost(bindings: HostBindings) {
    * session replacement is not quitting: the process keeps its live TUI. `start()` clears it.
    */
   let hostClosing = false;
+  /**
+   * The one review that may live in a sibling pane. It outlives every state below, because a pane
+   * belongs to a session, not to a phase: the host closes it when the session does.
+   */
+  const live = createLiveReview({
+    bridge: bindings.bridge,
+    sendUserMessage: bindings.sendUserMessage,
+  });
+  /** A pane launch in flight; a stop must not let it open for a session that is already gone. */
+  let opening: AbortController | undefined;
 
   function stopCurrent(): Promise<void> {
     switch (state._tag) {
@@ -857,12 +854,52 @@ export function createHost(bindings: HostBindings) {
               ? "log"
               : undefined;
         if (!view) return;
+        if (session.config.mode === "multiplexer") {
+          // The handler stays installed: a host without Tern, Rex or Herdr falls back to the
+          // static review below, which rewires it after taking the terminal over.
+          void openLive(session, view);
+          return consumed;
+        }
         listening.unsubscribe();
         launch(session, view);
         return consumed;
       }),
     };
     state = listening;
+  }
+
+  /**
+   * Opens the review in a sibling pane, and keeps today's behaviour where there is no pane to put
+   * it in: the review takes the terminal over. Hunk is checked first, because a pane that fails to
+   * start would otherwise close itself before it could say why.
+   */
+  async function openLive(session: Session, view: View): Promise<void> {
+    const cancel = new AbortController();
+    opening = cancel;
+    try {
+      await requireHunk(cancel.signal);
+    } catch (error) {
+      if (!cancel.signal.aborted)
+        session.ctx.ui.notify(`Hunk review failed: ${asError(error).message}`, "error");
+      return;
+    } finally {
+      if (opening === cancel) opening = undefined;
+    }
+    if (cancel.signal.aborted) return;
+    if (state._tag !== "Listening" || state.session !== session) return;
+    const result = await live.open(session, view).catch((error: unknown) => {
+      session.ctx.ui.notify(`Hunk review failed: ${asError(error).message}`, "error");
+      return "failed" as const;
+    });
+    if (result !== "unsupported") return;
+    session.ctx.ui.notify(
+      "Multiplexer mode needs Tern, Rex, or Herdr; opening this review full-screen.",
+      "info",
+    );
+    // The static review takes the terminal over; only its own key handler may stay installed.
+    if (state._tag !== "Listening" || state.session !== session) return;
+    state.unsubscribe();
+    launch(session, view);
   }
 
   function launch(session: Session, view: View): void {
@@ -977,42 +1014,21 @@ export function createHost(bindings: HostBindings) {
         if (!abnormal && uncommitted === undefined) await rm(directory, { recursive: true });
         return { _tag: "Finished" };
       }
-      if (!session.ctx.isIdle() && session.config.delivery === "interrupt") {
-        // Native abort returns void. In particular Pi restores prior queues to
-        // its composer; we neither await abort nor replace those native semantics.
-        session.ctx.abort();
-        // An abort that never makes the session idle must not leave the review silent and the
-        // keyboard unowned: the wait is bounded and says what it is waiting for.
-        const deadline = Date.now() + INTERRUPT_IDLE_TIMEOUT_MS;
-        let announced = false;
-        while (!session.ctx.isIdle() && !signal.aborted && Date.now() < deadline) {
-          if (!announced) {
-            announced = true;
-            session.ctx.ui.notify(
-              "Hunk review: interrupting the current turn; waiting for the agent to become idle.",
-              "info",
-            );
-          }
-          await idleTick(20, signal);
-        }
-        if (!session.ctx.isIdle() && !signal.aborted)
-          session.ctx.ui.notify(
-            `Hunk review: the agent is still busy after interrupting; the comments were queued as a follow-up. Recovery: ${journal}`,
-            "warning",
-          );
-      }
+      // The same handoff the live review uses: the interrupt wait and its notices live in
+      // `deliver`, so a busy agent is handled identically whether comments arrive at close or one
+      // at a time. A cancelled review sends nothing and its journal is the only copy left.
+      await deliver(
+        session.ctx,
+        bindings.sendUserMessage,
+        session.config.delivery,
+        formatFeedback(notes),
+        signal,
+        journal,
+      );
       if (!active()) {
         await abandonReview(recovery);
         return { _tag: "Finished" };
       }
-      const message = formatFeedback(notes);
-      if (session.ctx.isIdle()) bindings.sendUserMessage(message);
-      else
-        bindings.sendUserMessage(message, {
-          // An interrupt that timed out falls back to the follow-up queue; comments are never
-          // dropped because the turn did not stop.
-          deliverAs: session.config.delivery === "steer" ? "steer" : "followUp",
-        });
       // Native sendUserMessage returns void and hides asynchronous failures.
       // Retain recovery rather than treating call acceptance as a receipt.
       return { _tag: "Finished" };
@@ -1092,12 +1108,16 @@ export function createHost(bindings: HostBindings) {
     request = mine;
     // This host is alive: a review cancelled here must restore its TUI like any other close.
     hostClosing = false;
+    // A pane launch from the session being replaced must not finish after it is gone.
+    opening?.abort();
     // A previous teardown can fail on unverifiable process cleanup. That error belongs to
     // `stop()`; the replacement session still needs its keyboard, so report it and load.
     const teardown = await stopCurrent().then(
       () => undefined,
       (error: unknown) => asError(error),
     );
+    // A pane belongs to the session that opened it: a replacement session starts without one.
+    await live.close();
     // A later start or stop supersedes this request while teardown is awaited.
     if (request !== mine || ctx.mode !== "tui") return;
     if (teardown !== undefined)
@@ -1149,7 +1169,10 @@ export function createHost(bindings: HostBindings) {
     stop: (quitting: boolean) => {
       request = { _tag: "Stop" };
       hostClosing = quitting;
-      return stopCurrent();
+      // A launch still in flight must not open a pane for a session that is already gone.
+      opening?.abort();
+      // The pane outlives no session: `stop` settles only once both are down.
+      return Promise.all([stopCurrent(), live.close()]).then(() => undefined);
     },
     /** OMP restores the terminal after its shutdown handler, so it reports once `stop` settles. */
     announceAbandoned: flushAbandoned,

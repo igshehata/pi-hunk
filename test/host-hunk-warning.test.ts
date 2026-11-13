@@ -122,7 +122,7 @@ async function runChord(hunkSource: string | undefined): Promise<{
 }
 
 const oldHunk = hunkScript(`if (process.argv[2] === "--version") {
-  process.stdout.write("0.21.1\\n");
+  process.stdout.write("0.24.0\\n");
   process.exit(0);
 }
 process.exit(2);
@@ -133,7 +133,7 @@ process.exit(1);
 `);
 
 const supportedHunk = hunkScript(`if (process.argv[2] === "--version") {
-  process.stdout.write("0.22.0\\n");
+  process.stdout.write("0.25.0\\n");
   process.exit(0);
 }
 process.exit(0);
@@ -145,17 +145,17 @@ describe("Hunk dependency warnings", () => {
     expect(events).toEqual([]);
     expect(notices).toHaveLength(1);
     expect(notices[0]!.type).toBe("error");
-    expect(notices[0]!.message).toContain("0.22.0");
+    expect(notices[0]!.message).toContain("0.25.0");
     expect(notices[0]!.message).toContain("https://hunk.dev");
   });
 
-  it("warns when hunk is older than 0.22.0 without taking the terminal", async () => {
+  it("warns when hunk is older than 0.25.0 without taking the terminal", async () => {
     const { notices, events } = await runChord(oldHunk);
     expect(events).toEqual([]);
     expect(notices).toHaveLength(1);
     expect(notices[0]!.type).toBe("error");
-    expect(notices[0]!.message).toContain("0.22.0");
-    expect(notices[0]!.message).toContain("0.21.1");
+    expect(notices[0]!.message).toContain("0.25.0");
+    expect(notices[0]!.message).toContain("0.24.0");
     expect(notices[0]!.message).toContain("https://hunk.dev");
   });
 
@@ -164,11 +164,11 @@ describe("Hunk dependency warnings", () => {
     expect(events).toEqual([]);
     expect(notices).toHaveLength(1);
     expect(notices[0]!.type).toBe("error");
-    expect(notices[0]!.message).toContain("0.22.0");
+    expect(notices[0]!.message).toContain("0.25.0");
     expect(notices[0]!.message).toContain("https://hunk.dev");
   });
 
-  it("takes the terminal when hunk reports 0.22.0", async () => {
+  it("takes the terminal when hunk reports 0.25.0", async () => {
     const { events } = await runChord(supportedHunk);
     expect(events).toEqual(["terminal-stop", "terminal-start"]);
   });

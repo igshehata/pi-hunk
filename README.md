@@ -27,9 +27,9 @@ file, old and new lines, and the reviewed diff lines. No copy/paste.
 
 ## Install
 
-You need **Node.js 22.19+**, **Pi or OMP**, and **Hunk 0.22.0+** available as `hunk` on your `PATH`.
+You need **Node.js 22.19+**, **Pi or OMP**, and **Hunk 0.25.0+** available as `hunk` on your `PATH`.
 [Install Hunk separately](https://hunk.dev); pi-hunk does not download or manage it. If `hunk` is
-missing, older than 0.22.0, or cannot be run, the host shows a warning and does not take over the
+missing, older than 0.25.0, or cannot be run, the host shows a warning and does not take over the
 terminal. pi-hunk never installs or upgrades Hunk for you.
 
 pi-hunk finds `ps` on your `PATH` (falling back to `/bin/ps` and `/usr/bin/ps`) to stop Hunk and the
@@ -95,12 +95,43 @@ Press the prefix, release it, then press the view key:
 3. **Switch diff/show views with the same keys** while on Hunk’s main review screen. Your saved
    comments stay together.
 4. **Close Hunk** to return to the agent and hand off your feedback. In a standalone review, this is
-   normally <kbd>q</kbd>; in a log review, return to history first, then quit history.
+   normally <kbd>q</kbd>; in a log review, return to history first, then quit history. In
+   [multiplexer mode](#beside-the-agent-multiplexer-mode) each comment is already sent, so closing
+   Hunk hands off nothing.
 
 The prefix has no timeout. <kbd>Escape</kbd> cancels it; an unrelated next key passes through
 normally. Selecting the current diff/show view does nothing. Hunk controls native input routing:
 note-editor text is not interpreted as a view chord. Help and open menus do not necessarily disable
 view shortcuts.
+
+### Beside the agent (multiplexer mode)
+
+With `"mode": "multiplexer"`, Hunk opens in a pane to the right of the agent in **Tern**, **Rex**,
+or **Herdr**. The agent keeps its own pane and answers there.
+
+Each saved comment, edit, deletion, or reply reaches the agent right away, using your `delivery`
+setting. You do not close Hunk to hand anything off.
+
+- **Open:** the same chords as above. If Hunk is already open, the chord focuses its pane.
+- **Close:** <kbd>q</kbd> in Hunk. Changing the session or quitting the host closes the pane too.
+
+The agent receives numbered messages, numbered per review:
+
+- `Hunk comment #3` — a new comment, with its revision, file, lines, reviewed diff lines, and body.
+- `Hunk comment #4 (reply to #3)` — a reply, with the comment it answers quoted.
+- `Hunk comment #3 edited` — the edited comment.
+- `Hunk comment #3 deleted.` — a removed comment.
+- When the file on disk no longer matched the reviewed lines at save time, the message adds: “The
+  file changed after this review loaded; line numbers refer to the reviewed version.”
+
+Hunk never moves on its own. It never scrolls, navigates, or reloads by itself, and changes on disk
+show nothing until you press <kbd>r</kbd>. The bottom status line shows `pi-hunk live · N sent`, and
+once the working tree changes it adds `files changed, r to refresh`. After <kbd>r</kbd>, older
+comment cards keep their old line numbers; that is a Hunk limitation, and those comments were
+already delivered.
+
+Outside Tern, Rex, and Herdr, multiplexer mode has no pane to open: the review opens full-screen, as
+in static mode, and the host shows a notice.
 
 ### History and Back
 
@@ -141,7 +172,7 @@ still sets up the new session; close any leftover `hunk` process yourself.
 ## Configure
 
 No configuration is required. Run **`/hunk config`** in Pi or OMP to open the host’s native
-interactive menu for the prefix, diff key, show key, log key, and feedback delivery. **Save**
+interactive menu for the prefix, diff key, show key, log key, feedback delivery, and mode. **Save**
 persists your changes and applies them immediately—no restart needed. **Cancel** or
 <kbd>Escape</kbd> from the main menu discards the draft; <kbd>Escape</kbd> from a field returns to
 the menu without changing that field. Finish any active review before opening the menu.
@@ -161,7 +192,8 @@ host’s `config.yml` or `settings.json` is left untouched. You can also edit th
   "diff": "h",
   "show": "s",
   "log": "l",
-  "delivery": "steer"
+  "delivery": "steer",
+  "mode": "static"
 }
 ```
 
@@ -185,9 +217,20 @@ and Save. Changes made through the command take effect immediately. Installing a
 still requires a full host restart—OMP’s `/reload` is not enough. If your OS or terminal intercepts
 <kbd>Ctrl</kbd> + <kbd>Space</kbd>, free that binding or choose another prefix.
 
+### Where Hunk opens
+
+| `mode`               | What happens                                                                                                     |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `"static"` — default | Hunk takes over the agent’s terminal; comments are handed off when you close it.                                 |
+| `"multiplexer"`      | Hunk opens in a pane to the right of the agent in Tern, Rex, or Herdr; each comment is delivered as you save it. |
+
+In a multiplexer, `delivery` decides how each live message reaches a busy agent, exactly as it does
+for a static handoff. Outside Tern, Rex, and Herdr, `"multiplexer"` falls back to a full-screen
+review with a notice.
+
 ### When the agent is busy
 
-| `delivery`          | What happens when you close Hunk                                                  |
+| `delivery`          | What happens when feedback is sent                                                |
 | ------------------- | --------------------------------------------------------------------------------- |
 | `"steer"` — default | Queue feedback to steer the current turn at the host’s next steering opportunity. |
 | `"followUp"`        | Wait for the current turn to finish, then send the feedback.                      |
@@ -229,7 +272,7 @@ bun run check
 ```
 
 The extension is for interactive TUI sessions, targeting macOS and Linux. Native smoke coverage:
-**macOS**, with Pi **0.84.4**, OMP **18.1.10**, and Hunk **0.22.0**. Linux native smoke verification
+**macOS**, with Pi **0.84.4**, OMP **18.1.10**, and Hunk **0.25.0**. Linux native smoke verification
 has not yet been performed.
 
 ## License

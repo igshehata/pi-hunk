@@ -9,6 +9,7 @@ export const DEFAULT_CONFIG: Config = Object.freeze({
   show: "s",
   log: "l",
   delivery: "steer",
+  mode: "static",
 });
 
 const modifiers = ["ctrl", "alt", "shift"] as const;
@@ -71,7 +72,11 @@ export function parseConfig(value: unknown): ParsedConfig {
   if (delivery !== "steer" && delivery !== "followUp" && delivery !== "interrupt") {
     throw new Error("delivery must be steer, followUp, or interrupt");
   }
-  return { config: { prefix, diff, show, log, delivery }, ignored };
+  const mode = supplied.mode === undefined ? DEFAULT_CONFIG.mode : supplied.mode;
+  if (mode !== "static" && mode !== "multiplexer") {
+    throw new Error("mode must be static or multiplexer");
+  }
+  return { config: { prefix, diff, show, log, delivery, mode }, ignored };
 }
 
 /**

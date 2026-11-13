@@ -2,12 +2,20 @@ export type View = "diff" | "show" | "log";
 
 export type Delivery = "steer" | "followUp" | "interrupt";
 
+/**
+ * `static`: Hunk takes over the host's terminal and comments are handed off when it closes.
+ * `multiplexer`: Hunk opens in a sibling pane (Tern, Rex, or Herdr) and every comment change is
+ * delivered as it is saved.
+ */
+export type Mode = "static" | "multiplexer";
+
 export interface Config {
   readonly prefix: string;
   readonly diff: string;
   readonly show: string;
   readonly log: string;
   readonly delivery: Delivery;
+  readonly mode: Mode;
 }
 
 /** Private launch data passed only to the Hunk process owned by this extension. */
@@ -59,6 +67,11 @@ export interface ReviewNote {
   readonly newRange?: readonly [number, number];
   /** Unified-diff lines of the reviewed patch around this comment. */
   readonly excerpt?: string;
+  /**
+   * Multiplexer mode only: the working-tree file no longer matched the reviewed lines when this
+   * comment was saved, so its line numbers refer to the reviewed version, not the file on disk.
+   */
+  readonly stale?: true;
   readonly body: string;
 }
 
@@ -67,7 +80,9 @@ export type ReviewEvent =
   | { readonly _tag: "Ready" }
   | { readonly _tag: "Upsert"; readonly note: ReviewNote }
   | { readonly _tag: "Remove"; readonly id: string }
-  | { readonly _tag: "Failure"; readonly message: string };
+  | { readonly _tag: "Failure"; readonly message: string }
+  /** Multiplexer mode only: written by the pane's launcher script after Hunk exits. */
+  | { readonly _tag: "Exited"; readonly status: number };
 
 /** Private child status: capture failed, so a partial journal must not be submitted. */
 export const CAPTURE_FAILURE_EXIT_CODE = 74;

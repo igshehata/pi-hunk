@@ -99,7 +99,7 @@ process.stdin.resume();
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 if (process.argv[2] === "--version") {
-  process.stdout.write("0.22.0\\n");
+  process.stdout.write("0.25.0\\n");
   process.exit(0);
 }
 writeFileSync(process.env.PI_HUNK_TEST_LAUNCHER_PID, String(process.pid));

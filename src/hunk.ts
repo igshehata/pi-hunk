@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, watch, type FSWatcher } from "node:fs";
+import { join } from "node:path";
 import {
   matchesKeyChord,
   parseKeyChord,
@@ -7,6 +8,8 @@ import {
   type ExtensionKeyEvent,
   type ExtensionReviewNote,
   type ExtensionReviewSnapshotNote,
+  type ExtensionStatusLineControls,
+  type ExtensionStatusSpan,
   type HunkExtensionAPI,
 } from "hunkdiff/extension";
 import {
@@ -19,7 +22,7 @@ import {
   type View,
 } from "./contract.js";
 import { parseConfig } from "./config.js";
-import { excerptFor } from "./excerpt.js";
+import { excerptFor, newSideLines } from "./excerpt.js";
 
 /**
  * View lifecycle of one review.
@@ -146,10 +149,133 @@ interface Review {
   readonly notes: Map<string, NoteState>;
 }
 
+/** The one control multiplexer mode paints from; a context without it is skipped silently. */
+interface StatusLineHost {
+  readonly statusLine?: ExtensionStatusLineControls;
+}
+
+/**
+ * Multiplexer-mode status: the one item reporting what the agent has received, plus whether the
+ * working tree moved since Hunk mounted its changeset. Static mode never fills it.
+ */
+interface LiveStatus {
+  /** Last context that can paint the status row; the watcher callback receives no context. */
+  host?: StatusLineHost;
+  /** True while the working tree changed after the mounted changeset was read. */
+  filesChanged: boolean;
+  /** True once this registration decided about the watcher, so a second startup adds no other. */
+  watching: boolean;
+  watcher?: FSWatcher;
+  /** Pending watcher debounce; cleared on shutdown. */
+  timer?: NodeJS.Timeout;
+}
+
 // Hunk imports the same module when replacing its extension registry. Keep review
 // ownership here, not in a factory instance that shutdown/startup will replace.
 // One Hunk child owns exactly one host-created journal; nothing survives its exit.
 let ownedReview: Review | undefined;
+
+/** Status item id multiplexer mode keeps for the whole session; Hunk scopes it per extension. */
+const LIVE_STATUS_ID = "live";
+
+/** One write burst is one change: editors emit several events for one save. */
+const WORKING_TREE_DEBOUNCE_MS = 300;
+
+/** Saved comments the journal holds right now: one Upsert per note, minus its Remove. */
+function sentCount(review: Review): number {
+  let sent = 0;
+  for (const state of review.notes.values()) if (state._tag === "Saved") sent += 1;
+  return sent;
+}
+
+/**
+ * Paint the permanent status item. Multiplexer mode only: the row must never appear and vanish
+ * mid-review, so it is set once at startup and updated from then on, never cleared.
+ *
+ * The context a watcher callback repaints from is the last one an event handed us. A registration
+ * Hunk has replaced can no longer paint, and not every context carries a status line, so a
+ * context that cannot paint here is skipped: the next event repaints from its own.
+ */
+function paintLiveStatus(review: Review, live: LiveStatus, context?: StatusLineHost): void {
+  const host = context ?? live.host;
+  if (host === undefined) return;
+  live.host = host;
+  const controls = host.statusLine;
+  if (controls === undefined) return;
+  const spans: ExtensionStatusSpan[] = [
+    { text: `pi-hunk live · ${sentCount(review)} sent`, tone: "muted" },
+  ];
+  if (live.filesChanged) spans.push({ text: " · files changed, r to refresh", tone: "accent" });
+  try {
+    controls.set({ id: LIVE_STATUS_ID, spans });
+  } catch {
+    // A context from a replaced registration cannot paint; the next event repaints its own.
+  }
+}
+
+/**
+ * Follow the working tree so the status item can report that the files moved. Hunk shows nothing
+ * until the user presses `r`, so this only reports: no reload, no notice, no navigation. A
+ * platform that cannot watch recursively, or a failing watch, leaves the rest of the review as
+ * it is.
+ */
+function watchWorkingTree(review: Review, live: LiveStatus): void {
+  live.watching = true;
+  try {
+    const watcher = watch(review.launch.cwd, { recursive: true }, (_event, filename) => {
+      // Hunk keeps its own git state in `.git`; the reviewed files are everything else.
+      const name = filename?.replace(/\\/g, "/");
+      if (name === ".git" || name?.startsWith(".git/")) return;
+      clearTimeout(live.timer);
+      const timer = setTimeout(() => {
+        live.timer = undefined;
+        live.filesChanged = true;
+        paintLiveStatus(review, live);
+      }, WORKING_TREE_DEBOUNCE_MS);
+      // The indicator must not keep Hunk's process alive once the review is over.
+      timer.unref();
+      live.timer = timer;
+    });
+    watcher.on("error", () => {
+      // An unwatchable tree is not a review failure: drop the indicator, keep the review.
+      live.watcher = undefined;
+      try {
+        watcher.close();
+      } catch {
+        // Already closed.
+      }
+    });
+    live.watcher = watcher;
+  } catch {
+    live.watcher = undefined;
+  }
+}
+
+/**
+ * True when the working-tree file no longer carries the reviewed NEW-side lines of `range`.
+ *
+ * Multiplexer mode only, where the agent keeps writing while the reviewer reads: the patch Hunk
+ * mounted is what the comment's line numbers name, so it is what the file is compared against.
+ * One file read is cheap enough for the save path; an unreadable or missing file is exactly the
+ * case this flag exists for.
+ */
+function workingTreeMoved(
+  cwd: string,
+  path: string,
+  file: ReviewedFile,
+  range: readonly [number, number],
+): boolean {
+  const reviewed = newSideLines(file.patch, range);
+  if (reviewed === undefined) return false;
+  let current: readonly string[];
+  try {
+    current = readFileSync(join(cwd, path), "utf8").split("\n");
+  } catch {
+    return true;
+  }
+  for (const [line, text] of reviewed) if (current[line - 1] !== text) return true;
+  return false;
+}
 
 /** Compile physical Alt spellings emitted by Hunk's public Kitty and legacy events. */
 function compileHunkKey(chord: string) {
@@ -466,6 +592,15 @@ async function saveMutation(
     note.markup ?? (note.rationale ? `${note.summary}\n\n${note.rationale}` : note.summary);
   // A switch keeps the last mounted view authoritative until the replacement mounts.
   const view = frozen?.view ?? (state._tag === "Switching" ? state.mounted : state.view);
+  // Multiplexer mode only: the agent writes while the reviewer reads, so say whether the file
+  // still carries the lines these line numbers name. A note pinned to the old side, or to a
+  // revision that is not the working tree, has nothing on disk to compare.
+  const stale =
+    review.launch.config.mode === "multiplexer" &&
+    revision.kind === "working-tree" &&
+    note.anchor.newRange !== undefined &&
+    file !== undefined &&
+    workingTreeMoved(review.launch.cwd, record.path, file, note.anchor.newRange);
   const saved: ReviewNote = {
     id: note.id,
     ...(note.parentId === undefined ? {} : { parentId: note.parentId }),
@@ -476,6 +611,7 @@ async function saveMutation(
     ...(note.anchor.oldRange === undefined ? {} : { oldRange: note.anchor.oldRange }),
     ...(note.anchor.newRange === undefined ? {} : { newRange: note.anchor.newRange }),
     ...(excerpt === undefined ? {} : { excerpt }),
+    ...(stale ? { stale: true as const } : {}),
     body,
   };
   append(review, { _tag: "Upsert", note: saved });
@@ -558,9 +694,9 @@ function switchView(
 }
 
 export default function hunkBridge(hunk: HunkExtensionAPI): void {
-  if (hunk.apiVersion < 25) {
+  if (hunk.apiVersion < 33) {
     throw new Error(
-      `pi-hunk requires Hunk 0.22.0 (extension API 25) or newer; this Hunk reports API ${hunk.apiVersion}`,
+      `pi-hunk requires Hunk 0.25.0 (extension API 33) or newer; this Hunk reports API ${hunk.apiVersion}`,
     );
   }
   const raw = process.env[REVIEW_ENV];
@@ -595,6 +731,8 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const navigation: Navigation =
     launch.view === "log" ? { _tag: "History" } : { _tag: "SwitchableViews" };
   let bridge: BridgeState = { _tag: "Registered" };
+  // Multiplexer mode's one status item and its working-tree watcher; unused in static mode.
+  const live: LiveStatus = { filesChanged: false, watching: false };
   // Journal writes run one at a time: a save waiting for its revision must not let a later note
   // event overtake it, and the journal keeps the order the user worked in.
   let capture: Promise<void> = Promise.resolve();
@@ -620,6 +758,12 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     } catch (error) {
       failCapture(review, context, error);
     }
+    // Multiplexer mode owns one status item for the whole session: setting it here keeps the row
+    // from appearing and disappearing later, and the watcher only ever changes its text.
+    if (launch.config.mode === "multiplexer" && review.state._tag !== "Failed") {
+      paintLiveStatus(review, live, context);
+      if (!live.watching) watchWorkingTree(review, live);
+    }
     // A switch left pending by the registration this one replaced gets its reconciler back, and
     // must reload before it can finish: the abandoned reload may have mounted its own target.
     const state = review.state;
@@ -628,7 +772,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     }
   });
 
-  hunk.on("changeset_loaded", ({ changeset }) => {
+  hunk.on("changeset_loaded", ({ changeset }, context) => {
     if (bridge._tag !== "Running") return;
     const state = review.state;
     if (state._tag === "Failed") return;
@@ -636,6 +780,12 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     // review is showing the stable view the last switch settled on.
     const view = state._tag === "Switching" ? state.target : state.view;
     review.state = confirmMount(state, view);
+    // A changeset reached here because the user reloaded (`r`) or switched views, so the files
+    // on disk are the ones this review now carries and nothing is behind anymore.
+    if (launch.config.mode === "multiplexer") {
+      live.filesChanged = false;
+      paintLiveStatus(review, live, context);
+    }
     const files = new Map(
       changeset.files.map((file): [string, ReviewedFile] => [
         file.id,
@@ -698,6 +848,8 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
         } else {
           await saveMutation(review, state, changeset, note);
         }
+        // The item counts what the journal holds, so it is repainted after the write, not before.
+        if (launch.config.mode === "multiplexer") paintLiveStatus(review, live, context);
       } catch (error) {
         failCapture(review, context, error);
       }
@@ -755,5 +907,15 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
     // it came from nor reported as mounted, because only the replacing registration, reading
     // the changeset Hunk reloads for it, can tell what actually mounted.
     cancel.abort();
+    // The watcher belongs to this registration: a replacement starts its own, and a closed tree
+    // must not leave a timer painting into a review this registration no longer owns.
+    clearTimeout(live.timer);
+    live.timer = undefined;
+    try {
+      live.watcher?.close();
+    } catch {
+      // Already closed.
+    }
+    live.watcher = undefined;
   });
 }
