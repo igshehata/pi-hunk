@@ -143,18 +143,24 @@ function revisionKey(revision: Revision): string {
   }
 }
 
+/** SHAs are shown at git's own unique abbreviation; grouping still uses the full ids. */
 function revisionHeading(revision: Revision): string {
   switch (revision.kind) {
     case "working-tree":
       return "## Working tree (old: index, new: working tree)";
-    case "commit":
+    case "commit": {
+      const commit = revision.commit.slice(0, revision.abbrev);
       return revision.parent === undefined
-        ? `## Commit ${revision.commit} (root commit; old side empty)`
-        : `## Commit ${revision.commit} (old: parent ${revision.parent}, new: ${revision.commit})`;
-    case "range":
-      return revision.from === undefined
-        ? `## Range from the empty tree to ${revision.to} (includes the root commit)`
-        : `## Range ${revision.from}..${revision.to} (old: ${revision.from}, new: ${revision.to})`;
+        ? `## Commit ${commit} (root commit; old side empty)`
+        : `## Commit ${commit} (old: parent ${revision.parent.slice(0, revision.abbrev)}, new: ${commit})`;
+    }
+    case "range": {
+      const to = revision.to.slice(0, revision.abbrev);
+      if (revision.from === undefined)
+        return `## Range from the empty tree to ${to} (includes the root commit)`;
+      const from = revision.from.slice(0, revision.abbrev);
+      return `## Range ${from}..${to} (old: ${from}, new: ${to})`;
+    }
     case "unresolved":
       return `## Unverified revision: Hunk reported "${revision.description}"`;
   }

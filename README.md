@@ -119,10 +119,11 @@ as unresolved instead of guessing. Git verification runs in the background, so o
 a review renders immediately; a comment saved before that lookup finishes still records the revision
 on screen at that moment, never the previous one.
 
-The handoff is readable on its own. Comments are grouped by the exact revision they refer to, each
-shows its file, old and new lines, and the reviewed diff lines around the comment, and replies
-appear directly under the comment they answer. pi-hunk adds no instructions of its own: how a review
-should be handled is your choice, so put that guidance in `AGENTS.md` or a skill.
+The handoff is readable on its own. Comments are grouped by the exact revision they refer to, named
+by short SHA as `git log --oneline` would. Each shows its file, old and new lines, and the reviewed
+diff lines around the comment, and replies appear directly under the comment they answer. pi-hunk
+adds no instructions of its own: how a review should be handled is your choice, so put that guidance
+in `AGENTS.md` or a skill.
 
 The prefix is not active on the history screen. Diff/show switching is intentionally unavailable
 inside history-selected reviews; those chords show a notice and leave the selection unchanged. The

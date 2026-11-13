@@ -30,6 +30,8 @@ export type Revision =
       readonly commit: string;
       /** Full parent SHA; absent for a root commit. */
       readonly parent?: string;
+      /** Git's unique abbreviation length for these SHAs; the handoff shows them this short. */
+      readonly abbrev: number;
     }
   | {
       readonly kind: "range";
@@ -37,6 +39,8 @@ export type Revision =
       readonly from?: string;
       /** Full `to` SHA. */
       readonly to: string;
+      /** Git's unique abbreviation length for these SHAs; the handoff shows them this short. */
+      readonly abbrev: number;
     }
   /** Hunk's own description, verbatim, when the revision could not be verified. */
   | { readonly kind: "unresolved"; readonly description: string };
