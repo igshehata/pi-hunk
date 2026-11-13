@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createInterface } from "node:readline/promises";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,7 +12,6 @@ const RUN_ID_PATTERNS = [
   /\bgh run view (\d+)\b/g,
 ];
 const SHA1 = /^[0-9a-f]{40}$/;
-const VERIFY_JOB = /^Verify pi-hunk@(0\.0\.0-canary\.[1-9]\d*\.[1-9]\d*)$/;
 const STAGE_JOB = /^Stage pi-hunk@(0\.0\.0-canary\.[1-9]\d*\.[1-9]\d*)$/;
 const RUN_FIELDS =
   "attempt,conclusion,event,headBranch,headSha,jobs,number,status,url,workflowName";
@@ -84,7 +84,8 @@ function githubRepoFromOrigin(url) {
   return `${parts[0]}/${parts[1]}`;
 }
 
-function requireCleanMatchingMain() {
+/** The pushed branch to build: a clean checkout whose HEAD is exactly what origin has. */
+function requireCleanPushedBranch() {
   if (requireCommand("git", ["status", "--porcelain=v1"]) !== "") {
     fail("working tree is dirty; refusing to dispatch a different or unpublished revision");
   }
@@ -93,22 +94,28 @@ function requireCleanMatchingMain() {
     .map((name) => name.trim())
     .filter(Boolean);
   if (!remotes.includes("origin")) fail("no origin remote");
+  const branchResult = run("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  const branch = (branchResult.stdout ?? "").trim();
+  if (branchResult.status !== 0 || branch === "") fail("HEAD is detached; check out a branch");
   const head = git(["rev-parse", "HEAD"]);
   if (!SHA1.test(head)) fail(`HEAD is not a full SHA: ${head}`);
-  const remoteLines = git(["ls-remote", "origin", "refs/heads/main"])
+  const ref = `refs/heads/${branch}`;
+  const remoteLines = git(["ls-remote", "origin", ref])
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
   if (remoteLines.length !== 1) {
-    fail(`expected exactly one origin refs/heads/main line, got ${remoteLines.length}`);
+    fail(`expected exactly one origin ${ref} line, got ${remoteLines.length}; push ${branch}`);
   }
   const [remoteSha, remoteRef] = remoteLines[0].split("\t");
-  if (remoteRef !== "refs/heads/main" || !SHA1.test(remoteSha)) {
-    fail(`origin/main is not a full SHA on refs/heads/main: ${remoteLines[0]}`);
+  if (remoteRef !== ref || !SHA1.test(remoteSha)) {
+    fail(`origin/${branch} is not a full SHA on ${ref}: ${remoteLines[0]}`);
   }
-  if (head !== remoteSha) fail(`local HEAD ${head} does not match origin/main ${remoteSha}`);
+  if (head !== remoteSha) {
+    fail(`local HEAD ${head} does not match origin/${branch} ${remoteSha}; push it first`);
+  }
   const originUrl = git(["config", "--get", "remote.origin.url"]);
-  return { head, repo: githubRepoFromOrigin(originUrl) };
+  return { branch, head, repo: githubRepoFromOrigin(originUrl) };
 }
 
 function parseDispatchRunId(stdout, stderr) {
@@ -145,18 +152,12 @@ async function waitForRun(repo, runId, head, timeoutMs, pollMs) {
       fail(`run ${runId} headSha ${run.headSha} does not match ${head}`);
     }
     if (run.status === "completed") return run;
-    if (run.status === "waiting" || run.status === "pending" || run.status === "action_required") {
-      console.error(
-        `GitHub environment protection is pending for npm-release on run ${runId}. Approve it in the GitHub UI. This command does not bypass protection.`,
-      );
-      if (run.url) console.error(run.url);
-    }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   fail(`timed out waiting for run ${runId} (status ${run?.status ?? "unknown"})`);
 }
 
-function requireSuccessfulCanaryRun(run, head, runId) {
+function requireSuccessfulCanaryRun(run, head, branch, runId) {
   for (const field of [
     "attempt",
     "conclusion",
@@ -175,38 +176,32 @@ function requireSuccessfulCanaryRun(run, head, runId) {
     fail(`run ${runId} conclusion is ${run.conclusion}, not success`);
   if (run.event !== "workflow_dispatch")
     fail(`run ${runId} event is ${run.event}, not workflow_dispatch`);
-  if (run.headBranch !== "main") fail(`run ${runId} branch is ${run.headBranch}, not main`);
+  if (run.headBranch !== branch) fail(`run ${runId} branch is ${run.headBranch}, not ${branch}`);
   if (run.headSha !== head) fail(`run ${runId} headSha ${run.headSha} does not match ${head}`);
-  if (run.workflowName !== "Release")
-    fail(`run ${runId} workflow is ${run.workflowName}, not Release`);
+  if (run.workflowName !== "Canary")
+    fail(`run ${runId} workflow is ${run.workflowName}, not Canary`);
   if (!Array.isArray(run.jobs)) fail(`run ${runId} jobs is not an array`);
 }
 
-function retainedCanaryVersion(run) {
-  const verify = new Set();
-  const stage = new Set();
+/** The version the stage job staged, named by that job; it must belong to this run. */
+function stagedCanaryVersion(run, runId) {
+  const staged = new Set();
   for (const job of run.jobs) {
-    const verifyMatch = VERIFY_JOB.exec(job?.name ?? "");
-    const stageMatch = STAGE_JOB.exec(job?.name ?? "");
-    if (verifyMatch) verify.add(verifyMatch[1]);
-    if (stageMatch) stage.add(stageMatch[1]);
+    const match = STAGE_JOB.exec(job?.name ?? "");
+    if (match) staged.add(match[1]);
   }
-  if (verify.size !== 1 || stage.size !== 1) {
+  if (staged.size !== 1) {
     fail(
-      `could not read a unique retained canary version from Verify/Stage job names (verify=${[...verify].join(",") || "none"} stage=${[...stage].join(",") || "none"})`,
+      `could not read a unique canary version from Stage job names (${[...staged].join(",") || "none"})`,
     );
   }
-  const version = [...verify][0];
-  if (version !== [...stage][0])
-    fail(`Verify/Stage job versions disagree: ${version} vs ${[...stage][0]}`);
+  const version = [...staged][0];
   const match = CANARY_VERSION.exec(version);
-  if (String(run.number) !== match[1]) {
-    fail(
-      `retained version ${version} belongs to run ${match[1]}, not workflow run number ${run.number}`,
-    );
+  if (match[1] !== String(runId)) {
+    fail(`staged version ${version} belongs to run ${match[1]}, not run ${runId}`);
   }
   if (Number(match[2]) > Number(run.attempt)) {
-    fail(`retained version ${version} attempt is ahead of workflow attempt ${run.attempt}`);
+    fail(`staged version ${version} attempt is ahead of workflow attempt ${run.attempt}`);
   }
   const stageJob = run.jobs.find((job) => job.name === `Stage pi-hunk@${version}`);
   if (stageJob?.conclusion !== "success") {
@@ -310,6 +305,16 @@ function inspectStage(repo, runId, stage, version) {
   }
 }
 
+/** Asks on the terminal; anything but y/yes declines. */
+async function confirm(question) {
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return /^y(es)?$/i.test((await prompt.question(question)).trim());
+  } finally {
+    prompt.close();
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   let dryRun = false;
@@ -317,67 +322,86 @@ async function main() {
     if (arg === "--dry-run") dryRun = true;
     else fail("usage: release-canary.mjs [--dry-run]");
   }
-  const timeoutMs = integerEnv("RELEASE_CANARY_TIMEOUT_MS", 45 * 60 * 1000);
+  const timeoutMs = integerEnv("RELEASE_CANARY_TIMEOUT_MS", 20 * 60 * 1000);
   const pollMs = integerEnv("RELEASE_CANARY_POLL_MS", 5000);
   const packageJson = parseJson(readFileSync(join(root, "package.json"), "utf8"), "package.json");
   if (packageJson.name !== "pi-hunk") fail("package name is not pi-hunk");
-  const { head, repo } = requireCleanMatchingMain();
+  const { branch, head, repo } = requireCleanPushedBranch();
+  const dispatchArgs = ["workflow", "run", "canary.yml", "--ref", branch, "--repo", repo];
 
   if (dryRun) {
-    console.error(`Canary release dry-run for ${repo} at ${head}`);
-    console.error("would dispatch: gh workflow run release.yml --ref main --repo " + repo);
+    console.error(`Canary release dry-run for ${repo} ${branch} at ${head}`);
+    console.error(`would dispatch: gh ${dispatchArgs.join(" ")}`);
     console.error("would require the dispatch output's exact run id");
-    console.error("would not approve, publish, tag, merge, or bypass npm-release");
+    console.error("would ask before running npm stage approve (npm 2FA)");
     console.log(
       JSON.stringify({
         status: "dry-run",
         package: "pi-hunk",
         repo,
+        branch,
         commit: head,
-        wouldDispatch: ["gh", "workflow", "run", "release.yml", "--ref", "main", "--repo", repo],
-        remainingGates: [
-          "GitHub environment npm-release",
-          "npm stage approve <stage-id> (npm 2FA)",
-        ],
+        wouldDispatch: ["gh", ...dispatchArgs],
+        remainingGates: ["npm stage approve <stage-id> (npm 2FA)"],
       }),
     );
     return;
   }
 
-  const dispatch = run("gh", ["workflow", "run", "release.yml", "--ref", "main", "--repo", repo]);
+  const dispatch = run("gh", dispatchArgs);
   if (dispatch.status !== 0) {
     const detail = `${dispatch.stderr || dispatch.stdout || ""}`.trim();
     fail(`workflow dispatch failed (${dispatch.status})${detail ? `: ${detail}` : ""}`);
   }
   const runId = parseDispatchRunId(dispatch.stdout, dispatch.stderr);
-  console.error(`Dispatched Release workflow_dispatch run ${runId} on ${repo}`);
+  console.error(`Dispatched Canary run ${runId} on ${repo} ${branch}; waiting for it to stage.`);
   const workflowRun = await waitForRun(repo, runId, head, timeoutMs, pollMs);
-  requireSuccessfulCanaryRun(workflowRun, head, runId);
-  const version = retainedCanaryVersion(workflowRun);
+  requireSuccessfulCanaryRun(workflowRun, head, branch, runId);
+  const version = stagedCanaryVersion(workflowRun, runId);
   const stage = selectStage(version);
   const shasum = inspectStage(repo, runId, stage, version);
 
-  console.error(`pi-hunk@${version} is staged on npm tag canary from ${head}, not public.`);
+  console.error(`pi-hunk@${version} is staged on npm tag canary from ${branch} ${head}.`);
   console.error(`Stage id: ${stage.id}`);
   if (workflowRun.url) console.error(`Run: ${workflowRun.url}`);
-  console.error("Remaining approval gate (npm 2FA; this command does not run it):");
+  const result = {
+    package: "pi-hunk",
+    version,
+    tag: "canary",
+    repo,
+    branch,
+    commit: head,
+    runId,
+    runAttempt: workflowRun.attempt,
+    stageId: stage.id,
+    shasum,
+    runUrl: workflowRun.url ?? null,
+  };
+
+  // Publishing is the maintainer's own npm 2FA, asked for on their terminal. Without one there is
+  // nobody to ask, so the stage is left for `npm stage approve`.
+  const interactive = process.stdin.isTTY && process.stderr.isTTY;
+  if (interactive && (await confirm(`Publish pi-hunk@${version} to npm tag canary? [y/N] `))) {
+    const approve = spawnSync("npm", ["stage", "approve", stage.id], {
+      cwd: root,
+      env: childEnv(),
+      stdio: "inherit",
+    });
+    if (approve.status === 0) {
+      console.error(`Published pi-hunk@${version}. Install it with:`);
+      console.error(`  omp plugin install pi-hunk@${version} --force`);
+      console.error(`  pi install npm:pi-hunk@${version}`);
+      console.log(JSON.stringify({ status: "published", ...result }));
+      return;
+    }
+    console.error("npm stage approve did not publish it (npm may still be scanning the package).");
+  }
+  console.error("Publish it with npm 2FA when ready:");
   console.error(`  npm stage approve ${stage.id}`);
-  console.error("Canary releases do not get Git tags or GitHub Releases.");
   console.log(
     JSON.stringify({
       status: "staged",
-      package: "pi-hunk",
-      version,
-      tag: "canary",
-      stream: "canary",
-      repo,
-      commit: head,
-      runId,
-      runNumber: workflowRun.number,
-      runAttempt: workflowRun.attempt,
-      stageId: stage.id,
-      shasum,
-      runUrl: workflowRun.url ?? null,
+      ...result,
       remainingGates: [`npm stage approve ${stage.id}`],
     }),
   );

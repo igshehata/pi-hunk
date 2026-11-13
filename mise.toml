@@ -57,10 +57,10 @@ description = "Show pending Changesets and the resulting version"
 run = "bunx changeset status"
 
 [tasks."release:canary:preview"]
-description = "Preview the rolling canary package identity"
-run = "CANARY_RUN_NUMBER=1 CANARY_RUN_ATTEMPT=1 node scripts/prepare-canary-version.mjs"
+description = "Preview the canary package identity"
+run = "CANARY_RUN_ID=1 CANARY_RUN_ATTEMPT=1 node scripts/prepare-canary-version.mjs"
 [tasks."release:canary"]
-description = "Dispatch the rolling canary from matching main and stop at the staged npm package"
+description = "Stage a canary from the pushed current branch, then publish it with npm 2FA"
 raw_args = true
 run = "node scripts/release-canary.mjs"
 
