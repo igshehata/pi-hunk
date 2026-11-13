@@ -38,7 +38,7 @@ describe("saved review feedback", () => {
         note: {
           id: "removed",
           view: "show",
-          revision: { kind: "commit", commit: "a".repeat(40) },
+          revision: { kind: "commit", commit: "a".repeat(40), abbrev: 7 },
           path: "committed.ts",
           body: "Remove me",
         },

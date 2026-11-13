@@ -207,6 +207,21 @@ async function resolveCommit(cwd: string, revision: string): Promise<string | nu
 }
 
 /**
+ * The shortest length git itself uses to name every one of `ids` unambiguously, as
+ * `git log --oneline` would. A full SHA stays the identity; this only shortens what the agent
+ * reads. When git cannot answer, the full length keeps the id usable.
+ */
+async function abbreviation(cwd: string, ids: readonly string[]): Promise<number> {
+  const lengths = await Promise.all(
+    ids.map(async (id) => {
+      const short = await gitQuery(cwd, ["rev-parse", "--short", id]);
+      return short !== null && id.startsWith(short) ? short.length : id.length;
+    }),
+  );
+  return Math.max(...lengths);
+}
+
+/**
  * The empty tree id of each reviewed repository. It is a constant of the object format, so one
  * query per repository answers every root-commit range; Hunk's abbreviated ids are matched
  * against it by prefix instead of asking git to expand an object it does not have.
@@ -256,16 +271,20 @@ async function resolveRevision(cwd: string, view: View, title: string): Promise<
     const to = await resolveCommit(cwd, target.slice(separator + 2));
     if (to === null) return unresolved;
     const fromToken = target.slice(0, separator);
-    if (fromToken.length === 0) return { kind: "range", to };
+    if (fromToken.length === 0) return { kind: "range", to, abbrev: await abbreviation(cwd, [to]) };
     const from = await resolveCommit(cwd, fromToken);
-    if (from !== null) return { kind: "range", from, to };
-    return (await resolvesToEmptyTree(cwd, fromToken)) ? { kind: "range", to } : unresolved;
+    if (from !== null)
+      return { kind: "range", from, to, abbrev: await abbreviation(cwd, [from, to]) };
+    return (await resolvesToEmptyTree(cwd, fromToken))
+      ? { kind: "range", to, abbrev: await abbreviation(cwd, [to]) }
+      : unresolved;
   }
   if (tokens[tokens.length - 2] !== "show") return unresolved;
   const commit = await resolveCommit(cwd, target);
   if (commit === null) return unresolved;
   const parent = await resolveCommit(cwd, `${commit}^1`);
-  return { kind: "commit", commit, ...(parent === null ? {} : { parent }) };
+  const abbrev = await abbreviation(cwd, parent === null ? [commit] : [commit, parent]);
+  return { kind: "commit", commit, ...(parent === null ? {} : { parent }), abbrev };
 }
 
 /**
