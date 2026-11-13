@@ -20,7 +20,7 @@ const script = join(repositoryRoot, "scripts/release-canary.mjs");
 const STAGE_ID = "1de6f3db-2ed9-4d72-b3dd-8f0e2b474a2f";
 const DECOY_STAGE_ID = "f8e7a45b-7a5f-4f31-8e6d-9dd1c6ef38c0";
 const RUN_ID = "1001";
-const VERSION = "0.0.0-canary.42.1";
+const VERSION = `0.0.0-canary.${RUN_ID}.1`;
 const REPO = "igshehata/pi-hunk";
 
 const GH_DOUBLE = `#!/usr/bin/env node
@@ -40,7 +40,7 @@ function flag(name) {
   return index === -1 ? undefined : args[index + 1];
 }
 if (args[0] === "workflow" && args[1] === "run") {
-  if (args[2] !== "release.yml" || args[3] !== "--ref" || args[4] !== "main") {
+  if (args[2] !== "canary.yml" || args[3] !== "--ref" || args[4] !== "main") {
     console.error("unexpected dispatch " + args.join(" "));
     process.exit(1);
   }
@@ -297,10 +297,9 @@ function successfulRun(head: string) {
     number: 42,
     status: "completed",
     url: `https://github.com/${REPO}/actions/runs/${RUN_ID}`,
-    workflowName: "Release",
+    workflowName: "Canary",
     jobs: [
-      { name: "Version PR or release preflight", conclusion: "success", status: "completed" },
-      { name: `Verify pi-hunk@${VERSION}`, conclusion: "success", status: "completed" },
+      { name: "Verify canary", conclusion: "success", status: "completed" },
       { name: `Stage pi-hunk@${VERSION}`, conclusion: "success", status: "completed" },
     ],
   };
@@ -354,7 +353,7 @@ describe("release:canary", () => {
       "gh",
       "workflow",
       "run",
-      "release.yml",
+      "canary.yml",
       "--ref",
       "main",
       "--repo",
@@ -363,10 +362,10 @@ describe("release:canary", () => {
     expect(result.log).toEqual([]);
   });
 
-  it("stages the retained canary identity and stops before npm approve", () => {
+  it("stages the run's canary and, with no terminal to ask, stops before npm approve", () => {
     const checkout = createCheckout();
     const packed = writePackedTarball(checkout.scratch, VERSION);
-    const decoy = writePackedTarball(join(checkout.scratch, "decoy"), "0.0.0-canary.42.2");
+    const decoy = writePackedTarball(join(checkout.scratch, "decoy"), `0.0.0-canary.${RUN_ID}.2`);
     const result = runCanary(checkout, {
       dispatchStdout: `https://github.com/${REPO}/actions/runs/${RUN_ID}\n`,
       runs: { [RUN_ID]: successfulRun(checkout.sha) },
@@ -375,7 +374,7 @@ describe("release:canary", () => {
         {
           id: DECOY_STAGE_ID,
           packageName: "pi-hunk",
-          version: "0.0.0-canary.42.2",
+          version: `0.0.0-canary.${RUN_ID}.2`,
           tag: "canary",
           shasum: decoy.shasum,
           status: "staged",
@@ -391,7 +390,6 @@ describe("release:canary", () => {
       tag: "canary",
       commit: checkout.sha,
       runId: RUN_ID,
-      runNumber: 42,
       runAttempt: 2,
       stageId: STAGE_ID,
       shasum: packed.shasum,
@@ -501,7 +499,7 @@ describe("release:canary", () => {
     expect(result.stderr).toContain("does not match staged tarball sha1");
   });
 
-  it("surfaces the npm-release environment gate while waiting, then times out", () => {
+  it("times out while the run has not completed", () => {
     const checkout = createCheckout();
     const waiting = {
       attempt: 1,
@@ -511,15 +509,13 @@ describe("release:canary", () => {
       number: 42,
       status: "waiting",
       url: `https://github.com/${REPO}/actions/runs/${RUN_ID}`,
-      workflowName: "Release",
+      workflowName: "Canary",
     };
     const result = runCanary(checkout, {
       dispatchStdout: `https://github.com/${REPO}/actions/runs/${RUN_ID}\n`,
       runs: { [RUN_ID]: { views: [waiting, waiting, waiting] } },
     });
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("npm-release");
-    expect(result.stderr).toContain("does not bypass protection");
     expect(result.stderr).toContain("timed out");
   });
 });

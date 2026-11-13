@@ -1,0 +1,123 @@
+name: Canary
+
+# On demand from any branch: `mise run release:canary` dispatches this workflow for the pushed
+# HEAD of the current branch. It stages the package on npm tag `canary`; nothing becomes public
+# until the maintainer runs `npm stage approve` with npm 2FA. npm trusted publishing for this file
+# is stage-only, so a compromised run can at most stage a package that is never approved.
+on:
+  workflow_dispatch:
+
+# Canaries never share a queue with stable releases, and a newer canary replaces an older one.
+concurrency:
+  group: canary
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify canary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.canary.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          cache: true
+          install: true
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
+      - id: canary
+        name: Apply the canary version
+        run: node scripts/prepare-canary-version.mjs --write
+      - run: mise run check
+      - name: Pack the verified canary without lifecycle scripts
+        env:
+          RELEASE_VERSION: ${{ steps.canary.outputs.version }}
+        run: |
+          mkdir release
+          npm pack --ignore-scripts --pack-destination release
+          test -f "release/pi-hunk-${RELEASE_VERSION}.tgz"
+      - name: Preserve the exact verified tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-package-${{ steps.canary.outputs.version }}
+          path: release/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve the pinned npm CLI for the credentialed job
+        run: |
+          NPM_INSTALL="$(mise where npm@11.17.0)"
+          NPM_ROOT=""
+          for candidate in "$NPM_INSTALL/package" "$NPM_INSTALL/lib/node_modules/npm"; do
+            if test "$(node -p 'require(process.argv[1]).version' "$candidate/package.json" 2>/dev/null || true)" = 11.17.0; then
+              NPM_ROOT="$candidate"
+              break
+            fi
+          done
+          test -n "$NPM_ROOT"
+          mkdir release-tools
+          tar -czf release-tools/npm-cli-11.17.0.tgz -C "$NPM_ROOT" .
+      - name: Upload the pinned npm CLI
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-cli-11.17.0-canary
+          path: release-tools/npm-cli-11.17.0.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  stage:
+    name: Stage pi-hunk@${{ needs.verify.outputs.version }}
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_CONFIG_PROVENANCE: true
+      RELEASE_COMMIT: ${{ github.sha }}
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+      - name: Download the exact verified tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package-${{ needs.verify.outputs.version }}
+          path: release
+      - name: Download the pinned npm CLI
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-cli-11.17.0-canary
+          path: release-tools
+      - name: Stage the verified canary through npm OIDC
+        run: |
+          case "$RELEASE_VERSION" in
+            0.0.0-canary.*) ;;
+            *) echo "Not a canary version: $RELEASE_VERSION" >&2; exit 1 ;;
+          esac
+          PACKAGE="release/pi-hunk-${RELEASE_VERSION}.tgz"
+          test -f "$PACKAGE"
+          test "$(find release -type f -name '*.tgz' | wc -l | tr -d ' ')" = 1
+
+          mkdir -p npm-cli/package publish repacked
+          tar -xzf release-tools/npm-cli-11.17.0.tgz -C npm-cli/package
+          test "$(node -p 'require(require("node:path").resolve(process.argv[1])).version' npm-cli/package/package.json)" = 11.17.0
+
+          tar -xzf "$PACKAGE" -C publish
+          mkdir publish/package/.git
+          printf '%s\n' "$RELEASE_COMMIT" > publish/package/.git/HEAD
+          node npm-cli/package/bin/npm-cli.js pack ./publish/package \
+            --ignore-scripts \
+            --pack-destination repacked >/dev/null
+          cmp "$PACKAGE" "repacked/pi-hunk-${RELEASE_VERSION}.tgz"
+
+          node npm-cli/package/bin/npm-cli.js stage publish ./publish/package \
+            --ignore-scripts \
+            --tag canary \
+            --access public
+          echo "pi-hunk@${RELEASE_VERSION} is staged on npm tag canary, not public."

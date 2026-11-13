@@ -1,9 +1,9 @@
 name: Release
 
+# Stable releases only; canaries are on demand in canary.yml.
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 concurrency:
   group: release
@@ -29,36 +29,27 @@ jobs:
           install: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
-      - name: Require main for an on-demand canary
-        if: github.event_name == 'workflow_dispatch'
-        run: test "$GITHUB_REF" = refs/heads/main
       # Inspect the immutable commit before changesets/action versions the job
       # workspace while creating or updating its release pull request.
       - id: stable
-        if: github.event_name == 'push'
         name: Determine whether this commit contains an unpublished stable release
         run: node scripts/release-state.mjs
-      - id: canary
-        name: Prepare the rolling canary identity without changing the stable manifest
-        run: node scripts/prepare-canary-version.mjs
       - id: plan
-        name: Plan the release streams
+        name: Plan the stable release
         env:
-          CANARY_VERSION: ${{ steps.canary.outputs.version }}
           STABLE_SHOULD_STAGE: ${{ steps.stable.outputs.should_stage }}
           STABLE_VERSION: ${{ steps.stable.outputs.version }}
         run: |
           node --input-type=module <<'NODE'
           import { appendFileSync } from "node:fs";
-          const releases = [{ version: process.env.CANARY_VERSION, stream: "canary", tag: "canary" }];
-          if (process.env.GITHUB_EVENT_NAME === "push" && process.env.STABLE_SHOULD_STAGE === "true") {
+          const releases = [];
+          if (process.env.STABLE_SHOULD_STAGE === "true") {
             releases.push({ version: process.env.STABLE_VERSION, stream: "stable", tag: "latest" });
           }
           appendFileSync(process.env.GITHUB_OUTPUT, `releases=${JSON.stringify(releases)}\n`);
           NODE
       - name: Create or update the version pull request
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
-        if: github.event_name == 'push'
         with:
           version: mise run release:version
           commit: "chore: version package"
@@ -69,6 +60,7 @@ jobs:
   verify:
     name: Verify pi-hunk@${{ matrix.release.version }}
     needs: version
+    if: needs.version.outputs.releases != '[]'
     strategy:
       fail-fast: false
       matrix:
@@ -86,11 +78,6 @@ jobs:
           install: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
-      - name: Apply the selected ephemeral canary version
-        if: matrix.release.stream == 'canary'
-        env:
-          CANARY_VERSION: ${{ matrix.release.version }}
-        run: node scripts/prepare-canary-version.mjs --write --version "$CANARY_VERSION"
       - name: Verify selected release identity
         env:
           RELEASE_STREAM: ${{ matrix.release.stream }}
@@ -99,7 +86,7 @@ jobs:
         run: |
           test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
           case "$RELEASE_STREAM:$RELEASE_TAG" in
-            stable:latest|canary:canary) ;;
+            stable:latest) ;;
             *) echo "Invalid release stream/tag: $RELEASE_STREAM:$RELEASE_TAG" >&2; exit 1 ;;
           esac
       - run: mise run check
@@ -195,8 +182,4 @@ jobs:
       - name: Approval required
         run: |
           echo "pi-hunk@${RELEASE_VERSION} is staged on npm tag ${RELEASE_TAG}, not public."
-          if test "$RELEASE_STREAM" = canary; then
-            echo "Inspect and approve it with npm 2FA. Canary releases do not get Git tags or GitHub Releases."
-          else
-            echo "Inspect and approve it with npm 2FA before finalizing the stable release."
-          fi
+          echo "Inspect and approve it with npm 2FA before finalizing the stable release."
