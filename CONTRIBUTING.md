@@ -50,8 +50,8 @@ update as described in [SECURITY.md](SECURITY.md). npm is used only for registry
 | `mise run pack`                   | Validate the npm tarball and clean consumer install          |
 | `mise run check`                  | Run all release gates                                        |
 | `mise run changeset`              | Describe a release-worthy change                             |
-| `mise run release:canary`         | Dispatch canary from matching main and stop at the npm stage |
-| `mise run release:canary:preview` | Preview the rolling canary identity without changing files   |
+| `mise run release:canary`         | Stage a canary from the pushed branch, then publish with 2FA |
+| `mise run release:canary:preview` | Preview the canary identity without changing files           |
 
 ## Release streams
 
@@ -65,30 +65,24 @@ Pi-hunk has two npm streams:
   not staged again. Inspect and explicitly approve the staged package, then run
   `finalize-release.yml` with that exact version. Finalization creates the immutable `vX.Y.Z` tag
   and GitHub Release and rejects prerelease versions.
-- **Canary** is the rolling `canary` npm tag, independent of the stable Changesets plan. Every push
-  to `main` automatically verifies and stages a canary, including pushes with pending changesets or
-  an already-published stable version. There is no separate canary branch. For an optional on-demand
-  canary, from a clean checkout whose HEAD matches `origin/main`, run `mise run release:canary`. It
-  dispatches `release.yml` as `workflow_dispatch` on `main`, correlates only the run id returned by
-  that dispatch, waits through `npm-release` environment protection without bypassing it, and stops
-  at the exact staged tarball. Remaining npm 2FA approval is `npm stage approve <stage-id>`; this
-  command never approves, publishes, tags, or creates a GitHub Release. Optional
-  `mise run release:canary -- --dry-run` checks the git identity and prints that plan.
-  `mise run release:canary:preview` only shows the `0.0.0-canary.<run-number>.<run-attempt>`
-  formula. Users install `pi-hunk@canary`. Do not run the finalization workflow for a canary.
-  Requires authenticated `gh` and `npm` with access to the repository and its staged packages, and a
-  GitHub CLI/API combination that returns the dispatched run ID. If no ID is returned, the command
-  stops rather than guessing. Commit and merge the desired code into `main` before running it; this
-  command does not commit, push, or merge changes. This is a user-invoked dispatch helper, never
-  called from CI, and does not inspect push-triggered runs. Manual `workflow_dispatch` on `main`
-  stages canary only, not stable.
+- **Canary** is the `canary` npm tag, for testing a build before it reaches users. It is on demand
+  and works from any branch: push the branch, then run `mise run release:canary` from a clean
+  checkout whose HEAD matches `origin/<branch>`. It dispatches `canary.yml` on that branch,
+  correlates only the run id the dispatch returns, and waits for the run to verify and stage the
+  package (about two minutes). It then checks the stage against the run's artifact (package,
+  version, tag, commit, and SHA-1) and asks whether to publish. Answering `y` runs
+  `npm stage approve <stage-id>`, so npm asks for your 2FA; anything else, or a non-interactive run,
+  leaves the stage for you to approve later. Versions are `0.0.0-canary.<run-id>.<run-attempt>`, so
+  they never satisfy a semver range and never collide. `mise run release:canary -- --dry-run` checks
+  the git identity and prints the plan. Canaries get no Git tag or GitHub Release; do not run the
+  finalization workflow for one. Requires authenticated `gh` and `npm`.
 
-Both streams stay in `release.yml` because npm trusted publishing is bound to that workflow and the
-`npm-release` environment. When a push plans both streams, both verifications must succeed before
-either can stage. Staging still honors the GitHub environment gate; it is not npm publication.
-Inspect the exact stage (package, version, tag, source commit, and tarball), then explicitly run
-`npm stage approve <stage-id>` with npm 2FA to publish. Neither automatic push staging nor the
-manual helper approves npm stages. Canary releases never create Git tags or GitHub Releases.
+Stable lives in `release.yml`, bound by npm trusted publishing to that workflow and the
+`npm-release` environment, whose reviewer gate is approved in GitHub before staging. Canary lives in
+`canary.yml` with its own trusted publishing configuration and no GitHub environment, so it neither
+waits for a reviewer nor shares the stable queue. Both configurations are staging only: nothing
+becomes public without `npm stage approve` and the maintainer's npm 2FA, so a compromised workflow
+can stage a package but never publish one.
 
 ## Testing expectations
 
