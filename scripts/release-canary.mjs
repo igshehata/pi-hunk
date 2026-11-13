@@ -218,8 +218,30 @@ function requireStageIdentity(item, version, label) {
   if (item.version !== version) fail(`${label} version is ${item.version}, not ${version}`);
   if (item.tag !== "canary") fail(`${label} tag is ${item.tag}, not canary`);
   if (!SHA1.test(item.shasum ?? "")) fail(`${label} shasum is missing or not a SHA-1`);
-  if (item.status != null && item.status !== "staged")
+  // npm scans a staged package before it can be approved; it reads `validating` until then.
+  if (item.status != null && item.status !== "staged" && item.status !== "validating")
     fail(`${label} status is ${item.status}, not staged`);
+}
+
+/** Waits out npm's scan of the stage; approval is refused until it reads `staged`. */
+async function waitForScan(stage, version, deadline, pollMs) {
+  let current = stage;
+  let announced = false;
+  while (current.status === "validating") {
+    if (Date.now() >= deadline) fail(`npm is still scanning stage ${stage.id}; try again later`);
+    if (!announced) {
+      console.error("npm is scanning the staged package; approval opens when it finishes.");
+      announced = true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    current = parseJson(
+      requireCommand("npm", ["stage", "view", stage.id, "--json"]),
+      "npm stage view",
+    );
+    requireStageIdentity(current, version, `npm stage view ${stage.id}`);
+    if (current.shasum !== stage.shasum) fail(`stage ${stage.id} shasum changed while scanning`);
+  }
+  return current;
 }
 
 function selectStage(version) {
@@ -382,6 +404,7 @@ async function main() {
   // nobody to ask, so the stage is left for `npm stage approve`.
   const interactive = process.stdin.isTTY && process.stderr.isTTY;
   if (interactive && (await confirm(`Publish pi-hunk@${version} to npm tag canary? [y/N] `))) {
+    await waitForScan(stage, version, Date.now() + timeoutMs, pollMs);
     const approve = spawnSync("npm", ["stage", "approve", stage.id], {
       cwd: root,
       env: childEnv(),
@@ -394,7 +417,7 @@ async function main() {
       console.log(JSON.stringify({ status: "published", ...result }));
       return;
     }
-    console.error("npm stage approve did not publish it (npm may still be scanning the package).");
+    console.error("npm stage approve did not publish it.");
   }
   console.error("Publish it with npm 2FA when ready:");
   console.error(`  npm stage approve ${stage.id}`);
