@@ -84,8 +84,8 @@ function githubRepoFromOrigin(url) {
   return `${parts[0]}/${parts[1]}`;
 }
 
-/** The pushed branch to build: a clean checkout whose HEAD is exactly what origin has. */
-function requireCleanPushedBranch() {
+/** Canaries build `main` only: a clean `main` checkout whose HEAD is exactly what origin has. */
+function requireCleanPushedMain() {
   if (requireCommand("git", ["status", "--porcelain=v1"]) !== "") {
     fail("working tree is dirty; refusing to dispatch a different or unpublished revision");
   }
@@ -96,7 +96,8 @@ function requireCleanPushedBranch() {
   if (!remotes.includes("origin")) fail("no origin remote");
   const branchResult = run("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]);
   const branch = (branchResult.stdout ?? "").trim();
-  if (branchResult.status !== 0 || branch === "") fail("HEAD is detached; check out a branch");
+  if (branchResult.status !== 0 || branch === "") fail("HEAD is detached; check out main");
+  if (branch !== "main") fail(`canaries build main only; check out main (HEAD is on ${branch})`);
   const head = git(["rev-parse", "HEAD"]);
   if (!SHA1.test(head)) fail(`HEAD is not a full SHA: ${head}`);
   const ref = `refs/heads/${branch}`;
@@ -348,7 +349,7 @@ async function main() {
   const pollMs = integerEnv("RELEASE_CANARY_POLL_MS", 5000);
   const packageJson = parseJson(readFileSync(join(root, "package.json"), "utf8"), "package.json");
   if (packageJson.name !== "pi-hunk") fail("package name is not pi-hunk");
-  const { branch, head, repo } = requireCleanPushedBranch();
+  const { branch, head, repo } = requireCleanPushedMain();
   const dispatchArgs = ["workflow", "run", "canary.yml", "--ref", branch, "--repo", repo];
 
   if (dryRun) {

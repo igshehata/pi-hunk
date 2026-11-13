@@ -39,19 +39,19 @@ update as described in [SECURITY.md](SECURITY.md). npm is used only for registry
 
 ## Useful tasks
 
-| Task                              | Purpose                                                      |
-| --------------------------------- | ------------------------------------------------------------ |
-| `mise run format`                 | Format supported files with Oxfmt                            |
-| `mise run format:check`           | Check formatting without writes                              |
-| `mise run lint`                   | Run Oxlint                                                   |
-| `mise run typecheck`              | Run TypeScript without emitting                              |
-| `mise run test`                   | Run the full Vitest suite                                    |
-| `mise run build`                  | Bundle `dist/index.js`                                       |
-| `mise run pack`                   | Validate the npm tarball and clean consumer install          |
-| `mise run check`                  | Run all release gates                                        |
-| `mise run changeset`              | Describe a release-worthy change                             |
-| `mise run release:canary`         | Stage a canary from the pushed branch, then publish with 2FA |
-| `mise run release:canary:preview` | Preview the canary identity without changing files           |
+| Task                              | Purpose                                             |
+| --------------------------------- | --------------------------------------------------- |
+| `mise run format`                 | Format supported files with Oxfmt                   |
+| `mise run format:check`           | Check formatting without writes                     |
+| `mise run lint`                   | Run Oxlint                                          |
+| `mise run typecheck`              | Run TypeScript without emitting                     |
+| `mise run test`                   | Run the full Vitest suite                           |
+| `mise run build`                  | Bundle `dist/index.js`                              |
+| `mise run pack`                   | Validate the npm tarball and clean consumer install |
+| `mise run check`                  | Run all release gates                               |
+| `mise run changeset`              | Describe a release-worthy change                    |
+| `mise run release:canary`         | Stage a canary of `main`, then publish it with 2FA  |
+| `mise run release:canary:preview` | Preview the canary identity without changing files  |
 
 ## Release streams
 
@@ -66,11 +66,11 @@ Pi-hunk has two npm streams:
   `finalize-release.yml` with that exact version. Finalization creates the immutable `vX.Y.Z` tag
   and GitHub Release and rejects prerelease versions.
 - **Canary** is the `canary` npm tag, for testing a build before it reaches users. It is on demand
-  and works from any branch: push the branch, then run `mise run release:canary` from a clean
-  checkout whose HEAD matches `origin/<branch>`. It dispatches `canary.yml` on that branch,
-  correlates only the run id the dispatch returns, and waits for the run to verify and stage the
-  package (about two minutes). It then checks the stage against the run's artifact (package,
-  version, tag, commit, and SHA-1) and asks whether to publish. Answering `y` runs
+  and builds `main` only: merge, then run `mise run release:canary` from a clean `main` checkout
+  whose HEAD matches `origin/main`. It dispatches `canary.yml` on `main` (the workflow fails on any
+  other ref), correlates only the run id the dispatch returns, and waits for the run to verify and
+  stage the package (about two minutes). It then checks the stage against the run's artifact
+  (package, version, tag, commit, and SHA-1) and asks whether to publish. Answering `y` runs
   `npm stage approve <stage-id>`, so npm asks for your 2FA; anything else, or a non-interactive run,
   leaves the stage for you to approve later. Versions are `0.0.0-canary.<run-id>.<run-attempt>`, so
   they never satisfy a semver range and never collide. `mise run release:canary -- --dry-run` checks

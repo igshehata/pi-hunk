@@ -60,7 +60,7 @@ run = "bunx changeset status"
 description = "Preview the canary package identity"
 run = "CANARY_RUN_ID=1 CANARY_RUN_ATTEMPT=1 node scripts/prepare-canary-version.mjs"
 [tasks."release:canary"]
-description = "Stage a canary from the pushed current branch, then publish it with npm 2FA"
+description = "Stage a canary of the pushed main, then publish it with npm 2FA"
 raw_args = true
 run = "node scripts/release-canary.mjs"
 
