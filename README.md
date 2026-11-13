@@ -272,8 +272,9 @@ bun run check
 ```
 
 The extension is for interactive TUI sessions, targeting macOS and Linux. Native smoke coverage:
-**macOS**, with Pi **0.84.4**, OMP **18.1.10**, and Hunk **0.25.0**. Linux native smoke verification
-has not yet been performed.
+**macOS**, with Pi **1.5.0**, OMP **18.20.0**, and Hunk **0.25.0**; multiplexer mode in Tern
+**0.9.18** (Pi and OMP), Rex beta, and Herdr **0.9.0** (OMP). Linux native smoke verification has
+not yet been performed.
 
 ## License
 
