@@ -1,5 +1,20 @@
 # pi-hunk
 
+## 2.0.0
+
+### Major Changes
+
+- e5071a7: Add a `mode` setting. `"multiplexer"` opens Hunk in a pane beside the agent in Tern, Rex,
+  or Herdr, and delivers each saved comment, edit, deletion, or reply as it happens instead of one
+  handoff on close. `"static"`, the default, is unchanged: full-screen Hunk, comments sent when you
+  close it. Hunk 0.25.0 or newer is now required.
+
+### Minor Changes
+
+- e5071a7: Add `branch` and `codebase` views: the branch view reviews everything since the branch
+  left its base branch, and the codebase view reviews every tracked and untracked, non-ignored file,
+  each with its own trigger key and switchable inside Hunk like diff and show.
+
 ## 1.2.0
 
 ### Minor Changes
