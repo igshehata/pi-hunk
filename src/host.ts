@@ -953,10 +953,13 @@ export function createHost(bindings: HostBindings) {
       pendingJournal = journal;
       await writeFile(journal, "", { mode: 0o600, flag: "wx" });
       signal.throwIfAborted();
+      // A full-screen review is a static review whatever the saved mode: one handoff on close, so
+      // the multiplexer fallback must not paint a live status or mark notes stale. The saved
+      // config is untouched.
       const launchData: ReviewLaunch = {
         cwd: session.ctx.cwd,
         view,
-        config: session.config,
+        config: { ...session.config, mode: "static" },
         journal,
         ...(resolvedBase.base === undefined ? {} : { base: resolvedBase.base }),
       };

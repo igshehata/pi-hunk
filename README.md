@@ -17,7 +17,8 @@ omp plugin install pi-hunk   # Oh My Pi
 pi install npm:pi-hunk       # Pi
 ```
 
-Restart your agent afterwards.
+Restart your agent afterwards. After upgrading Hunk, run `hunk daemon restart` so an older Hunk
+daemon left running does not replace pi-hunk's status line.
 
 ## Use
 

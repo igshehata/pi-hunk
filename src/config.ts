@@ -57,6 +57,32 @@ function branchName(value: unknown): string {
   return value;
 }
 
+/** Views a 1.x file cannot set: their defaults may already be one of that file's keys. */
+const newViews: ReadonlySet<string> = new Set(["branch", "codebase"]);
+
+/**
+ * Two views on one key is refused by naming both and the key. A 1.x file never set the views 2.0
+ * added, so a new view's default can collide with a key the user chose long ago: the error says
+ * so, and how to resolve it.
+ */
+function collisions(supplied: Record<string, unknown>, views: Record<string, string>): void {
+  const owner = new Map<string, string>();
+  for (const [field, bound] of Object.entries(views)) {
+    const first = owner.get(bound);
+    if (first === undefined) {
+      owner.set(bound, field);
+      continue;
+    }
+    const clash = `${first} and ${field} both use ${JSON.stringify(bound)}`;
+    const unset = [first, field].find((view) => newViews.has(view) && supplied[view] === undefined);
+    if (unset === undefined) throw new Error(`${clash}. Give each view its own key.`);
+    const chosen = unset === field ? first : field;
+    throw new Error(
+      `${clash}: ${unset} is a view added in pi-hunk 2.0 and defaults to ${JSON.stringify(bound)}. Set ${unset} to another key, or change ${chosen}.`,
+    );
+  }
+}
+
 /** A parsed file: the settings this build understands, plus the ones it had to skip. */
 export interface ParsedConfig {
   readonly config: Config;
@@ -88,9 +114,8 @@ export function parseConfig(value: unknown): ParsedConfig {
     "codebase",
   );
   const delivery = supplied.delivery === undefined ? DEFAULT_CONFIG.delivery : supplied.delivery;
+  collisions(supplied, { diff, show, log, branch, codebase });
   const views = [diff, show, log, branch, codebase];
-  if (new Set(views).size !== views.length)
-    throw new Error("diff, show, log, branch, and codebase must use different trigger keys");
   if (views.includes("escape")) {
     throw new Error("Escape is reserved for canceling the prefix");
   }
