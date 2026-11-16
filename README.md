@@ -46,6 +46,27 @@ In Tern, Rex, or Herdr, set the mode to `multiplexer` in `/hunk config`. Hunk th
 next to the agent, and each comment goes to the agent as soon as you save it. Press <kbd>r</kbd> in
 Hunk to see the agent's latest changes.
 
+<details open>
+<summary>Tern</summary>
+
+![Hunk opens beside OMP in Tern; a saved comment reaches the agent at once](assets/demo-tern.gif)
+
+</details>
+
+<details>
+<summary>Rex</summary>
+
+![Hunk opens beside OMP in Rex; a saved comment reaches the agent at once](assets/demo-rex.gif)
+
+</details>
+
+<details>
+<summary>Herdr</summary>
+
+![Hunk opens beside OMP in Herdr; a saved comment reaches the agent at once](assets/demo-herdr.gif)
+
+</details>
+
 ## Configure
 
 Run `/hunk config` to change the keys, the mode, or what happens if the agent is busy when your
