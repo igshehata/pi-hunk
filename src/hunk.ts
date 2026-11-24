@@ -148,6 +148,12 @@ interface Review {
   changeset: ChangesetState;
   /** noteId → capture record, so a location and its journal entry cannot diverge. */
   readonly notes: Map<string, NoteState>;
+  /**
+   * Batch comments only, mirroring what the host queues: `unsent` holds every note changed since
+   * the last `Send` (a deletion stays only if the agent had the note), `sent` every note a batch
+   * already gave the agent.
+   */
+  readonly batch: { readonly unsent: Set<string>; readonly sent: Set<string> };
 }
 
 /** The one control multiplexer mode paints from; a context without it is skipped silently. */
@@ -189,6 +195,32 @@ function sentCount(review: Review): number {
   return sent;
 }
 
+/** Saved comments a batch has already given the agent. */
+function batchSentCount(review: Review): number {
+  let sent = 0;
+  for (const [id, state] of review.notes)
+    if (state._tag === "Saved" && review.batch.sent.has(id)) sent += 1;
+  return sent;
+}
+
+/** Record one saved change in the batch mirror, after its journal write. */
+function queueChange(review: Review, id: string, removed: boolean): void {
+  const { unsent, sent } = review.batch;
+  // A note the agent never received, deleted before its batch, leaves nothing to send.
+  if (removed && !sent.has(id)) unsent.delete(id);
+  else unsent.add(id);
+}
+
+/** The queued changes are with the host now: what still exists counts as sent. */
+function markBatchSent(review: Review): void {
+  const { unsent, sent } = review.batch;
+  for (const id of unsent) {
+    if (review.notes.get(id)?._tag === "Saved") sent.add(id);
+    else sent.delete(id);
+  }
+  unsent.clear();
+}
+
 /**
  * Paint the permanent status item. Multiplexer mode only: the row must never appear and vanish
  * mid-review, so it is set once at startup and updated from then on, never cleared.
@@ -203,9 +235,19 @@ function paintLiveStatus(review: Review, live: LiveStatus, context?: StatusLineH
   live.host = host;
   const controls = host.statusLine;
   if (controls === undefined) return;
-  const spans: ExtensionStatusSpan[] = [
-    { text: `pi-hunk live · ${sentCount(review)} sent`, tone: "muted" },
-  ];
+  const { config } = review.launch;
+  const spans: ExtensionStatusSpan[] = [];
+  if (config.comments === "batch") {
+    const queued = review.batch.unsent.size;
+    spans.push({
+      text: `pi-hunk batch · ${queued} queued · ${batchSentCount(review)} sent`,
+      tone: "muted",
+    });
+    if (queued > 0)
+      spans.push({ text: ` · ${config.prefix} ${config.send} to send`, tone: "accent" });
+  } else {
+    spans.push({ text: `pi-hunk live · ${sentCount(review)} sent`, tone: "muted" });
+  }
   if (live.filesChanged) spans.push({ text: " · files changed, r to refresh", tone: "accent" });
   try {
     controls.set({ id: LIVE_STATUS_ID, spans });
@@ -754,6 +796,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
       session: { _tag: "Unknown" },
       changeset: { _tag: "Absent" },
       notes: new Map(),
+      batch: { unsent: new Set(), sent: new Set() },
     };
   } else if (ownedReview.launch.journal !== launch.journal) {
     throw new Error("A Hunk process cannot own two pi-hunk review journals");
@@ -776,6 +819,40 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
   const log = compileHunkKey(launch.config.log);
   const branch = compileHunkKey(launch.config.branch);
   const codebase = compileHunkKey(launch.config.codebase);
+  const send = compileHunkKey(launch.config.send);
+  const batching = launch.config.mode === "multiplexer" && launch.config.comments === "batch";
+
+  /**
+   * Hands the queued batch to the host. It runs on the capture chain, so a save still waiting
+   * for its revision is journaled, and sent, before the `Send` that follows it.
+   */
+  function sendBatch(context: ExtensionContext): void {
+    capture = capture.then(() => {
+      if (bridge._tag !== "Running" || review.state._tag === "Failed") return;
+      const queued = review.batch.unsent.size;
+      if (queued > 0) {
+        try {
+          append(review, { _tag: "Send" });
+        } catch (error) {
+          failCapture(review, context, error);
+          return;
+        }
+        markBatchSent(review);
+        // A keyboard context carries no status line: repaint from the last one that did.
+        paintLiveStatus(review, live);
+      }
+      try {
+        context.notify(
+          queued === 0
+            ? "No queued comments to send."
+            : `Sending ${queued} queued comment change${queued === 1 ? "" : "s"} to the agent.`,
+          "info",
+        );
+      } catch {
+        // A dying Hunk UI must not reject the capture chain every later save waits on.
+      }
+    });
+  }
 
   hunk.on("startup", (_event, context) => {
     // Stopped is terminal: Hunk registers a replacement by importing the module again, so this
@@ -883,6 +960,7 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
         } else {
           await saveMutation(review, state, changeset, note);
         }
+        if (batching) queueChange(review, note.id, kind === "removed");
         // The item counts what the journal holds, so it is repainted after the write, not before.
         if (launch.config.mode === "multiplexer") paintLiveStatus(review, live, context);
       } catch (error) {
@@ -901,6 +979,13 @@ export default function hunkBridge(hunk: HunkExtensionAPI): void {
       // Exit before passing unknown input through to native Hunk commands.
       // Escape is owned and canceled by Hunk before this callback runs.
       context.keyboardModes.exitMode();
+      // Sending works from every review, history included; outside batch comments the key is
+      // Hunk's own.
+      if (send.matches(key)) {
+        if (!batching) return "pass";
+        if (bridge._tag === "Running" && review.state._tag !== "Failed") sendBatch(context);
+        return "handled";
+      }
       if (navigation._tag === "History") {
         if (log.matches(key)) {
           if (bridge._tag === "Running" && review.state._tag !== "Failed") {

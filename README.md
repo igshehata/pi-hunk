@@ -67,6 +67,13 @@ Hunk to see the agent's latest changes.
 
 </details>
 
+### Batch comments
+
+If the agent changes code faster than you review it, set `comments` to `batch` in `/hunk config`.
+Your saved comments then wait in Hunk; the status line shows how many are queued. Press
+<kbd>Ctrl</kbd> + <kbd>Space</kbd>, then <kbd>Enter</kbd> in Hunk to send them all as one message.
+Quitting Hunk sends whatever is still queued.
+
 ## Configure
 
 Run `/hunk config` to change the keys, the mode, or what happens if the agent is busy when your
