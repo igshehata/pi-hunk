@@ -4,10 +4,17 @@ export type Delivery = "steer" | "followUp" | "interrupt";
 
 /**
  * `static`: Hunk takes over the host's terminal and comments are handed off when it closes.
- * `multiplexer`: Hunk opens in a sibling pane (Tern, Rex, or Herdr) and every comment change is
- * delivered as it is saved.
+ * `multiplexer`: Hunk opens in a sibling pane (Tern, Rex, or Herdr) and comment changes are
+ * delivered while it stays open, as `comments` says.
  */
 export type Mode = "static" | "multiplexer";
+
+/**
+ * Multiplexer mode only. `live`: every comment change reaches the agent as it is saved.
+ * `batch`: changes queue in Hunk until the reviewer presses the prefix and `send` (or quits Hunk),
+ * then reach the agent as one message.
+ */
+export type Comments = "live" | "batch";
 
 export interface Config {
   readonly prefix: string;
@@ -16,8 +23,11 @@ export interface Config {
   readonly log: string;
   readonly branch: string;
   readonly codebase: string;
+  /** Inside Hunk, after the prefix: send the queued batch. Only acts with `comments: "batch"`. */
+  readonly send: string;
   readonly delivery: Delivery;
   readonly mode: Mode;
+  readonly comments: Comments;
   /** Base branch the `branch` view compares against; absent means detect it at launch. */
   readonly base?: string;
 }
@@ -101,7 +111,9 @@ export type ReviewEvent =
   | { readonly _tag: "Remove"; readonly id: string }
   | { readonly _tag: "Failure"; readonly message: string }
   /** Multiplexer mode only: written by the pane's launcher script after Hunk exits. */
-  | { readonly _tag: "Exited"; readonly status: number };
+  | { readonly _tag: "Exited"; readonly status: number }
+  /** Batch comments only: the reviewer asked to send every change queued since the last batch. */
+  | { readonly _tag: "Send" };
 
 /** Private child status: capture failed, so a partial journal must not be submitted. */
 export const CAPTURE_FAILURE_EXIT_CODE = 74;

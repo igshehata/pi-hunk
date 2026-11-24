@@ -1,5 +1,5 @@
 import { DEFAULT_CONFIG, loadConfig, saveConfig } from "./config.js";
-import type { Config, Delivery, Mode } from "./contract.js";
+import type { Comments, Config, Delivery, Mode } from "./contract.js";
 
 export interface ConfigUI {
   select(
@@ -15,7 +15,7 @@ export interface ConfigUI {
   notify(message: string, type?: "info" | "warning" | "error"): void;
 }
 
-type KeyField = "prefix" | "diff" | "show" | "log" | "branch" | "codebase";
+type KeyField = "prefix" | "diff" | "show" | "log" | "branch" | "codebase" | "send";
 
 // The unsaved draft travels inside the state: no second mutable "current config" lives beside it.
 type EditorState =
@@ -23,6 +23,7 @@ type EditorState =
   | { readonly _tag: "Key"; readonly draft: Config; readonly field: KeyField }
   | { readonly _tag: "Delivery"; readonly draft: Config }
   | { readonly _tag: "Mode"; readonly draft: Config }
+  | { readonly _tag: "Comments"; readonly draft: Config }
   | { readonly _tag: "Save"; readonly draft: Config };
 
 // Each menu row carries the transition it selects, so no index arithmetic or label matching decides it.
@@ -30,12 +31,21 @@ type MenuChoice =
   | { readonly _tag: "Key"; readonly field: KeyField; readonly label: string }
   | { readonly _tag: "Delivery"; readonly label: string }
   | { readonly _tag: "Mode"; readonly label: string }
+  | { readonly _tag: "Comments"; readonly label: string }
   | { readonly _tag: "Save"; readonly label: string }
   | { readonly _tag: "Cancel"; readonly label: string };
 
 type Answer<T> = { readonly _tag: "Answer"; readonly value: T } | { readonly _tag: "Aborted" };
 
-const keyFields: readonly KeyField[] = ["prefix", "diff", "show", "log", "branch", "codebase"];
+const keyFields: readonly KeyField[] = [
+  "prefix",
+  "diff",
+  "show",
+  "log",
+  "branch",
+  "codebase",
+  "send",
+];
 const deliveryChoices: readonly { value: Delivery; label: string }[] = [
   { value: "steer", label: "steer — deliver during the current response" },
   { value: "followUp", label: "followUp — wait until the current response finishes" },
@@ -49,7 +59,14 @@ const modeChoices: readonly { value: Mode; label: string }[] = [
   {
     value: "multiplexer",
     label:
-      "multiplexer — Hunk opens beside the agent in Tern, Rex, or Herdr; each comment is sent as you save it",
+      "multiplexer — Hunk opens beside the agent in Tern, Rex, or Herdr; comments are sent while it stays open",
+  },
+];
+const commentsChoices: readonly { value: Comments; label: string }[] = [
+  { value: "live", label: "live — each comment is sent as you save it" },
+  {
+    value: "batch",
+    label: "batch — comments wait in Hunk until you press prefix then send; they go as one message",
   },
 ];
 
@@ -107,6 +124,7 @@ export async function editConfig(
           })),
           { _tag: "Delivery", label: `delivery: ${draft.delivery}` },
           { _tag: "Mode", label: `mode: ${draft.mode}` },
+          { _tag: "Comments", label: `comments: ${draft.comments}` },
           { _tag: "Save", label: "Save" },
           { _tag: "Cancel", label: "Cancel" },
         ];
@@ -134,6 +152,9 @@ export async function editConfig(
             break;
           case "Mode":
             state = { _tag: "Mode", draft };
+            break;
+          case "Comments":
+            state = { _tag: "Comments", draft };
             break;
           case "Save":
             state = { _tag: "Save", draft };
@@ -201,6 +222,27 @@ export async function editConfig(
         state = {
           _tag: "Menu",
           draft: selected ? { ...current, mode: selected.value } : current,
+        };
+        break;
+      }
+      case "Comments": {
+        const current: Config = state.draft;
+        const answered: Answer<string | undefined> = await answer(
+          signal,
+          (): Promise<string | undefined> =>
+            ui.select(
+              `Comments in multiplexer mode (current: ${current.comments})`,
+              commentsChoices.map(({ label }) => label),
+              { signal },
+            ),
+        );
+        if (answered._tag === "Aborted") return undefined;
+        const selected: { value: Comments; label: string } | undefined = commentsChoices.find(
+          ({ label }) => label === answered.value,
+        );
+        state = {
+          _tag: "Menu",
+          draft: selected ? { ...current, comments: selected.value } : current,
         };
         break;
       }

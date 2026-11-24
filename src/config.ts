@@ -10,8 +10,10 @@ export const DEFAULT_CONFIG: Config = Object.freeze({
   log: "l",
   branch: "b",
   codebase: "c",
+  send: "enter",
   delivery: "steer",
   mode: "static",
+  comments: "live",
 });
 
 /**
@@ -57,28 +59,33 @@ function branchName(value: unknown): string {
   return value;
 }
 
-/** Views a 1.x file cannot set: their defaults may already be one of that file's keys. */
-const newViews: ReadonlySet<string> = new Set(["branch", "codebase"]);
+/**
+ * Keys an older file cannot set, and the release that added them: their defaults may already be
+ * one of that file's keys.
+ */
+const addedKeys: Readonly<Record<string, string>> = { branch: "2.0", codebase: "2.0", send: "2.1" };
 
 /**
- * Two views on one key is refused by naming both and the key. A 1.x file never set the views 2.0
- * added, so a new view's default can collide with a key the user chose long ago: the error says
- * so, and how to resolve it.
+ * Two actions on one key after the prefix is refused by naming both and the key. An older file
+ * never set the keys later releases added, so a new key's default can collide with a key the user
+ * chose long ago: the error says so, and how to resolve it.
  */
-function collisions(supplied: Record<string, unknown>, views: Record<string, string>): void {
+function collisions(supplied: Record<string, unknown>, keys: Record<string, string>): void {
   const owner = new Map<string, string>();
-  for (const [field, bound] of Object.entries(views)) {
+  for (const [field, bound] of Object.entries(keys)) {
     const first = owner.get(bound);
     if (first === undefined) {
       owner.set(bound, field);
       continue;
     }
     const clash = `${first} and ${field} both use ${JSON.stringify(bound)}`;
-    const unset = [first, field].find((view) => newViews.has(view) && supplied[view] === undefined);
-    if (unset === undefined) throw new Error(`${clash}. Give each view its own key.`);
+    const unset = [first, field].find(
+      (key) => Object.hasOwn(addedKeys, key) && supplied[key] === undefined,
+    );
+    if (unset === undefined) throw new Error(`${clash}. Give each its own key.`);
     const chosen = unset === field ? first : field;
     throw new Error(
-      `${clash}: ${unset} is a view added in pi-hunk 2.0 and defaults to ${JSON.stringify(bound)}. Set ${unset} to another key, or change ${chosen}.`,
+      `${clash}: ${unset} is a key added in pi-hunk ${addedKeys[unset]} and defaults to ${JSON.stringify(bound)}. Set ${unset} to another key, or change ${chosen}.`,
     );
   }
 }
@@ -113,10 +120,10 @@ export function parseConfig(value: unknown): ParsedConfig {
     supplied.codebase === undefined ? DEFAULT_CONFIG.codebase : supplied.codebase,
     "codebase",
   );
+  const send = key(supplied.send === undefined ? DEFAULT_CONFIG.send : supplied.send, "send");
   const delivery = supplied.delivery === undefined ? DEFAULT_CONFIG.delivery : supplied.delivery;
-  collisions(supplied, { diff, show, log, branch, codebase });
-  const views = [diff, show, log, branch, codebase];
-  if (views.includes("escape")) {
+  collisions(supplied, { diff, show, log, branch, codebase, send });
+  if ([diff, show, log, branch, codebase, send].includes("escape")) {
     throw new Error("Escape is reserved for canceling the prefix");
   }
   if (delivery !== "steer" && delivery !== "followUp" && delivery !== "interrupt") {
@@ -125,6 +132,10 @@ export function parseConfig(value: unknown): ParsedConfig {
   const mode = supplied.mode === undefined ? DEFAULT_CONFIG.mode : supplied.mode;
   if (mode !== "static" && mode !== "multiplexer") {
     throw new Error("mode must be static or multiplexer");
+  }
+  const comments = supplied.comments === undefined ? DEFAULT_CONFIG.comments : supplied.comments;
+  if (comments !== "live" && comments !== "batch") {
+    throw new Error("comments must be live or batch");
   }
   const base = supplied.base === undefined ? undefined : branchName(supplied.base);
   return {
@@ -135,8 +146,10 @@ export function parseConfig(value: unknown): ParsedConfig {
       log,
       branch,
       codebase,
+      send,
       delivery,
       mode,
+      comments,
       ...(base === undefined ? {} : { base }),
     },
     ignored,

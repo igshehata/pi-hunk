@@ -748,6 +748,7 @@ export function createHost(bindings: HostBindings) {
   const live = createLiveReview({
     bridge: bindings.bridge,
     sendUserMessage: bindings.sendUserMessage,
+    announce,
   });
   /** A pane launch in flight; a stop must not let it open for a session that is already gone. */
   let opening: AbortController | undefined;
@@ -858,7 +859,21 @@ export function createHost(bindings: HostBindings) {
                 : bindings.matchesKey(data, session.config.codebase)
                   ? "codebase"
                   : undefined;
-        if (!view) return;
+        if (!view) {
+          // The batch is queued inside Hunk, so its send key belongs there; at the prompt it must
+          // not fall through and submit whatever the composer holds.
+          if (
+            session.config.mode !== "multiplexer" ||
+            session.config.comments !== "batch" ||
+            !bindings.matchesKey(data, session.config.send)
+          )
+            return;
+          session.ctx.ui.notify(
+            `Queued comments are sent from Hunk: press ${session.config.prefix} then ${session.config.send} in its pane.`,
+            "info",
+          );
+          return consumed;
+        }
         if (session.config.mode === "multiplexer") {
           // The handler stays installed: a host without Tern, Rex or Herdr falls back to the
           // static review below, which rewires it after taking the terminal over.

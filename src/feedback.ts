@@ -32,6 +32,9 @@ function replay(state: JournalState, event: ReviewEvent): JournalState {
     case "Exited":
       // Written by the multiplexer launcher after Hunk exits; it records no comment.
       return state;
+    case "Send":
+      // A batch boundary of a live review; a full-screen review hands everything off at close.
+      return state;
     default:
       throw new Error("Unrecognized review journal entry");
   }

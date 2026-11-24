@@ -50,6 +50,12 @@ interface LiveOpen {
   readonly numbers: Map<string, number>;
   /** The newest note per id, so an edit or a delete can be described. */
   readonly notes: Map<string, ReviewNote>;
+  /**
+   * Batch comments: the newest state of every note changed since the last batch, in the order
+   * each was first touched; `undefined` is a deletion. A rewrite of a queued note replaces its
+   * entry, so a batch says what the note ended up as, not every save on the way.
+   */
+  readonly queued: Map<string, ReviewNote | undefined>;
   next: number;
   watcher: FSWatcher | undefined;
   /** Bytes of the journal already parsed. */
@@ -100,6 +106,8 @@ function sameRange(
 export function createLiveReview(bindings: {
   readonly bridge: string;
   readonly sendUserMessage: SendUserMessage;
+  /** Names a kept journal on stderr once the terminal is restored; a quitting host shows no notice. */
+  readonly announce: (journal: string) => void;
 }): LiveReview {
   let state: LiveState = { _tag: "Closed" };
   /**
@@ -151,42 +159,67 @@ export function createLiveReview(bindings: {
     return review.sending;
   }
 
-  function upsert(review: LiveOpen, note: ReviewNote): void {
+  /** The message for one saved note, or nothing when the agent already read exactly this. */
+  function upsert(review: LiveOpen, note: ReviewNote): string | undefined {
     const number = review.numbers.get(note.id);
     if (number === undefined) {
       const assigned = review.next++;
       review.numbers.set(note.id, assigned);
       const parent = note.parentId === undefined ? undefined : parentOf(review, note.parentId);
       review.notes.set(note.id, note);
-      void send(
-        review,
-        formatLiveChange(
-          parent === undefined
-            ? { kind: "added", number: assigned, note }
-            : { kind: "added", number: assigned, note, parent },
-        ),
+      return formatLiveChange(
+        parent === undefined
+          ? { kind: "added", number: assigned, note }
+          : { kind: "added", number: assigned, note, parent },
       );
-      return;
     }
     const previous = review.notes.get(note.id);
     review.notes.set(note.id, note);
-    if (previous !== undefined && sameNote(previous, note)) return;
-    void send(review, formatLiveChange({ kind: "edited", number, note }));
+    if (previous !== undefined && sameNote(previous, note)) return undefined;
+    return formatLiveChange({ kind: "edited", number, note });
   }
 
-  function remove(review: LiveOpen, id: string): void {
+  /** The retraction for one deleted note, or nothing when the agent never saw it. */
+  function remove(review: LiveOpen, id: string): string | undefined {
     const number = review.numbers.get(id);
-    // A note the agent never saw needs no retraction.
-    if (number === undefined) return;
+    if (number === undefined) return undefined;
     review.numbers.delete(id);
     review.notes.delete(id);
-    void send(review, formatLiveChange({ kind: "deleted", number }));
+    return formatLiveChange({ kind: "deleted", number });
+  }
+
+  /** Live comments go out now; batch comments wait for the reviewer's send. */
+  function change(review: LiveOpen, id: string, note: ReviewNote | undefined): void {
+    if (review.config.comments === "batch") {
+      // A note the agent never saw, deleted before its batch went out, owes the agent nothing.
+      if (note === undefined && !review.numbers.has(id)) review.queued.delete(id);
+      else review.queued.set(id, note);
+      return;
+    }
+    const message = note === undefined ? remove(review, id) : upsert(review, note);
+    if (message !== undefined) void send(review, message);
+  }
+
+  /**
+   * Sends every queued change as one message, numbered in the order the changes were first made,
+   * so a reply queued with its parent still names the parent's number.
+   */
+  function sendBatch(review: LiveOpen): void {
+    const messages: string[] = [];
+    for (const [id, note] of review.queued) {
+      const message = note === undefined ? remove(review, id) : upsert(review, note);
+      if (message !== undefined) messages.push(message);
+    }
+    review.queued.clear();
+    if (messages.length > 0) void send(review, messages.join("\n\n---\n\n"));
   }
 
   async function exited(review: LiveOpen, status: number): Promise<void> {
+    // Quitting Hunk sends what is still queued, like closing a full-screen review does.
+    sendBatch(review);
     if (status !== 0) {
       review.ctx.ui.notify(
-        `Hunk exited with code ${status}. Comments sent so far were delivered. Journal: ${review.journal}`,
+        `Hunk exited with code ${status}. Your comments were sent. Journal: ${review.journal}`,
         "warning",
       );
       // Whatever is already chained was read from the journal before this record: deliver it,
@@ -196,8 +229,8 @@ export function createLiveReview(bindings: {
       await tearDown(review, true, false);
       return;
     }
-    // All comments were delivered as they were saved, so a clean exit has nothing left to hand
-    // off; only the last chained deliveries still need to land before the review goes away.
+    // Every comment has now been handed over, live or in the last batch; only the chained
+    // deliveries still need to land before the review goes away.
     await review.sending;
     await tearDown(review, review.failure);
   }
@@ -222,10 +255,13 @@ export function createLiveReview(bindings: {
         // The bridge announcing itself; no comment changed.
         return;
       case "Upsert":
-        upsert(review, event.note);
+        change(review, event.note.id, event.note);
         return;
       case "Remove":
-        remove(review, event.id);
+        change(review, event.id, undefined);
+        return;
+      case "Send":
+        sendBatch(review);
         return;
       case "Failure":
         review.failure = true;
@@ -345,6 +381,9 @@ export function createLiveReview(bindings: {
         return "focused";
       }
       // The pane went away without its `Exited` record (killed, or crashed before the trap ran).
+      // Its queued comments were saved, so they still go to the agent before the review ends.
+      sendBatch(current);
+      await current.sending;
       await tearDown(current, current.failure);
     }
     const multiplexer = detectMultiplexer(process.env);
@@ -387,6 +426,7 @@ export function createLiveReview(bindings: {
         config: session.config,
         numbers: new Map(),
         notes: new Map(),
+        queued: new Map(),
         next: 1,
         watcher: undefined,
         offset: 0,
@@ -423,7 +463,17 @@ export function createLiveReview(bindings: {
     const current = state;
     // `Opening` cannot be observed here: the queue means a launch has finished before a close runs.
     if (current._tag !== "Open") return Promise.resolve();
-    return tearDown(current, current.failure);
+    // The session is going away, so an unsent batch has no agent to go to: its journal is kept
+    // and named, never sent into whichever session comes next.
+    const unsent = current.queued.size;
+    if (unsent > 0) {
+      current.ctx.ui.notify(
+        `Hunk review closed with ${unsent} unsent comment change${unsent === 1 ? "" : "s"}. Journal: ${current.journal}`,
+        "warning",
+      );
+      bindings.announce(current.journal);
+    }
+    return tearDown(current, current.failure || unsent > 0);
   }
 
   return {
